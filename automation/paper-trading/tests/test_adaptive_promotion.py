@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from adaptive_fixtures import gate8_cache_from_series
 import adaptive_engine as ae
 import adaptive_logging as alog
 import adaptive_promotion as ap
@@ -12,6 +14,11 @@ import calibration as cal
 import pit_archive as pit
 from tests.test_atomic_gates import _build_trades
 from tests.test_calibration_and_truncation import _make_dataset_with_future_split
+from unittest import mock
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from adaptive_fixtures import calibration_partitions, ci_success_payload, seed_observation_evidence, trading_days
+import adaptive_ci
+import adaptive_policy as apol
 
 
 class MemDB:
@@ -66,6 +73,7 @@ class AdaptivePromotionTests(unittest.TestCase):
             stressed_r_var=stressed_r_var,
             k_cand=2, rho_bar=0.4, observation_only=True,
             microstructure_checks=dict.fromkeys(ag.MICROSTRUCTURE_LOCKS, True),
+            gate8_cache=gate8_cache_from_series(r_var, r_base),
         )
         self.assertTrue(gate_res['overall_passed'])
 
@@ -81,21 +89,37 @@ class AdaptivePromotionTests(unittest.TestCase):
         self.assertIn('calibration_go_power_floor_not_passed', b2['prerequisites']['blockers'])
         self.assertIn('ci_lookahead_truncation_test_not_passed', b2['prerequisites']['blockers'])
 
-        # 3. Complete observation period, calibration GO, and CI look-ahead truncation pass
-        ap.record_observation_period_completed(self.db, ns, strategy=3, sessions_observed=20, min_sessions=15)
-        cal.run_calibration_go_no_go(
+        # 3. Observation evidence (derived from logs), calibration GO + passed holdout, CI proven for the exact SHA
+        sessions = trading_days(apol.POLICY['observation_min_sessions'], start=date(2025, 9, 1))
+        seed_observation_evidence(self.db, ns, 3, sessions)
+        st = ap.record_observation_period_completed(self.db, ns, strategy=3)
+        self.assertTrue(st['completed'])
+        parts, old_dates, _, hold_dates = calibration_partitions(120)
+        cal_run = cal.run_calibration_go_no_go(
             self.db, ns, strategy=3,
             real_d_t=rng.normal(0.0, 0.0008, size=120),
             smallest_actionable_edge=0.0005,
+            d_t_dates=old_dates, partitions=parts,
             window_days=45,
         )
-        dates, stock_df, idx_df, corp_actions = _make_dataset_with_future_split(days=260)
-        trunc_rep = cal.run_lookahead_truncation_test(stock_df, idx_df, corp_actions, [dates[-5], dates[-2]])
-        ap.record_ci_lookahead_pass(self.db, ns, trunc_rep)
+        b3 = ap.attempt_promotion(self.db, ns, sid, observation_only=False)
+        self.assertIn('holdout_vault_not_touched', b3['prerequisites']['blockers'])
+        cal.touch_holdout_vault_once(self.db, ns, 'vault_s3', cal_run['calibration_id'], True, holdout_dates=hold_dates)
+
+        sha = 'a' * 40
+        # A stored "CI passed" value can no longer unlock promotion: CI must be proven at promotion time.
+        self.db.batch([("INSERT INTO paper_meta(namespace,key,value) VALUES(?,?,?)", (ns, 'adaptive_ci_lookahead_passed', '1'))])
+        self.assertFalse(hasattr(ap, 'record_ci_lookahead_pass'))
+        with mock.patch.object(adaptive_ci, '_http_get_json', side_effect=OSError('offline')):
+            b4 = ap.attempt_promotion(self.db, ns, sid, observation_only=False, ci_sha=sha)
+        self.assertFalse(b4['promoted'])
+        self.assertEqual(b4['prerequisites']['blockers'], ['ci_lookahead_truncation_test_not_passed'])
 
         # 4. Now promotion succeeds and places candidate as the sole Track C champion for Strategy 3
-        promo = ap.attempt_promotion(self.db, ns, sid, observation_only=False)
-        self.assertTrue(promo['promoted'])
+        with mock.patch.object(adaptive_ci, '_http_get_json', return_value=ci_success_payload(sha)), \
+                mock.patch.object(adaptive_ci, 'run_local_truncation_suite', return_value={'passed': True}):
+            promo = ap.attempt_promotion(self.db, ns, sid, observation_only=False, ci_sha=sha)
+        self.assertTrue(promo['promoted'], promo['prerequisites'])
         self.assertEqual(promo['track'], 'C')
         self.assertEqual(promo['status'], 'PROMOTED')
 

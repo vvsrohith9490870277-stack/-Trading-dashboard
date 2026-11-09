@@ -21,7 +21,7 @@ import adaptive_promotion as ap
 import atomic_gates as ag
 import calibration as cal
 import capital as cap
-from adaptive_fixtures import fresh_db, make_market, seed_pit
+from adaptive_fixtures import calibration_partitions, fresh_db, gate8_cache_from_series, make_market, seed_pit
 from test_atomic_gates import _build_trades
 
 LOCKS = dict.fromkeys(ag.MICROSTRUCTURE_LOCKS, True)
@@ -56,6 +56,7 @@ class AdaptiveAuditTests(unittest.TestCase):
                     warm_start_end_date='2025-05-30', neighbor_improvements=[mean_d * 0.85, mean_d * 0.82],
                     stressed_r_var=stressed, k_cand=2, rho_bar=0.4, observation_only=True, microstructure_checks=LOCKS)
         args.update(kw)
+        args.setdefault('gate8_cache', gate8_cache_from_series(args['r_var'], args['r_base']))
         return ag.evaluate_all_atomic_gates(self.db, self.ns, spawn_id=sid, strategy=strategy, decision_day='2025-08-29', **args)
 
     def _release(self, sid):
@@ -95,7 +96,7 @@ class AdaptiveAuditTests(unittest.TestCase):
                 apol.load(f.name)
 
     def test_harness_hash_covers_gate_code_and_policy(self):
-        for name in ('atomic_gates.py', 'adaptive_policy.json', 'calibration.py', 'charge_rates.json'):
+        for name in ('atomic_gates.py', 'adaptive_policy.json', 'calibration.py', 'freeze_lock.json', '../../server/automation-read.mjs'):
             self.assertIn(name, ae.HARNESS_FILES)
 
     # ---- gates once, on the final decision day ---------------------------------------------------------------------
@@ -168,14 +169,16 @@ class AdaptiveAuditTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             ag.evaluate_track_c_probation(self.db, self.ns, 'x', 3, realized_d_t=[0.001] * 5, historical_d_t_for_sigma=[0.001])
         with self.assertRaises(ValueError):
-            cal.tune_thresholds_on_partition('P0', ['P0'], [0.1], [0.001])
+            parts, old, _, _ = calibration_partitions(5)
+            cal.tune_thresholds_on_partition(parts, old[:1], [0.1], [0.001])
 
     def test_calibration_rerun_cannot_reset_spent_vault(self):
         rng = np.random.default_rng(3)
-        run = cal.run_calibration_go_no_go(self.db, self.ns, 3, rng.normal(0, 0.0008, 120), 0.0005, window_days=45, calibration_id='cal_fixed')
-        cal.touch_holdout_vault_once(self.db, self.ns, 'vault1', run['calibration_id'], holdout_passed=False)
+        parts, old, _, hold = calibration_partitions(120)
+        run = cal.run_calibration_go_no_go(self.db, self.ns, 3, rng.normal(0, 0.0008, 120), 0.0005, old, parts, window_days=45, calibration_id='cal_fixed')
+        cal.touch_holdout_vault_once(self.db, self.ns, 'vault1', run['calibration_id'], holdout_passed=False, holdout_dates=hold)
         with self.assertRaises(PermissionError):
-            cal.run_calibration_go_no_go(self.db, self.ns, 3, rng.normal(0, 0.0008, 120), 0.0005, window_days=45, calibration_id='cal_fixed')
+            cal.run_calibration_go_no_go(self.db, self.ns, 3, rng.normal(0, 0.0008, 120), 0.0005, old, parts, window_days=45, calibration_id='cal_fixed')
 
     # ---- challenger code path == frozen Track A indicators -------------------------------------------------------
     def test_challenger_code_path_with_baseline_values_matches_frozen_indicators(self):

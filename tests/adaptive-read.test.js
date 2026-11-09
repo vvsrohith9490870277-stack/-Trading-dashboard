@@ -13,6 +13,9 @@ it('reads tracks, spawns, gates, calibration, probation and hash-chained logs fr
  await db.execute({sql:"INSERT INTO adaptive_calibration_runs(namespace,calibration_id,correlation_id,strategy,partition_name,sigma_d_t,mde,injected_edge,measured_power,power_floor,go_no_go,pipeline_mode,details_json,data_hash,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",args:[ns,'c1','c1',3,'OLDEST',0.001,0.0004,0.0005,0.42,0.3,'GO','OBSERVATION_ONLY_PENDING_COMPLETION','{}','d',t]});
  await db.execute({sql:"INSERT INTO adaptive_decision_logs(namespace,seq,log_id,correlation_id,spawn_id,track,strategy,category,decision_type,named_cause,conditions_json,filters_json,indicator_snapshot_json,risk_state_json,execution_details_json,data_hash,source_at,recorded_at,prev_hash,entry_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",args:[ns,1,'l1','sp1','sp1','B',3,'SPAWN','SPAWN','candidate_spawned','{}','{}','{}','{}','{"x":1}','d',t,t,'0','abc']});
  await db.execute({sql:"INSERT INTO paper_meta(namespace,key,value) VALUES(?,?,?)",args:[ns,'adaptive_ci_lookahead_passed','1']});
+ // A stored flag alone never shows CI as verified (E6): only a promotion check's recorded CI result does.
+ expect((await readAdaptiveSummary(run(db),ns)).ci_lookahead_passed).toBe(false);
+ await db.execute({sql:"INSERT INTO adaptive_decision_logs(namespace,seq,log_id,correlation_id,spawn_id,track,strategy,category,decision_type,named_cause,conditions_json,filters_json,indicator_snapshot_json,risk_state_json,execution_details_json,data_hash,source_at,recorded_at,prev_hash,entry_hash) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",args:[ns,2,'l2','sp1','sp1','B',3,'PROMOTION','HOLD','observation_only_mode_enabled','{"ci_lookahead_passed":true,"ci":{"passed":true,"sha":"'+'a'.repeat(40)+'"}}','{}','{}','{}','{}','d',t,t,'abc','def']});
  const a=await readAdaptiveSummary(run(db),ns);
  expect(a.read_error).toBeNull();
  expect(a.ci_lookahead_passed).toBe(true);
@@ -22,8 +25,8 @@ it('reads tracks, spawns, gates, calibration, probation and hash-chained logs fr
  expect(a.spawns[0]).toMatchObject({spawn_id:'sp1',track_id:'B',k_cand:1,effective_critical_t:1.4,target_window_days:45});
  expect(a.gate_evaluations[0]).toMatchObject({spawn_id:'sp1',track_id:'B',k_cand:3,effective_critical_t:1.96,all_gates_passed:1,terminal_status:'OBSERVATION_ONLY'});
  expect(a.gate_evaluations[0].residualized_mean_bps).toBeCloseTo(8,6);
- expect(a.logs[0]).toMatchObject({seq_id:1,tier:'B',event_type:'SPAWN',named_cause:'candidate_spawned',entry_hash:'abc'});
- expect(a.logs[0].payload).toEqual({x:1});
+ expect(a.logs[1]).toMatchObject({seq_id:1,tier:'B',event_type:'SPAWN',named_cause:'candidate_spawned',entry_hash:'abc'});
+ expect(a.logs[1].payload).toEqual({x:1});
 });
 it('reports an uninitialized adaptive schema instead of silently pretending it is empty',async()=>{
  const dir=mkdtempSync(join(tmpdir(),'adaptive-read-empty-'));const db=createClient({url:'file:'+join(dir,'empty.db')});clients.push({db,dir});

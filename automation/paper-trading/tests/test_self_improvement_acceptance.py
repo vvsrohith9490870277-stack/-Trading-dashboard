@@ -5,6 +5,12 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from adaptive_fixtures import calibration_partitions, ci_success_payload, gate8_cache_from_series, seed_observation_evidence, trading_days
+from datetime import date
+from unittest import mock
+import adaptive_ci
+import adaptive_policy as apol
 import adaptive_engine as ae
 import adaptive_logging as alog
 import adaptive_promotion as ap
@@ -49,7 +55,7 @@ class TestSelfImprovementAcceptance(unittest.TestCase):
         trunc_rep = cal.run_lookahead_truncation_test(stock_df, idx_df, corp_actions, [dates[-5], dates[-2]])
         self.assertTrue(trunc_rep['passed'])
         self.assertEqual(len(trunc_rep['mismatches']), 0)
-        ap.record_ci_lookahead_pass(self.db, ns, trunc_rep)
+        self.assertGreater(trunc_rep["checks_run"], 0)  # CI pass is now proven per-SHA via public check-runs, not a DB flag
 
         # B1: PIT Bhavcopy SERIES archive & EQ-only new entry enforcement
         pit.ingest_bhavcopy_series(
@@ -111,29 +117,36 @@ class TestSelfImprovementAcceptance(unittest.TestCase):
             stressed_r_var=stressed_r_var,
             k_cand=2, rho_bar=0.4, observation_only=True,
             microstructure_checks=dict.fromkeys(ag.MICROSTRUCTURE_LOCKS, True),
+            gate8_cache=gate8_cache_from_series(r_var, r_base),
         )
         self.assertTrue(gate_res['overall_passed'])
         self.assertTrue(gate_res['details']['gate_2_and_4']['residualized_check']['passed'])
         self.assertEqual(gate_res['details']['gate_8']['m_runs'], 250)
 
-        # B4: Calibration go/no-go (~30% power floor), oldest-partition tuning, single-touch holdout vault, observation lock
-        partitions = ['OLDEST_CALIBRATION_PARTITION', 'MID_PARTITION', 'HOLDOUT_VAULT']
-        tuned = cal.tune_thresholds_on_partition(
-            'OLDEST_CALIBRATION_PARTITION', partitions, [0.00005, 0.0001, 0.0002], r_var - r_base
-        )
+        # B4: Calibration go/no-go (power floor, HAC/bootstrap agreement), date-enforced oldest-partition tuning,
+        # single-touch holdout vault, observation sessions derived from logs, CI proven for the exact SHA
+        parts, old_dates, _, hold_dates = calibration_partitions(n)
+        tuned = cal.tune_thresholds_on_partition(parts, old_dates, [0.00005, 0.0001, 0.0002], r_var - r_base)
         self.assertTrue(tuned['oldest_partition_verified'])
 
+        parts120, old120, _, hold120 = calibration_partitions(120)
         cal_res = cal.run_calibration_go_no_go(
             self.db, ns, strategy=3,
             real_d_t=rng.normal(0.0, 0.0008, size=120),
             smallest_actionable_edge=0.0005,
+            d_t_dates=old120, partitions=parts120,
             window_days=45,
         )
         self.assertEqual(cal_res['go_no_go'], 'GO')
         self.assertGreaterEqual(cal_res['measured_power'], 0.30)
+        cal.touch_holdout_vault_once(self.db, ns, 'vault_acc', cal_res['calibration_id'], True, holdout_dates=hold120)
 
-        ap.record_observation_period_completed(self.db, ns, strategy=3, sessions_observed=20, min_sessions=15)
-        promo = ap.attempt_promotion(self.db, ns, sp_fast['spawn_id'], observation_only=False)
+        seed_observation_evidence(self.db, ns, 3, trading_days(apol.POLICY['observation_min_sessions'], start=date(2025, 9, 1)))
+        self.assertTrue(ap.record_observation_period_completed(self.db, ns, strategy=3)['completed'])
+        sha = 'd' * 40
+        with mock.patch.object(adaptive_ci, '_http_get_json', return_value=ci_success_payload(sha)), \
+                mock.patch.object(adaptive_ci, 'run_local_truncation_suite', return_value={'passed': True}):
+            promo = ap.attempt_promotion(self.db, ns, sp_fast['spawn_id'], observation_only=False, ci_sha=sha)
         self.assertTrue(promo['promoted'])
         self.assertEqual(promo['track'], 'C')
 

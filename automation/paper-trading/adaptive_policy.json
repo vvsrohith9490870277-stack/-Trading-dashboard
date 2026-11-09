@@ -1,15 +1,130 @@
 {
-  "version": "adaptive_policy_v1",
-  "note": "Every number the adaptive (Track B/C) code uses lives here. 'plan' = value stated in the Self-Improvement Definitive Coding-Ready Plan (15Sk6te6O6BAQtxa1zfSy4eeD_gbghdUqPMVr3UhrcIk). 'plan_example' = the plan gives it only as an example ('e.g.'). 'placeholder_pending_review' = the plan is silent; the value was chosen by the implementer and must be reviewed before any promotion is enabled. Track A frozen policy (capital_policy.json, charge_rates.json, config.json) is read, never copied here.",
+  "version": "adaptive_policy_v2",
+  "note": "Every number the adaptive (Track B/C) code uses lives here (H6, C-05). Provenance groups: 'plan' = stated in the Self-Improvement Definitive Coding-Ready Plan or Adaptive Completion Plan v2; 'plan_example' = given only as an example ('e.g.'), user must confirm; 'placeholder_pending_review' = plan silent, implementer value (v1 audit), user must review (23 keys); 'new_pending_review' = proposed in Adaptive Completion Plan v2 section 3 'New in v2', user must review; 'implementer_pending_review' = needed by Phase 2 code, not stated in the plan, chosen by the implementer on 10 Nov 2026, user must review; 'standard_formula' = constant of a published statistical formula (cited), not a tunable threshold; 'operational_config' = non-threshold configuration (paths, repo, check names). Economic hurdles gate9_min_effect_size_daily and gate2_cost_slippage_hurdle_daily are locked before calibration and are never retuned on it (C-04 rejected). Track A frozen policy (capital_policy.json, charge_rates.json, config.json) is read, never copied here.",
   "provenance": {
-    "plan": ["max_track_b_challengers", "max_track_c_champions", "fast_swing_strategies", "trend_strategies", "fast_swing_warm_start_days", "trend_warm_start_min_days", "trend_warm_start_max_days", "fast_swing_target_window_days", "trend_target_window_days", "extension_days", "min_new_discordant_trades", "max_rho_bar", "critical_value_floor", "max_dd_multiplier", "max_single_trade_share", "plateau_retention_min", "placebo_runs", "placebo_percentile", "probation_sigma_multiplier", "power_floor"],
-    "plan_example": ["track_c_superiority_bps_per_day", "alpha"],
-    "placeholder_pending_review": ["trend_warm_start_default_days", "min_distinct_entry_weeks", "gate1_min_total_trades", "gate2_cost_slippage_hurdle_daily", "gate3_min_dd_baseline_floor", "gate4_beta_se_stability_threshold", "gate4_max_subsample_beta_diff", "gate5_min_observations", "gate5_max_abs_lag1_autocorr", "gate5_min_half_mean_vs_overall", "gate9_min_effect_size_daily", "probation_days_trend", "probation_days_fast_swing", "bootstrap_block_size", "bootstrap_n_boot", "bootstrap_ci_level", "calibration_n_sims", "calibration_min_sims", "meta_kill_min_days", "meta_kill_max_t", "observation_min_sessions", "base_seed", "placebo_seed_stride"]
+    "plan": [
+      "max_track_b_challengers",
+      "max_track_c_champions",
+      "fast_swing_strategies",
+      "trend_strategies",
+      "fast_swing_warm_start_days",
+      "trend_warm_start_min_days",
+      "trend_warm_start_max_days",
+      "fast_swing_target_window_days",
+      "trend_target_window_days",
+      "extension_days",
+      "min_new_discordant_trades",
+      "max_rho_bar",
+      "critical_value_floor",
+      "max_dd_multiplier",
+      "max_single_trade_share",
+      "plateau_retention_min",
+      "placebo_runs",
+      "placebo_percentile",
+      "probation_sigma_multiplier",
+      "power_floor",
+      "gate8_ucb_confidence"
+    ],
+    "plan_example": [
+      "track_c_superiority_bps_per_day",
+      "alpha"
+    ],
+    "placeholder_pending_review": [
+      "trend_warm_start_default_days",
+      "min_distinct_entry_weeks",
+      "gate1_min_total_trades",
+      "gate2_cost_slippage_hurdle_daily",
+      "gate3_min_dd_baseline_floor",
+      "gate4_beta_se_stability_threshold",
+      "gate4_max_subsample_beta_diff",
+      "gate5_min_observations",
+      "gate5_max_abs_lag1_autocorr",
+      "gate5_min_half_mean_vs_overall",
+      "gate9_min_effect_size_daily",
+      "probation_days_trend",
+      "probation_days_fast_swing",
+      "bootstrap_block_size",
+      "bootstrap_n_boot",
+      "bootstrap_ci_level",
+      "calibration_n_sims",
+      "calibration_min_sims",
+      "meta_kill_min_days",
+      "meta_kill_max_t",
+      "observation_min_sessions",
+      "base_seed",
+      "placebo_seed_stride"
+    ],
+    "new_pending_review": [
+      "backfill_window_start_ist",
+      "backfill_window_end_ist",
+      "backfill_max_requests_per_minute",
+      "backfill_stop_trackA_error_multiplier",
+      "archive_depth_months",
+      "archive_min_coverage",
+      "placebo_jitter_sessions",
+      "gate8_null_count",
+      "gate8_null_point_max",
+      "gate8_null_ucb_max",
+      "placebo_cache_equivalence_samples",
+      "plateau_step_sizes",
+      "plateau_aggregation",
+      "parity_equity_tolerance_paise",
+      "parity_min_consecutive_sessions",
+      "runner_memory_max_mb",
+      "runner_cpu_quota_pct",
+      "hac_bandwidth_grid",
+      "hac_bootstrap_max_disagreement",
+      "fresh_holdout_min_sessions_fast_swing",
+      "fresh_holdout_min_sessions_trend",
+      "eod_marker_deadline_ist"
+    ],
+    "implementer_pending_review": [
+      "heavy_work_window_start_ist",
+      "ci_api_timeout_seconds",
+      "ci_local_truncation_timeout_seconds"
+    ],
+    "standard_formula": [
+      "hac_auto_lag_coefficient",
+      "hac_auto_lag_reference_n",
+      "hac_auto_lag_exponent_num",
+      "hac_auto_lag_exponent_den"
+    ],
+    "operational_config": [
+      "kill_switch_relative_path",
+      "ci_github_repo",
+      "ci_required_check_names",
+      "harness_dashboard_read_module",
+      "db_batch_chunk_rows"
+    ]
+  },
+  "provenance_sources": {
+    "gate8_ucb_confidence": "Adaptive Completion Plan v2 E2: one-sided 95% upper bound <= 15%",
+    "heavy_work_window_start_ist": "H4: nothing adaptive 09:15-15:30 IST; 15:35 is the post-close start used in the brief of 10 Nov 2026. The window ends at backfill_window_end_ist.",
+    "ci_api_timeout_seconds": "Implementer: HTTP timeout for the unauthenticated GitHub check-runs read; timeout => fail closed.",
+    "plateau_step_sizes": "Plan v2 lists plateau_step_sizes as \"per parameter\" without values; these steps were proposed by the implementer on 10 Nov 2026 and await D5/D11 review.",
+    "hac_auto_lag_coefficient": "Newey-West (1994) automatic lag rule floor(4 * (n/100)^(2/9)).",
+    "hac_auto_lag_reference_n": "Newey-West (1994) automatic lag rule.",
+    "hac_auto_lag_exponent_num": "Newey-West (1994) automatic lag rule exponent 2/9.",
+    "hac_auto_lag_exponent_den": "Newey-West (1994) automatic lag rule exponent 2/9.",
+    "parity_equity_tolerance_paise": "Plan v2 D3: equity within Rs 1/day = 100 paise.",
+    "runner_memory_max_mb": "Plan v2: 2 GB.",
+    "runner_cpu_quota_pct": "Plan v2: 200%.",
+    "ci_local_truncation_timeout_seconds": "Implementer: wall-clock cap for the local truncation re-run; timeout => fail closed.",
+    "db_batch_chunk_rows": "Pre-existing pit_archive.py write batching (rows per db.batch); throughput only, not a decision threshold."
   },
   "max_track_b_challengers": 3,
   "max_track_c_champions": 1,
-  "fast_swing_strategies": [3, 5],
-  "trend_strategies": [1, 2, 4, 6, 7],
+  "fast_swing_strategies": [
+    3,
+    5
+  ],
+  "trend_strategies": [
+    1,
+    2,
+    4,
+    6,
+    7
+  ],
   "fast_swing_warm_start_days": 60,
   "trend_warm_start_min_days": 100,
   "trend_warm_start_max_days": 120,
@@ -50,5 +165,91 @@
   "meta_kill_max_t": -1.0,
   "observation_min_sessions": 15,
   "base_seed": 20261109,
-  "placebo_seed_stride": 1009
+  "placebo_seed_stride": 1009,
+  "backfill_window_start_ist": "18:00",
+  "backfill_window_end_ist": "07:00",
+  "backfill_max_requests_per_minute": 20,
+  "backfill_stop_trackA_error_multiplier": 2.0,
+  "archive_depth_months": 36,
+  "archive_min_coverage": 0.99,
+  "placebo_jitter_sessions": 5,
+  "gate8_null_count": 500,
+  "gate8_null_point_max": 0.12,
+  "gate8_null_ucb_max": 0.15,
+  "placebo_cache_equivalence_samples": 10,
+  "plateau_step_sizes": {
+    "1": {
+      "entry_lookback": 2,
+      "exit_lookback": 1
+    },
+    "2": {
+      "atr_period": 1,
+      "atr_multiplier": 0.25
+    },
+    "3": {
+      "rsi_period": 1,
+      "rsi_entry": 2.0,
+      "rsi_exit": 2.0,
+      "sma_trend": 10,
+      "sma_exit": 1
+    },
+    "4": {
+      "ema_fast": 2,
+      "ema_slow": 5,
+      "sma_trend": 10
+    },
+    "5": {
+      "bb_period": 2,
+      "bb_std": 0.25,
+      "sma_trend": 10
+    },
+    "6": {
+      "ema_fast": 1,
+      "ema_slow": 2,
+      "signal_period": 1,
+      "sma_trend": 5
+    },
+    "7": {
+      "high_lookback": 10,
+      "near_high_ratio": 0.01,
+      "sma_trend": 10,
+      "sma_exit": 5,
+      "trail_ratio": 0.01
+    }
+  },
+  "plateau_aggregation": {
+    "statistic": "median",
+    "neighbour_radius_steps": 1,
+    "min_neighbour_improvement": 0.0
+  },
+  "parity_equity_tolerance_paise": 100,
+  "parity_min_consecutive_sessions": 10,
+  "runner_memory_max_mb": 2048,
+  "runner_cpu_quota_pct": 200,
+  "hac_bandwidth_grid": [
+    0.5,
+    1.0,
+    1.5
+  ],
+  "hac_bootstrap_max_disagreement": 0.25,
+  "fresh_holdout_min_sessions_fast_swing": 45,
+  "fresh_holdout_min_sessions_trend": 75,
+  "eod_marker_deadline_ist": "19:00",
+  "heavy_work_window_start_ist": "15:35",
+  "gate8_ucb_confidence": 0.95,
+  "ci_api_timeout_seconds": 15,
+  "hac_auto_lag_coefficient": 4.0,
+  "hac_auto_lag_reference_n": 100.0,
+  "hac_auto_lag_exponent_num": 2,
+  "hac_auto_lag_exponent_den": 9,
+  "kill_switch_relative_path": "out/adaptive/KILL_SWITCH",
+  "ci_github_repo": "vvsrohith9490870277-stack/-Trading-dashboard",
+  "ci_required_check_names": [
+    "adaptive-python",
+    "adaptive-dashboard",
+    "adaptive-truncation"
+  ],
+  "harness_dashboard_read_module": "../../server/automation-read.mjs",
+  "ci_local_truncation_timeout_seconds": 600,
+  "db_batch_chunk_rows": 200
 }

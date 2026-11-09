@@ -26,7 +26,15 @@ def compute_paired_active_returns(r_var, r_base):
     return v - b
 
 
-def newey_west_t_hac(series, max_lag=None):
+def newey_west_auto_lag(n, bandwidth_multiplier=1.0):
+    """Newey-West (1994) automatic lag floor(c * (n / n_ref)^(a/b)), constants from adaptive_policy.json
+    (standard_formula), optionally scaled by a bandwidth multiplier for sensitivity analysis (C-09)."""
+    expo = AP['hac_auto_lag_exponent_num'] / float(AP['hac_auto_lag_exponent_den'])
+    base = AP['hac_auto_lag_coefficient'] * ((int(n) / AP['hac_auto_lag_reference_n']) ** expo)
+    return max(1, min(int(n) - 1, int(math.floor(base * float(bandwidth_multiplier)))))
+
+
+def newey_west_t_hac(series, max_lag=None, bandwidth_multiplier=1.0):
     """Compute Newey-West HAC standard error and t-statistic for the mean of a 1D return series."""
     x = np.asarray(series, dtype=float)
     n = len(x)
@@ -35,8 +43,7 @@ def newey_west_t_hac(series, max_lag=None):
     mean = float(np.mean(x))
     centered = x - mean
     if max_lag is None:
-        # Standard Newey-West automatic lag rule: floor(4 * (n / 100)^(2/9))
-        max_lag = max(1, int(math.floor(4.0 * ((n / 100.0) ** (2.0 / 9.0)))))
+        max_lag = newey_west_auto_lag(n, bandwidth_multiplier)
     max_lag = min(int(max_lag), n - 1)
 
     gamma_0 = float(np.dot(centered, centered)) / n
@@ -58,6 +65,7 @@ def newey_west_t_hac(series, max_lag=None):
         t_hac = 0.0
     return {
         'mean': mean,
+        'long_run_sigma': math.sqrt(max(lrv, 0.0)),
         'se_hac': se_hac,
         't_hac': float(t_hac),
         'max_lag': max_lag,

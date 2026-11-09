@@ -8,6 +8,7 @@ import csv, hashlib, json
 from datetime import datetime, timezone
 from pathlib import Path
 import pandas as pd
+import adaptive_policy as apol
 import prefilter as pf
 
 SCHEMA = """
@@ -144,7 +145,7 @@ def ingest_bhavcopy_series(db, rows, trade_date=None, source='NSE_BHAVCOPY', rec
             ),
         ))
         ingested += 1
-        if len(statements) >= 200:
+        if len(statements) >= apol.POLICY['db_batch_chunk_rows']:
             db.batch(statements)
             statements = []
     if statements:
@@ -253,7 +254,7 @@ def archive_daily_prefilter(db, namespace, trade_date, stock_df, index_df, symbo
             'pit_series=excluded.pit_series,metrics_json=excluded.metrics_json,data_hash=excluded.data_hash,recorded_at=excluded.recorded_at',
             (namespace, tdate, sym, ver, status, eligible, res['pit_series'], metrics_str, dhash, stamp),
         ))
-        if len(statements) >= 200:
+        if len(statements) >= apol.POLICY['db_batch_chunk_rows']:
             db.batch(statements)
             statements = []
     if statements:

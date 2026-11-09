@@ -139,6 +139,16 @@ def evaluate_gate2_critical_link(t_hac, k_cand, rho_bar=0.0, alpha=DEFAULT_ALPHA
     }
 
 
+def cumulative_k_cand(db, namespace, strategy):
+    """C-11: K_cand persisted cumulatively across ALL spawn rounds for a strategy (every eligible CANDIDATE and
+    TRACK_C_COMPARISON ever spawned, whatever its status), read from adaptive_spawns."""
+    rows = db.query(
+        'SELECT spawn_id,candidate_kind,eligible_for_selection FROM adaptive_spawns WHERE namespace=? AND strategy=?',
+        (namespace, int(strategy)),
+    )
+    return count_k_cand(rows)
+
+
 def record_trial_count(db, namespace, strategy, candidate_records=None, candidate_return_matrix=None, explicit_rho_bar=None, t_hac=0.0, spawn_id=None, correlation_id=None, alpha=DEFAULT_ALPHA):
     """Compute K_cand, rho_bar, K_eff, and effective critical value from DB or provided records and persist to spawn/logs."""
     if candidate_records is None:

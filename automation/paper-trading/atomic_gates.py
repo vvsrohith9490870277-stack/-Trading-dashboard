@@ -25,6 +25,7 @@ import numpy as np
 
 import adaptive_engine as ae
 import adaptive_logging as alog
+import adaptive_placebo as aplc
 import adaptive_policy as apol
 import residualized_check as rc
 import trial_counting as tc
@@ -151,38 +152,13 @@ def evaluate_gate5_stationarity(d_t):
     }
 
 
-def evaluate_gate6_parameter_plateau(candidate_improvement, neighbor_improvements, min_retention=PLATEAU_RETENTION_MIN):
-    """Gate 6: Parameter plateau (>= 75% retention on improvement over baseline across local neighbors).
-
-    Neighbors are tagged PLATEAU_NEIGHBOR and excluded from K_cand.
-    """
-    cand_imp = float(candidate_improvement)
-    neighbors = [float(x) for x in (neighbor_improvements or [])]
-    if cand_imp <= 0.0 or not neighbors:
-        return {
-            'passed': False,
-            'candidate_improvement': cand_imp,
-            'neighbor_count': len(neighbors),
-            'retention_ratio': 0.0,
-            'min_retention': float(min_retention),
-            'neighbors_excluded_from_k_cand': True,
-        }
-    mean_neighbor = float(np.mean(neighbors))
-    min_neighbor = float(np.min(neighbors))
-    retention_mean = mean_neighbor / cand_imp
-    retention_min = min_neighbor / cand_imp
-    # Require mean neighbor retention >= 75% and all local neighbors retaining positive improvement
-    passed = (retention_mean >= float(min_retention) - 1e-12) and (min_neighbor > 0.0)
-    return {
-        'passed': bool(passed),
-        'candidate_improvement': cand_imp,
-        'mean_neighbor_improvement': mean_neighbor,
-        'min_neighbor_improvement': min_neighbor,
-        'retention_ratio': retention_mean,
-        'min_retention_ratio': retention_min,
-        'required_retention': float(min_retention),
-        'neighbors_excluded_from_k_cand': True,
-    }
+def evaluate_gate6_parameter_plateau(candidate_improvement, neighbor_improvements, min_retention=None):
+    """Gate 6: Parameter plateau with the D5 rule from policy (plateau_aggregation: median retention >=
+    plateau_retention_min and no neighbour below min_neighbour_improvement). Neighbours are PLATEAU_NEIGHBOR and
+    excluded from K_cand. Use adaptive_placebo.evaluate_gate6_with_simulation() to generate and simulate them."""
+    if min_retention is not None and float(min_retention) != PLATEAU_RETENTION_MIN:
+        raise ValueError('gate6_retention_comes_from_policy')
+    return aplc.aggregate_plateau(candidate_improvement, neighbor_improvements or [])
 
 
 def evaluate_gate7_microstructure_stress(
@@ -212,83 +188,21 @@ def evaluate_gate7_microstructure_stress(
     }
 
 
-def evaluate_gate8_placebo(
-    r_var,
-    r_base,
-    discordant_day_mask=None,
-    candidate_pool_discordant_components=None,
-    m_runs=PLACEBO_RUNS_M,
-    percentile=PLACEBO_PERCENTILE,
-    base_seed=AP['base_seed'],
-):
-    """Gate 8: Placebo M = 250 seeded runs.
+def evaluate_gate8_from_cache(gate8_cache, d_t, placebo_seed=AP['base_seed']):
+    """Gate 8 for the final gate run: cached-pool re-screening (adaptive_placebo.evaluate_gate8_cached).
 
-    - Each run repeats the exact spawn-time screening/selection procedure across the candidate pool.
-    - Jitters ONLY discordant trades / discordant active-return contributions (concordant trades remain identical
-      to baseline with zero active return contribution).
-    - Candidate's observed active statistic must beat the 90th percentile of the M = 250 placebo maxima.
+    gate8_cache = {'candidate_index': int, 'pool': [member caches], 'sym_returns': {symbol: daily returns}}.
+    Missing cache, or a cached candidate d_t that differs from the gate's d_t, fails closed: the placebo must be run
+    on the same trades that produced the evaluated returns.
     """
-    m = int(m_runs)
-    if m != PLACEBO_RUNS_M:
-        raise ValueError(f'gate8_requires_exactly_250_placebo_runs_got_{m}')
-
-    d_obs = rc.compute_paired_active_returns(r_var, r_base)
-    n = len(d_obs)
-    obs_stat = rc.newey_west_t_hac(d_obs)['t_hac']
-
-    if discordant_day_mask is None:
-        # Days with non-zero active difference are discordant days; concordant days have d_t == 0
-        disc_mask = np.abs(d_obs) > 1e-12
-    else:
-        disc_mask = np.asarray(discordant_day_mask, dtype=bool)
-        if len(disc_mask) != n:
-            raise ValueError('discordant_day_mask_length_mismatch')
-
-    # Pool of candidates screened at spawn time (each row is a screened candidate's d_t series)
-    if candidate_pool_discordant_components is not None and len(candidate_pool_discordant_components) > 0:
-        pool = [np.asarray(c, dtype=float) for c in candidate_pool_discordant_components]
-    else:
-        pool = [d_obs]
-
-    concordant_part = np.where(disc_mask, 0.0, d_obs)
-    placebo_selected_stats = np.zeros(m, dtype=float)
-    seeds_used = []
-
-    for run_idx in range(m):
-        seed_i = int(base_seed) + run_idx * AP['placebo_seed_stride']
-        seeds_used.append(seed_i)
-        rng = np.random.default_rng(seed_i)
-
-        # Repeat spawn-time screening across all candidates in pool under discordant-only sign/timing jitter
-        best_run_stat = -1e9
-        for cand_d in pool:
-            disc_idx = np.flatnonzero(disc_mask)
-            jittered = concordant_part.copy()
-            if len(disc_idx) > 0:
-                perm_idx = rng.permutation(disc_idx)
-                signs = rng.choice(np.array([-1.0, 1.0]), size=len(disc_idx))
-                jittered[disc_idx] = cand_d[perm_idx] * signs
-            stat_c = rc.newey_west_t_hac(jittered)['t_hac']
-            if stat_c > best_run_stat:
-                best_run_stat = stat_c
-        placebo_selected_stats[run_idx] = best_run_stat
-
-    threshold_90 = float(np.percentile(placebo_selected_stats, float(percentile)))
-    pct_rank = float(np.mean(placebo_selected_stats < obs_stat) * 100.0)
-    passed = bool(obs_stat > threshold_90)
-    return {
-        'passed': passed,
-        'm_runs': m,
-        'percentile_required': float(percentile),
-        'observed_t_hac': float(obs_stat),
-        'placebo_90th_percentile_t': threshold_90,
-        'observed_percentile_rank': pct_rank,
-        'screened_pool_size': len(pool),
-        'discordant_days_jittered': int(np.sum(disc_mask)),
-        'concordant_days_untouched': int(n - np.sum(disc_mask)),
-        'base_seed': int(base_seed),
-        'first_5_seeds': seeds_used[:5],
-    }
+    if not gate8_cache:
+        return {'passed': False, 'reason': 'gate8_requires_cached_pool_rescreening'}
+    pool = gate8_cache['pool']
+    cand = pool[int(gate8_cache['candidate_index'])]
+    if len(cand['d_t']) != len(d_t) or not np.allclose(cand['d_t'], d_t, rtol=0.0, atol=1e-12):
+        return {'passed': False, 'reason': 'gate8_cache_does_not_reproduce_candidate_d_t'}
+    return aplc.evaluate_gate8_cached(int(gate8_cache['candidate_index']), pool, gate8_cache['sym_returns'], seed=placebo_seed,
+                                      return_equivalence=True)
 
 
 def evaluate_gate9_minimum_effect_size(d_t, min_effect_size_daily=AP['gate9_min_effect_size_daily']):
@@ -445,7 +359,6 @@ def evaluate_all_atomic_gates(
     stressed_r_var,
     k_cand=1,
     rho_bar=0.0,
-    candidate_pool_discordant_components=None,
     r_track_c=None,
     track_c_threshold_bps=DEFAULT_TRACK_C_SUPERIORITY_BPS,
     cost_slippage_hurdle=AP['gate2_cost_slippage_hurdle_daily'],
@@ -453,6 +366,7 @@ def evaluate_all_atomic_gates(
     placebo_seed=AP['base_seed'],
     observation_only=True,
     microstructure_checks=None,
+    gate8_cache=None,
 ):
     """Evaluate all 9 Atomic Gates (plus incremental superiority vs Track C when Track C exists) on the final decision day.
 
@@ -474,7 +388,10 @@ def evaluate_all_atomic_gates(
     )
     if live_champion and r_track_c is None:
         raise ValueError(f"track_c_champion_exists_incremental_superiority_required:{live_champion[0]['spawn_id']}")
-    k_cand_for_gate2 = int(k_cand) + (1 if r_track_c is not None else 0)
+    # C-11: Gate 2 reads the cumulative K_cand across spawn rounds; a smaller caller value can never lower it.
+    k_cand_cumulative = tc.cumulative_k_cand(db, namespace, int(strategy))['k_cand']
+    k_cand_base = max(int(k_cand), int(k_cand_cumulative))
+    k_cand_for_gate2 = k_cand_base + (1 if r_track_c is not None else 0)
 
     d_t = rc.compute_paired_active_returns(r_var, r_base)
 
@@ -494,12 +411,7 @@ def evaluate_all_atomic_gates(
         neighbor_improvements=neighbor_improvements,
     )
     g7 = evaluate_gate7_microstructure_stress(stressed_r_var=stressed_r_var, r_base=r_base, microstructure_checks=microstructure_checks)
-    g8 = evaluate_gate8_placebo(
-        r_var=r_var,
-        r_base=r_base,
-        candidate_pool_discordant_components=candidate_pool_discordant_components,
-        base_seed=placebo_seed,
-    )
+    g8 = evaluate_gate8_from_cache(gate8_cache, d_t, placebo_seed)
     g9 = evaluate_gate9_minimum_effect_size(d_t, min_effect_size_daily=min_effect_size_daily)
 
     track_c_cmp = None
@@ -543,6 +455,7 @@ def evaluate_all_atomic_gates(
         'track_c_comparison': track_c_cmp,
         'track_c_champion_present': bool(live_champion),
         'k_cand_supplied': int(k_cand),
+        'k_cand_cumulative_from_spawns': int(k_cand_cumulative),
         'k_cand_including_track_c_comparison': k_cand_for_gate2,
     }
     dhash = alog.compute_hash(full_details)
@@ -594,7 +507,7 @@ def evaluate_all_atomic_gates(
             'overall_passed': overall_passed,
             'status': status,
             'observation_only': bool(observation_only),
-            'placebo_90th_percentile_t': g8['placebo_90th_percentile_t'],
+            'placebo_threshold_t': g8.get('placebo_threshold_t'),
         },
         input_data=full_details,
         source_at=stamp,

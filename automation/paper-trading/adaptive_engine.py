@@ -131,26 +131,57 @@ def validate_parameter_only_mutation(strategy, params):
     return merged
 
 
-HARNESS_FILES = (
-    'adaptive_engine.py', 'adaptive_policy.py', 'adaptive_policy.json', 'atomic_gates.py', 'residualized_check.py',
-    'trial_counting.py', 'calibration.py', 'adaptive_promotion.py', 'adaptive_logging.py', 'pit_archive.py',
-    'strategy_indicators.py', 'strategy_rules.json', 'capital_policy.json', 'charge_rates.json',
+# G-05: harness_hash = SHA-256 over the git blob hashes of the adaptive Python modules, the adaptive dashboard read
+# module, adaptive_policy.json and freeze_lock.json. Paths are relative to this directory.
+HARNESS_PY_MODULES = (
+    'adaptive_engine.py', 'adaptive_policy.py', 'adaptive_promotion.py', 'adaptive_logging.py', 'atomic_gates.py',
+    'calibration.py', 'residualized_check.py', 'trial_counting.py', 'pit_archive.py', 'adaptive_ci.py',
+    'adaptive_guard.py', 'adaptive_observation.py', 'adaptive_placebo.py',
 )
+HARNESS_FILES = HARNESS_PY_MODULES + (AP['harness_dashboard_read_module'], 'adaptive_policy.json', 'freeze_lock.json')
 
 
-def compute_harness_hash():
-    """Compute a deterministic SHA-256 hash of the adaptive engine and indicator rules."""
-    root = Path(__file__).resolve().parent
-    h = hashlib.sha256()
+def git_blob_sha1(data):
+    """Git blob object id (identical to `git hash-object`) computed without a git binary."""
+    return hashlib.sha1(b'blob %d\0' % len(data) + data).hexdigest()
+
+
+def harness_manifest(root=None):
+    base = Path(root) if root else Path(__file__).resolve().parent
+    out = []
     for name in HARNESS_FILES:
-        p = root / name
+        p = (base / name).resolve()
         if not p.exists():
             raise FileNotFoundError(f'harness_file_missing:{name}')
-        h.update(name.encode() + b'\0' + p.read_bytes())
+        out.append((name, git_blob_sha1(p.read_bytes())))
+    return out
+
+
+def compute_harness_hash(root=None):
+    """G-05 harness_hash: SHA-256 over '<path> <git blob sha1>' lines, in HARNESS_FILES order."""
+    h = hashlib.sha256()
+    for name, blob in harness_manifest(root):
+        h.update(f'{name} {blob}\n'.encode())
     return h.hexdigest()
 
 
-def back_adjust_ohlc_pit(df, corp_actions, as_of_date):
+def verify_harness_hash(expected, root=None):
+    """Runner start check: refuse to run when the harness differs from the recorded hash (fail closed)."""
+    got = compute_harness_hash(root)
+    if not expected or got != str(expected):
+        raise RuntimeError(f'harness_hash_mismatch:expected_{expected}_got_{got}')
+    return got
+
+
+def corp_action_known_date(act):
+    """Date from which a corporate action is knowable: its announcement date when recorded, never before ex_date
+    for a late announcement, else its ex_date."""
+    ex_date = str(act.get('ex_date') or '')
+    ann = str(act.get('announcement_date') or '')[:10]
+    return max(ex_date, ann) if ann else ex_date
+
+
+def back_adjust_ohlc_pit(df, corp_actions, as_of_date, truncate_rows=True):
     """Back-adjust pre-ex-date OHLC prices for splits/bonuses strictly with ex_date <= as_of_date.
 
     Corporate actions with ex_date > as_of_date are never applied (zero look-ahead).
@@ -160,7 +191,10 @@ def back_adjust_ohlc_pit(df, corp_actions, as_of_date):
     if df is None or df.empty:
         return pd.DataFrame() if df is None else df.copy()
     as_of = str(as_of_date)
-    out = df[df['trade_date'].astype(str) <= as_of].copy().sort_values('trade_date').reset_index(drop=True)
+    src = df[df['trade_date'].astype(str) <= as_of] if truncate_rows else df
+    # truncate_rows=False is used only by the look-ahead truncation test: rows after as_of stay present (scaled with
+    # actions knowable at as_of) so an indicator that peeks forward changes its value at as_of and is caught.
+    out = src.copy().sort_values('trade_date').reset_index(drop=True)
     if out.empty or not corp_actions:
         return out
     for col in ('open', 'high', 'low', 'close'):
@@ -177,6 +211,8 @@ def back_adjust_ohlc_pit(df, corp_actions, as_of_date):
         ex_date = str(act.get('ex_date') or '')
         if not ex_date or ex_date > as_of:
             continue
+        if corp_action_known_date(act) > as_of:
+            continue  # late-announced action: not knowable at as_of even though its ex_date has passed
         if sym_col and act.get('symbol') and str(act['symbol']) != str(sym_col):
             continue
         num = act.get('ratio_num')
@@ -203,8 +239,8 @@ def evaluate_parameterized_strategy(strategy, df, params=None):
     if merged == BASELINE_PARAMS[s]:
         if s == 1:
             f = df.copy()
-            f['entry_condition'] = f.close > f.high.shift().rolling(20).max()
-            f['exit_condition'] = f.close < f.low.shift().rolling(10).min()
+            f['entry_condition'] = f.close > f.high.shift().rolling(merged['entry_lookback']).max()
+            f['exit_condition'] = f.close < f.low.shift().rolling(merged['exit_lookback']).min()
             return f
         return getattr(si_base, f'strategy_{s}')(df)
 
@@ -474,6 +510,62 @@ def value_starting_equity_net_of_haircut(cash_paise, open_positions, marks_by_sy
         'inherited_positions_count': sum(1 for p in open_positions if int(p.get('qty') or 0) > 0),
         'positions_without_adv_slippage': without_adv,
     }
+
+
+def liquidation_net_equity_paise(cash_paise, open_positions, marks_by_symbol=None, series_by_symbol=None,
+                                 locked_days_by_symbol=None, adv_paise_by_symbol=None, stress=False):
+    """D1/E5 (C-02): the single equity basis used for BOTH arms on EVERY day: cash + positions at mark minus the
+    exit haircut (frozen sell charges incl. DP, tiered exit slippage, lower-circuit haircut). E_0 and every EOD
+    equity use this same function, so d_t never mixes a gross MTM arm with a liquidation-net arm."""
+    v = value_starting_equity_net_of_haircut(
+        cash_paise=cash_paise, open_positions=open_positions, marks_by_symbol=marks_by_symbol,
+        series_by_symbol=series_by_symbol, locked_days_by_symbol=locked_days_by_symbol, stress=stress,
+        adv_paise_by_symbol=adv_paise_by_symbol,
+    )
+    return v['starting_equity_net_haircut_paise'], v
+
+
+def remark_ledger_liquidation_net(ledger_snapshot, stress=False):
+    """D2: re-mark a read-only Track A ledger snapshot on the liquidation-net basis.
+
+    ledger_snapshot = {'cash_paise': int, 'positions': [{'symbol','qty','mark_price','series','locked_days','adv_paise'}]}
+    The live ledger itself is never written; only the snapshot passed in is valued.
+    """
+    positions = [dict(p) for p in (ledger_snapshot.get('positions') or [])]
+    eq, detail = liquidation_net_equity_paise(
+        cash_paise=int(ledger_snapshot['cash_paise']),
+        open_positions=positions,
+        marks_by_symbol={p['symbol']: p['mark_price'] for p in positions if p.get('mark_price') is not None},
+        series_by_symbol={p['symbol']: p.get('series', 'EQ') for p in positions},
+        locked_days_by_symbol={p['symbol']: p.get('locked_days', 0) for p in positions},
+        adv_paise_by_symbol={p['symbol']: p.get('adv_paise') for p in positions if p.get('adv_paise')},
+        stress=stress,
+    )
+    return {'equity_paise': eq, 'basis': 'liquidation_net', **detail}
+
+
+def daily_returns_from_equity(equity_paise_series, e0_paise):
+    """R_t = E_t / E_{t-1} - 1 with E_0 as the first denominator; every E on the liquidation-net basis."""
+    prev = int(e0_paise)
+    if prev <= 0:
+        raise ValueError('e0_must_be_positive')
+    out = []
+    for e in equity_paise_series:
+        e = int(e)
+        out.append((e - prev) / float(prev))
+        prev = e
+    return out
+
+
+def paired_active_returns_same_basis(arm_var, arm_base):
+    """d_t = R_var,t - R_base,t where both arms are {'e0_paise', 'equity_paise': [...], 'basis'} on one basis."""
+    if arm_var.get('basis') != 'liquidation_net' or arm_base.get('basis') != 'liquidation_net':
+        raise ValueError('both_arms_must_use_liquidation_net_basis')
+    rv = daily_returns_from_equity(arm_var['equity_paise'], arm_var['e0_paise'])
+    rb = daily_returns_from_equity(arm_base['equity_paise'], arm_base['e0_paise'])
+    if len(rv) != len(rb):
+        raise ValueError('arms_must_cover_the_same_sessions')
+    return [a - b for a, b in zip(rv, rb)]
 
 
 def classify_discordant_trades(var_trades, base_trades, warm_start_end_date):
@@ -1002,26 +1094,18 @@ def simulate_track_window(
             series_map[sym] = pit.get_pit_series(db, sym, day, as_of_date=day) or pos.get('series') or 'UNKNOWN'
             locked_map[sym] = pos.get('locked_days', 0)
 
-        # At the end of the warm-start window, record starting equity E_0 net of exit haircut
+        # One liquidation-net basis (C-02/E5) for E_0 and for every end-of-day equity.
+        eod_equity_paise, eod_detail = liquidation_net_equity_paise(
+            cash_paise=cash_paise,
+            open_positions=list(positions.values()),
+            marks_by_symbol=marks,
+            series_by_symbol=series_map,
+            locked_days_by_symbol=locked_map,
+            adv_paise_by_symbol=adv_map,
+            stress=stress_slippage,
+        )
         if day == ws_end:
-            starting_equity_summary = value_starting_equity_net_of_haircut(
-                cash_paise=cash_paise,
-                open_positions=list(positions.values()),
-                marks_by_symbol=marks,
-                series_by_symbol=series_map,
-                locked_days_by_symbol=locked_map,
-                stress=stress_slippage,
-                adv_paise_by_symbol=adv_map,
-            )
-
-        # Value end-of-day total portfolio equity (unlevered total MTM including cash)
-        marked_val = 0
-        for sym, pos in positions.items():
-            gross_pos = pos['qty'] * cap.price_paise(pos['mark_price'])
-            if pos.get('pending_exit'):
-                gross_pos -= circuit_haircut_paise(gross_pos, pos.get('locked_days', 0))
-            marked_val += gross_pos
-        eod_equity_paise = cash_paise + marked_val
+            starting_equity_summary = eod_detail
 
         if in_eval:
             prev_eq = (
@@ -1033,6 +1117,9 @@ def simulate_track_window(
             daily_records.append({
                 'trade_date': day,
                 'equity_paise': eod_equity_paise,
+                'equity_basis': 'liquidation_net',
+                'gross_equity_paise': eod_detail['starting_equity_gross_paise'],
+                'exit_haircut_paise': eod_detail['exit_haircut_paise'],
                 'cash_paise': cash_paise,
                 'open_positions': len(positions),
                 'return': r_t,
@@ -1068,6 +1155,7 @@ def simulate_track_window(
         'warm_start_days': len(ws_dates),
         'eval_days': len(ev_dates),
         'starting_equity': starting_equity_summary,
+        'equity_basis': 'liquidation_net',
         'daily_records': daily_records,
         'closed_trades': closed_trades,
         'open_positions': list(positions.values()),

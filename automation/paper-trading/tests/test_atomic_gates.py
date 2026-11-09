@@ -4,6 +4,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from adaptive_fixtures import gate8_cache_from_series
 import adaptive_engine as ae
 import adaptive_logging as alog
 import atomic_gates as ag
@@ -110,6 +112,7 @@ class AtomicGatesTests(unittest.TestCase):
             track_c_threshold_bps=0.35,
             observation_only=True,
             microstructure_checks=dict.fromkeys(ag.MICROSTRUCTURE_LOCKS, True),
+            gate8_cache=gate8_cache_from_series(r_var, r_base),
         )
         self.assertTrue(res['overall_passed'])
         self.assertEqual(res['status'], 'OBSERVATION_ONLY')
@@ -119,9 +122,10 @@ class AtomicGatesTests(unittest.TestCase):
         # Verify Gate 8 ran M = 250 placebo runs and jittered only discordant days
         g8 = res['details']['gate_8']
         self.assertEqual(g8['m_runs'], 250)
-        self.assertEqual(g8['discordant_days_jittered'], 30)
-        self.assertEqual(g8['concordant_days_untouched'], 30)
-        self.assertGreater(g8['observed_t_hac'], g8['placebo_90th_percentile_t'])
+        self.assertEqual(g8['new_discordant_trades'], 30)  # only the 30 discordant trades are jittered
+        self.assertEqual(g8['pool_size'], 3)  # spawn-time screening re-run over the whole pool
+        self.assertEqual(g8['cache_equivalence_max_abs_diff'], 0.0)
+        self.assertGreater(g8['observed_t_hac'], g8['placebo_threshold_t'])
 
         # Verify Track C comparison counted as a trial
         tc_cmp = res['details']['track_c_comparison']
