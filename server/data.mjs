@@ -2,6 +2,7 @@ import {cappedLedger,PUBLIC_LABELS} from './capped-ledger.mjs';
 import {readAutomation} from './automation-read.mjs';
 import {DEMO_NAMESPACE,DEMO_SELECT} from './demo-read.mjs';
 import {createClient} from '@libsql/client/web';
+import {loadExitInputs,planFor,pauseStates,pauseFor,entryPlan,entryCosts,entrySignals,positionMoney} from './exit-plan.mjs';
 import {readLedgerView,runHealth,runSummary,enrichFills,industryOf,LEDGER_VIEWS,SIGNAL_STATUSES,RUN_KINDS,STRATEGY_VIEWS} from './ledger-read.mjs';
 export const NAMESPACE='paper_v1';
 export const IST='Asia/Kolkata';
@@ -20,7 +21,7 @@ export function positionView(row,now=Date.now()){
  const state=!valid?'missing':age===null?'missing':age< -5?'future':age>60?'stale':'fresh';
  return {...row,qty,entry_price:entry,mark_price:valid?mark:null,mark_age_seconds:age,mark_stale:!valid||age===null||age>60||age< -5,mark_state:state,unrealized_pnl:valid&&qty!==null&&entry!==null?(mark-entry)*qty:null,unrealized_pct:valid&&entry>0?(mark-entry)/entry*100:null,cost_basis:qty!==null&&entry!==null?entry*qty:null,market_value:valid&&qty!==null?mark*qty:null,high_water:numeric(row.high_water)};
 }
-export function publicRows(rows){return rows.map(row=>{const r={...row};if('reason' in r){const known=['daily_entry:beta_momentum_v1','blocked_prefilter_missing_active_pass','daily_entry','observed_LTP_below_close_highwater_stop','market_closed_or_unverified','provider_quote_error','nonpositive_or_missing_price','missing_exchange_timestamp','stale_or_future_quote','quote_outside_verified_session','fresh','unverified_or_closed_session_candle','invalid_Fyers_OHLC','nonpositive_nonfinite_or_inconsistent_OHLC'];r.reason=known.includes(r.reason)||/^daily_entry:[A-Za-z0-9_.-]{1,60}$/.test(r.reason)?r.reason:/^daily_exit:\d{4}-\d{2}-\d{2}T[0-9:.+Z-]{8,40}$/.test(r.reason)?r.reason:'recorded_event';}if('status' in r&&!['blocked_prefilter','pending','filled','ignored_state','ignored_stale_position','ignored_same_bar','shadow_closed','expired','closed','ok','partial','failed','success','noop'].includes(r.status))r.status='recorded';if('kind' in r&&!['monitor','scan','bootstrap','probe','init','pnl','status'].includes(r.kind))r.kind='engine_run';if('source' in r)r.source=r.source==='FYERS_QUOTES'?'FYERS_QUOTES':'market_data';return r;});}
+export function publicRows(rows){return rows.map(row=>{const r={...row};if('reason' in r){const known=['trail_gap','trail_touch','pending_exit_carry','daily_entry:beta_momentum_v1','blocked_prefilter_missing_active_pass','daily_entry','observed_LTP_below_close_highwater_stop','market_closed_or_unverified','provider_quote_error','nonpositive_or_missing_price','missing_exchange_timestamp','stale_or_future_quote','quote_outside_verified_session','fresh','unverified_or_closed_session_candle','invalid_Fyers_OHLC','nonpositive_nonfinite_or_inconsistent_OHLC'];r.reason=known.includes(r.reason)||/^daily_entry:[A-Za-z0-9_.-]{1,60}$/.test(r.reason)?r.reason:/^daily_exit:\d{4}-\d{2}-\d{2}T[0-9:.+Z-]{8,40}$/.test(r.reason)?r.reason:'recorded_event';}if('status' in r&&!['blocked_prefilter','pending','filled','ignored_state','ignored_stale_position','ignored_same_bar','shadow_closed','expired','closed','ok','partial','failed','success','noop'].includes(r.status))r.status='recorded';if('kind' in r&&!['monitor','scan','bootstrap','probe','init','pnl','status'].includes(r.kind))r.kind='engine_run';if('source' in r)r.source=r.source==='FYERS_QUOTES'?'FYERS_QUOTES':'market_data';return r;});}
 export function parseOptions(query={}){
  const view=query.view??'overview';if(!['overview','fills','positions','signals','runs','quotes','history','demo','analytics','scan','qualifiers','prefilter',...LEDGER_VIEWS].includes(view))throw new Error('BAD_REQUEST');
  const integer=(v,def,max)=>{const n=v===undefined?def:Number(v);if(!Number.isInteger(n)||n<1||n>max)throw new Error('BAD_REQUEST');return n;};
@@ -86,9 +87,18 @@ export async function readDashboard(options,execute,now=new Date()){
   if(options.kind!==undefined){where+=' AND kind=?';args.push(options.kind);}
   if(options.accepted!==undefined){where+=' AND accepted=?';args.push(options.accepted);}
   if(options.scope==='today'){where+=` AND date(${d.date},'+5 hours','+30 minutes')=?`;args.push(day);}
-  const [counts,rows]=await Promise.all([select(`SELECT COUNT(*) AS total FROM ${d.table} WHERE ${where}`,args),select(`SELECT ${d.fields} FROM ${d.table} WHERE ${where} ORDER BY ${d.order} LIMIT ? OFFSET ?`,[...args,options.limit,(options.page-1)*options.limit])]);
+  const pageArgs=[...args,options.limit,(options.page-1)*options.limit];
+  const rowsSql=fields=>`SELECT ${fields} FROM ${d.table} WHERE ${where} ORDER BY ${d.order} LIMIT ? OFFSET ?`;
+  // Newer engine columns (pending_exit on positions, execution_path on fills) are read when present; older databases fall back to the base fields.
+  const extra={positions:',pending_exit,pending_exit_since',fills:',execution_path'}[options.view];
+  const readRows=async()=>{if(!extra)return select(rowsSql(d.fields),pageArgs);try{return await select(rowsSql(d.fields+extra),pageArgs);}catch(e){if(/no such column/i.test(String(e?.message??'')))return select(rowsSql(d.fields),pageArgs);throw e;}};
+  const [counts,rows]=await Promise.all([select(`SELECT COUNT(*) AS total FROM ${d.table} WHERE ${where}`,args),readRows()]);
   const base={readAt:now.toISOString(),namespace:NAMESPACE,view:options.view,market:marketState(now),page:options.page,limit:options.limit,total:Number(counts[0].total)};
-  if(options.view==='positions')return {...base,rows:rows.map(r=>({...positionView(r,now.getTime()),industry:industryOf(r.symbol)}))};
+  if(options.view==='positions'){
+   // Stop / target / exit rule per position: S7 trail = trail_level(high_water) from config TRAIL; S1-6 rule levels only from stored completed bars.
+   const views=rows.map(r=>positionView(r,now.getTime()));const [inputs,pauses,costs,entries]=await Promise.all([loadExitInputs(select,NAMESPACE,views),pauseStates(select,NAMESPACE),entryCosts(select,NAMESPACE,views),entrySignals(select,NAMESPACE,views)]);
+   return {...base,pausesAvailable:pauses.available,rows:views.map(v=>{const {pending_exit,pending_exit_since,...p}=v;return {...p,industry:industryOf(v.symbol),pending_exit:pending_exit===undefined||pending_exit===null?null:Number(pending_exit)===1,pending_exit_since:typeof pending_exit_since==='string'?pending_exit_since:null,exit_plan:planFor(v,inputs),entry_pause:pauseFor(pauses,v.strategy),...positionMoney(v,costs,now.getTime()),entry_signal:entries.get(`${Number(v.strategy)}|${v.symbol}|${v.entry_at}`)??null};})};
+  }
   if(options.view==='runs'){const health=await runHealth(select,NAMESPACE);return {...base,health:{...health,latestByKind:publicRows(health.latestByKind)},rows:publicRows(rows.map(({details_json,...r})=>({...r,summary:runSummary(details_json)})))};}
   if(options.view==='fills'){const e=await enrichFills(select,NAMESPACE,publicRows(rows));return {...base,...e};}
   if(options.view==='signals'){
@@ -96,7 +106,21 @@ export async function readDashboard(options,execute,now=new Date()){
    const ids=rows.map(r=>r.id).filter(Boolean);let fills=[];
    if(ids.length)fills=await select(`SELECT signal_id,qty,price,filled_at FROM paper_fills WHERE namespace=? AND signal_id IN (${ids.map(()=>'?').join(',')})`,[NAMESPACE,...ids]);
    const byId=new Map(fills.map(f=>[f.signal_id,f]));
-   return {...base,rows:publicRows(rows).map(r=>{const f=byId.get(r.id);return {...r,fill_qty:f?numeric(f.qty):null,fill_price:f?numeric(f.price):null,filled_at:f?.filled_at??null};})};
+   // Pending orders: exits carry the held position's current stop / rule level; entries carry the policy sizing context and the signal-bar close.
+   // Current price for each order's stock: the latest accepted recorded quote (never fetched live here).
+   const qs=[...new Set(rows.map(r=>r.symbol))];const lastQuote=new Map();
+   if(qs.length)for(const q of await select(`SELECT q.symbol,q.price,q.quote_at FROM paper_quote_audit q WHERE q.namespace=? AND q.accepted=1 AND q.price>0 AND q.symbol IN (${qs.map(()=>'?').join(',')}) AND q.id=(SELECT MAX(m.id) FROM paper_quote_audit m WHERE m.namespace=q.namespace AND m.symbol=q.symbol AND m.accepted=1 AND m.price>0)`,[NAMESPACE,...qs]))lastQuote.set(q.symbol,{price:numeric(q.price),quote_at:q.quote_at??null});
+   const pend=rows.filter(r=>r.status==='pending');let held=[],plans=new Map(),closes=new Map(),pauses={available:false,rows:[]};
+   if(pend.length){
+    const sells=pend.filter(r=>r.side==='SELL'),buys=pend.filter(r=>r.side==='BUY');
+    if(sells.length){const syms=[...new Set(sells.map(r=>r.symbol))];held=(await select(`SELECT strategy,symbol,qty,entry_price,entry_at,high_water,mark_price,mark_at,updated_at FROM paper_positions WHERE namespace=? AND qty>0 AND symbol IN (${syms.map(()=>'?').join(',')})`,[NAMESPACE,...syms])).map(r=>positionView(r,now.getTime()));const inputs=await loadExitInputs(select,NAMESPACE,held);plans=new Map(held.map(p=>[`${p.strategy}|${p.symbol}`,planFor(p,inputs)]));}
+    if(buys.length){try{const bs=[...new Set(buys.map(r=>r.symbol))],bd=[...new Set(buys.map(r=>r.bar_date))];const q=await select(`SELECT strategy,symbol,bar_date,plan_json FROM paper_qualifier_states WHERE namespace=? AND symbol IN (${bs.map(()=>'?').join(',')}) AND bar_date IN (${bd.map(()=>'?').join(',')})`,[NAMESPACE,...bs,...bd]);for(const r of q){let plan={};try{plan=JSON.parse(r.plan_json);}catch{/* unreadable plan stays unavailable */}closes.set(`${r.strategy}|${r.symbol}|${r.bar_date}`,plan&&typeof plan==='object'?plan:{});}}catch(e){if(!/no such (table|column)/i.test(String(e?.message??'')))throw e;}}
+    pauses=await pauseStates(select,NAMESPACE);
+   }
+   return {...base,rows:publicRows(rows).map(r=>{const f=byId.get(r.id);const lq=lastQuote.get(r.symbol);const out={...r,fill_qty:f?numeric(f.qty):null,fill_price:f?numeric(f.price):null,filled_at:f?.filled_at??null,current_price:lq?.price??null,current_quote_at:lq?.quote_at??null};
+    if(r.status!=='pending')return out;const k=`${r.strategy}|${r.symbol}`;
+    if(r.side==='SELL'){const plan=plans.get(k)??null;const p=held.find(x=>`${x.strategy}|${x.symbol}`===k);return {...out,exit_plan:plan,position:p?{qty:p.qty,entry_price:p.entry_price,mark_price:p.mark_price,mark_state:p.mark_state,high_water:p.high_water}:null};}
+    return {...out,entry_plan:entryPlan(r,closes.get(`${k}|${r.bar_date}`)),entry_pause:pauseFor(pauses,r.strategy)};})};
   }
   if(options.view==='quotes')return {...base,rows:publicRows(rows).map(r=>{const o=Date.parse(r.observed_at),q=Date.parse(r.quote_at);return {...r,price:numeric(r.price),lag_seconds:Number.isFinite(o)&&Number.isFinite(q)?(o-q)/1000:null};})};
   return {...base,rows:publicRows(rows)};

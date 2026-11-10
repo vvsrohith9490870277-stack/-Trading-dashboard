@@ -4,6 +4,9 @@ import {act, cleanup, fireEvent, render, screen, within} from '@testing-library/
 import Portal from '../src/portal/Portal';
 import {clearStaticCache} from '../src/portal/data';
 import {LEDGER_TABS} from '../src/portal/LedgerBrowser';
+import {exitPlan} from '../server/exit-plan.mjs';
+import {trailLevel} from '../src/exitRules.js';
+import {allocation, monthlyPnl, returnDistribution, stopRisk, tradeFrequency} from '../src/portal/ledger-stats';
 import {fillStats, groupBy, rangeBounds, sessionSlots, signalKind, tradeStats} from '../src/portal/ledger-stats';
 
 const sleeve = (open, net) => ({cash_paise: 50000000, market_value_paise: 0, equity_paise: 50000000 + net, net_pnl_paise: net, open_positions: open, slots_max: 9});
@@ -20,8 +23,10 @@ const overview = {
 };
 const page = rows => ({total: rows.length, page: 1, limit: 25, rows, market: overview.market});
 const ROWS = {
-  positions: [{strategy: 7, symbol: 'MAHABANK-EQ', industry: 'Financial Services', qty: 1, entry_price: 86.9, cost_basis: 86.9, mark_price: 87.1, market_value: 87.1, unrealized_pnl: 0.2, unrealized_pct: 0.23, high_water: 87, mark_state: 'stale', mark_age_seconds: 4000, mark_at: '2026-11-09T09:59:00Z', entry_at: '2026-11-09T06:00:00Z', updated_at: '2026-11-09T09:59:00Z'},
-    {strategy: 1, symbol: 'ABB-EQ', qty: 1, entry_price: 100, cost_basis: 100, mark_price: null, market_value: null, unrealized_pnl: null, unrealized_pct: null, mark_state: 'missing', mark_age_seconds: null, entry_at: '2026-11-09T06:00:00Z'}],
+  positions: [{strategy: 7, symbol: 'MAHABANK-EQ', industry: 'Financial Services', qty: 1, entry_price: 86.9, cost_basis: 86.9, mark_price: 87.1, market_value: 87.1, unrealized_pnl: 0.2, unrealized_pct: 0.23, high_water: 87, mark_state: 'stale', mark_age_seconds: 4000, mark_at: '2026-11-09T09:59:00Z', entry_at: '2026-11-09T06:00:00Z', updated_at: '2026-11-09T09:59:00Z',
+      exit_plan: exitPlan({strategy: 7, qty: 1, entry_price: 86.9, high_water: 87, mark_price: 87.1, mark_state: 'stale'}), gross_pnl_paise: 20, entry_charges_paise: 1800, est_exit_charges_paise: 1850, charges_paise: 3650, net_unrealized_paise: -3630, net_return_pct: -41.77, break_even: 123.4, charges_note: 'Entry: recorded fee row.', pending_exit: false, entry_pause: {paused: false}, entry_signal: {signal_id: 'sig-7', bar_date: '2026-11-06', reason: 'daily_entry:beta_momentum_v1'}},
+    {strategy: 1, symbol: 'ABB-EQ', qty: 1, entry_price: 100, cost_basis: 100, mark_price: null, market_value: null, unrealized_pnl: null, unrealized_pct: null, mark_state: 'missing', mark_age_seconds: null, entry_at: '2026-11-09T06:00:00Z',
+      exit_plan: exitPlan({strategy: 1, qty: 1, entry_price: 100, high_water: 100, mark_price: null}, {bars: []}), gross_pnl_paise: null, charges_paise: null, net_unrealized_paise: null, break_even: null, charges_note: 'No fee row is recorded for the entry fill (legacy fill), so charges are unavailable, not zero.'}],
   fills: [{id: 7, strategy: 3, symbol: 'CUPID-EQ', side: 'SELL', qty: 2, price: 120, quote_at: '2026-11-09T05:00:00Z', filled_at: '2026-11-09T05:00:01Z', reason: 'daily_exit:2026-11-06T10:00:00+05:30', realized_pnl: 20, cashflow: 240,
     costs: {turnover_paise: 24000, charges_paise: 45, gross_cashflow_paise: 24000, net_cashflow_paise: 23955, policy_version: 'FYERS_v2', fees: {brokerage: 20, stt: 24, exchange: 1, sebi: 0, ipft: 0, clearing: 0, stamp: 0, gst: 0, dp: 0, dp_gst: 0, total: 45}}},
     {id: 6, strategy: 3, symbol: 'CUPID-EQ', side: 'BUY', qty: 2, price: 110, quote_at: '2026-11-06T05:00:00Z', filled_at: '2026-11-06T05:00:01Z', reason: 'daily_entry', realized_pnl: 0, cashflow: -220, costs: null}],
@@ -71,7 +76,7 @@ describe('paper ledger tab parity', () => {
     mock({hold: {view: 'fills', promise}}); at('/paper'); render(<Portal/>);
     await screen.findByText('Monitoring / mark');
     expect(screen.getByText(/stale · 67m \(market closed\)/)).toBeInTheDocument();
-    expect(within(screen.getByRole('table', {name: 'positions'})).getByText('missing')).toBeInTheDocument();
+    expect(within(screen.getByRole('table', {name: 'positions'})).getAllByText('missing')[0]).toBeInTheDocument();
     fireEvent.click(tab('Fills'));
     expect(await screen.findByText('Loading fills…')).toBeInTheDocument();
     expect(screen.queryByText('Monitoring / mark')).toBeNull();
@@ -84,6 +89,25 @@ describe('paper ledger tab parity', () => {
     fireEvent.click(within(table).getAllByRole('row')[1]);
     expect(await screen.findByRole('region', {name: 'Fill details'})).toBeInTheDocument();
     expect(screen.getByText('STT')).toBeInTheDocument();
+  });
+
+  it('positions show the S7 trail stop, rule text for S1, no target, no R:R, charges and read-only actions', async () => {
+    mock(); at('/paper'); render(<Portal/>);
+    await screen.findByText('Monitoring / mark');
+    const table = screen.getByRole('table', {name: 'positions'});
+    for (const h of ['Signal', 'Stop', 'Target', 'R:R', 'Break-even', 'Gross P&L', 'Taxes & charges', 'Net unrealized', '% Net return', 'Status', 'Open time', 'Action']) expect(within(table).getByRole('columnheader', {name: h})).toBeInTheDocument();
+    expect(within(table).getByText('₹' + trailLevel(87).toFixed(2))).toBeInTheDocument();
+    expect(within(table).getByText(/No fixed stop · Close below the prior 10-session low/)).toBeInTheDocument();
+    expect(within(table).getAllByText(/No fixed target · exit:/)).toHaveLength(2);
+    expect(within(table).getAllByText('— (no target)')).toHaveLength(2);
+    expect(within(table).getByText('₹123.40')).toBeInTheDocument();
+    expect(within(table).getAllByText('Exit / square off · read-only')).toHaveLength(2);
+    expect(within(table).queryByRole('button', {name: /exit|square/i})).toBeNull();
+    expect(screen.getByText('Total capital')).toBeInTheDocument();
+    fireEvent.click(within(table).getAllByRole('row')[1]);
+    const detail = await screen.findByRole('region', {name: 'Position details'});
+    expect(within(detail).getByText(/risk distance, not risk:reward/)).toBeInTheDocument();
+    expect(within(detail).getByText(/Strategy 07 trail ·/)).toBeInTheDocument();
   });
 
   it('recent fills says it is capped and opens the complete Fills tab', async () => {
@@ -99,13 +123,16 @@ describe('paper ledger tab parity', () => {
     await screen.findByText('Browse the paper ledger');
     fireEvent.click(tab('Orders'));
     await screen.findByText('Expected execution');
-    expect(screen.getByText('2026-11-11 session')).toBeInTheDocument();
+    expect(screen.getAllByText('2026-11-11 session').length).toBeGreaterThan(0);
+    for (const h of ['Order ID', 'Signal', 'Strategy', 'Order type', 'Quantity', 'Order price', 'Current price', 'Order status', 'Created time', 'Execution time', 'Remarks', 'Action']) expect(screen.getByRole('columnheader', {name: h})).toBeInTheDocument();
+    expect(screen.getByText('Edit / cancel · read-only')).toBeInTheDocument();
     expect(calls.some(c => c.includes('view=signals') && c.includes('status=pending'))).toBe(true);
     fireEvent.click(tab('History'));
     await screen.findByRole('columnheader', {name: 'Net P&L'});
+    for (const h of ['Break-even', 'Gross P&L', 'Charges', 'Net %', 'Signal', 'Strategy', 'Score', 'Opened', 'Closed', 'Exit reason', 'Hold']) expect(screen.getByRole('columnheader', {name: h})).toBeInTheDocument();
     fireEvent.click(within(screen.getByRole('table', {name: 'history'})).getAllByRole('row')[1]);
     expect(await screen.findByRole('region', {name: 'Trade exit details'})).toBeInTheDocument();
-    expect(screen.getByText('Completed-bar daily exit rule')).toBeInTheDocument();
+    expect(screen.getAllByText('Completed-bar daily exit rule').length).toBeGreaterThan(0);
     fireEvent.click(tab('Alerts'));
     await screen.findByText('Threshold');
     expect(screen.getByText('Price alerts you set yourself are unavailable.')).toBeInTheDocument();
@@ -134,9 +161,14 @@ describe('paper ledger tab parity', () => {
     expect(tileOf('Win rate')).toHaveTextContent('50.0%');
     expect(tileOf('Profit factor')).toHaveTextContent('4.00');
     expect(screen.getByText(/Max drawdown \/ Sharpe \/ Sortino/)).toBeInTheDocument();
+    for (const t of ['Monthly P&L (realized, gross, by exit month)', 'Win / loss distribution (gross return % per closed trade)', 'Trade frequency (per IST session day)']) expect(screen.getByText(t)).toBeInTheDocument();
+    expect(await screen.findByText('S07 open risk to trail stops')).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', {name: 'Custom'}));
+    expect(screen.getByLabelText('Custom range from')).toBeInTheDocument();
     fireEvent.click(tab('Daily'));
     await screen.findByText('2026-11-09 snapshot');
     expect(screen.getByText('Daily journal')).toBeInTheDocument();
+    expect(screen.getByRole('button', {name: 'Export session CSV'})).toBeInTheDocument();
     fireEvent.click(tab('Capital'));
     await screen.findByText('Starting capital');
     expect(screen.getByText('Sleeve cash after')).toBeInTheDocument();
@@ -145,6 +177,23 @@ describe('paper ledger tab parity', () => {
 });
 
 describe('ledger statistics', () => {
+  it('monthly, distribution, frequency, allocation and stop risk use only real rows', () => {
+    const t = [{closed_at: '2026-10-30T05:00:00Z', realized_pnl: 10, pnl_pct: 6}, {closed_at: '2026-11-03T05:00:00Z', realized_pnl: -4, pnl_pct: -3}, {closed_at: '2026-11-04T05:00:00Z', realized_pnl: null, pnl_pct: null}];
+    expect(monthlyPnl(t)).toEqual([{month: '2026-10', trades: 1, pnl: 10}, {month: '2026-11', trades: 1, pnl: -4}]);
+    const d = returnDistribution(t); expect(d.reduce((a, b) => a + b.trades, 0)).toBe(2); expect(d.find(b => b.label === '> 5%').trades).toBe(1); expect(d.find(b => b.label === '−5% to −2%').trades).toBe(1);
+    expect(tradeFrequency(t.slice(0, 1), [{filled_at: '2026-10-30T04:00:00Z'}])).toEqual([{day: '2026-10-30', closed: 1, fills: 1}]);
+    const a = allocation([{industry: 'X', market_value: 300}, {industry: 'Y', market_value: 100}, {industry: 'Y', market_value: null}], p => p.industry);
+    expect(a.total).toBe(400); expect(a.missing).toBe(1); expect(a.rows[0]).toMatchObject({key: 'X', share: 75});
+    const plan = exitPlan({strategy: 7, qty: 2, entry_price: 100, high_water: 100, mark_price: 95});
+    const r = stopRisk([{symbol: 'A', exit_plan: plan}, {symbol: 'B', exit_plan: exitPlan({strategy: 2, qty: 1, entry_price: 1, high_water: 1, mark_price: 1})}]);
+    expect(r).toMatchObject({positions: 1, priced: 1, withMark: 1}); expect(r.openRisk).toBeCloseTo((95 - trailLevel(100)) * 2); expect(r.entryRisk).toBeCloseTo((100 - trailLevel(100)) * 2);
+  });
+
+  it('session CSV contains only loaded ledger rows', async () => {
+    const {sessionCsv} = await import('../src/portal/LedgerBrowser');
+    const csv = sessionCsv('2026-11-09', ROWS.fills.slice(0, 1), ROWS.trades.slice(0, 1));
+    expect(csv.trim().split('\n')).toHaveLength(3);expect(csv).toContain('fill,2026-11-09T05:00:01Z,CUPID-EQ,3,SELL,2,120');expect(csv).toContain('trade,');
+  });
   it('computes trade stats, streaks and groups without inventing missing values', () => {
     const t = [
       {symbol: 'A', strategy: 1, realized_pnl: 10, closed_at: '2026-11-03T05:00:00Z', opened_at: '2026-11-03T04:00:00Z', hold_hours: 1, entry_price: 100, exit_price: 110, qty: 1, entry_matched: true, pnl_pct: 10, net_pnl_paise: 900, charges_paise: 100},

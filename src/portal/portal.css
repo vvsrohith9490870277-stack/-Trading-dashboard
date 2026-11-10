@@ -290,3 +290,64 @@
 .ad-muted-cell{color:var(--ad-faint);font-size:12px}
 .ad-chip{height:30px;padding:0 12px;border:1px solid var(--ad-line);border-radius:999px;background:var(--ad-raised);color:var(--ad-dim);font-size:12px}
 .ad-chip.on{background:var(--ad-surface);color:var(--ad-text);border-color:var(--ad-brand)}
+
+/* Ledger palette: colour language taken from the old-trading desk tokens (frontend/src/styles.css):
+   soft light cards, muted slate borders, blue/teal primary, amber warning chips, green/red P&L.
+   Scoped to the ledger section only; layout and typography stay Atlas Desk. */
+.ad-root .ad-ledger-palette{
+  --ad-surface:#141a22;--ad-raised:#1a222d;--ad-line:#2a3444;--ad-line-soft:#222b38;
+  --ad-brand:#3b82f6;--ad-info:#38bdf8;--ad-teal:#14b8a6;
+  --ad-up:#22c55e;--ad-down:#ef4444;--ad-warn:#f59e0b;
+  --ad-up-bg:#22c55e1f;--ad-down-bg:#ef44441f;--ad-warn-bg:#f59e0b24;--ad-info-bg:#38bdf81c;
+}
+.ad-root[data-theme="light"] .ad-ledger-palette{
+  --ad-surface:#ffffff;--ad-raised:#f7f9fc;--ad-line:#e2e8f0;--ad-line-soft:#eef2f7;
+  --ad-text:#0f172a;--ad-dim:#334155;--ad-faint:#64748b;
+  --ad-brand:#2563eb;--ad-info:#0284c7;--ad-teal:#0d9488;
+  --ad-up:#15803d;--ad-down:#b91c1c;--ad-warn:#d97706;
+  --ad-up-bg:#16a34a14;--ad-down-bg:#dc262614;--ad-warn-bg:#d977061f;--ad-info-bg:#0284c714;
+}
+.ad-ledger-palette .ad-tile{background:var(--ad-raised);border-color:var(--ad-line)}
+.ad-ledger-palette .ad-tag{border-radius:999px}
+.ad-ledger-palette .ad-chip.on{background:var(--ad-brand);color:#fff;border-color:var(--ad-brand)}
+.ad-ledger-palette .ad-stop strong{color:var(--ad-teal)}
+.ad-ledger-palette .ad-account-strip .ad-tile{border-left:3px solid var(--ad-brand)}
+.ad-tags{display:inline-flex;gap:4px;flex-wrap:wrap}
+.ad-stop{white-space:nowrap}
+.ad-bar-cell{display:inline-flex;align-items:center;gap:6px;justify-content:flex-end;min-width:90px}
+.ad-bar-cell i{display:inline-block;height:6px;border-radius:3px;background:var(--ad-teal,var(--ad-brand));max-width:60px}
+
+/* Ledger on phones (~375px): tables scroll horizontally inside their card with the first column
+   (the stock / time that identifies the row) pinned, so no label is clipped; tabs scroll in one row;
+   account strip and tiles become two compact columns; detail panels stack. */
+.ad-ledger-palette .ad-table-scroll{-webkit-overflow-scrolling:touch;overscroll-behavior-x:contain;max-width:100%}
+.ad-ledger-palette .ad-table thead th:first-child,.ad-ledger-palette .ad-table tbody td:first-child{position:sticky;left:0;z-index:1;background:var(--ad-surface);box-shadow:1px 0 0 var(--ad-line)}
+.ad-ledger-palette .ad-table thead th:first-child{background:var(--ad-raised);z-index:2}
+.ad-ledger-palette .ad-ledger-tab,.ad-ledger-palette .ad-section,.ad-ledger-palette .ad-table-wrap{min-width:0;max-width:100%}
+@media (max-width:640px){
+  .ad-ledger-palette .ad-ledger-tabs .ad-tabs{flex-wrap:nowrap;width:auto;max-width:none}
+  .ad-ledger-palette .ad-ledger-tabs{overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:thin;padding-bottom:4px}
+  .ad-ledger-palette .ad-tabs button{white-space:nowrap;padding:8px 12px;font-size:13px;min-height:36px}
+  .ad-ledger-palette .ad-section-head{flex-direction:column;align-items:stretch;gap:8px}
+  .ad-ledger-palette .ad-ledger-filters{width:100%}
+  .ad-ledger-palette .ad-ledger-filters .ad-input{flex:1 1 140px;min-width:0;min-height:36px;font-size:14px}
+  .ad-ledger-palette .ad-tiles{grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+  .ad-ledger-palette .ad-tile{min-width:0;padding:10px}
+  .ad-ledger-palette .ad-tile-value{font-size:16px;overflow-wrap:anywhere}
+  .ad-ledger-palette .ad-tile-label,.ad-ledger-palette .ad-tile-hint{overflow-wrap:anywhere;white-space:normal}
+  .ad-ledger-palette .ad-table{font-size:13px}
+  .ad-ledger-palette .ad-table td,.ad-ledger-palette .ad-table tbody th{padding:8px 10px}
+  .ad-ledger-palette .ad-table thead th button{padding:8px 10px}
+  .ad-ledger-palette .ad-table thead th:first-child,.ad-ledger-palette .ad-table tbody td:first-child{max-width:42vw;overflow:hidden;text-overflow:ellipsis}
+  .ad-ledger-palette .ad-detail-grid{grid-template-columns:1fr}
+  .ad-ledger-palette .ad-kv div{grid-template-columns:1fr;gap:2px}
+  .ad-ledger-palette .ad-kv dd{overflow-wrap:anywhere}
+  .ad-ledger-palette .ad-unavail li{grid-template-columns:1fr;gap:2px}
+  .ad-ledger-palette .ad-pager{flex-direction:column;align-items:stretch;gap:8px}
+  .ad-ledger-palette .ad-pager button{min-height:36px}
+  .ad-ledger-palette .ad-ledger-note{font-size:13px;line-height:1.5}
+  .ad-ledger-palette .ad-stop{white-space:normal}
+}
+.ad-ledger-palette .ad-table td .ad-muted-cell{display:inline-block;min-width:140px;max-width:260px;white-space:normal;line-height:1.35;vertical-align:middle}
+.ad-ledger-palette .ad-table td .ad-stop{display:inline-block;min-width:150px;max-width:260px;white-space:normal;line-height:1.35}
+@media (max-width:640px){.ad-ledger-palette .ad-table td .ad-muted-cell,.ad-ledger-palette .ad-table td .ad-stop{max-width:200px;font-size:12px}}

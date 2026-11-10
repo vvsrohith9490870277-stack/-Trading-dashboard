@@ -7,11 +7,12 @@ const finite = v => v !== null && v !== undefined && v !== '' && Number.isFinite
 export function istDate(ts) { const d = new Date(ts ?? ''); return Number.isNaN(d.getTime()) ? null : IST_DAY.format(d); }
 export function istHour(ts) { const d = new Date(ts ?? ''); return Number.isNaN(d.getTime()) ? null : Number(IST_HOUR.format(d)) % 24; }
 
-export const RANGES = [['today', 'Today'], ['week', 'This week'], ['month', 'This month'], ['last_month', 'Last month'], ['last_3_months', 'Last 3 months'], ['last_6_months', 'Last 6 months'], ['last_year', 'Last year'], ['all', 'All time']];
+export const RANGES = [['today', 'Today'], ['week', 'This week'], ['month', 'This month'], ['last_month', 'Last month'], ['last_3_months', 'Last 3 months'], ['last_6_months', 'Last 6 months'], ['last_year', 'Last year'], ['all', 'All time'], ['custom', 'Custom']];
 
 const iso = d => d.toISOString().slice(0, 10);
 // Inclusive [from, to] IST calendar-day bounds for a range, relative to the IST day `day` (YYYY-MM-DD).
-export function rangeBounds(range, day) {
+export function rangeBounds(range, day, custom) {
+  if (range === 'custom') { const [f, t] = custom ?? []; const ok = v => /^\d{4}-\d{2}-\d{2}$/.test(v ?? ''); return ok(f) && ok(t) ? (f <= t ? [f, t] : [t, f]) : [null, null]; }
   if (range === 'all' || !/^\d{4}-\d{2}-\d{2}$/.test(day ?? '')) return [null, null];
   const d = new Date(day + 'T00:00:00Z');
   const shift = (months) => { const x = new Date(d); x.setUTCDate(1); x.setUTCMonth(x.getUTCMonth() + months); return x; };
@@ -94,7 +95,8 @@ export function fillStats(fills) {
   const charges = fills.every(f => finite(f.costs?.charges_paise)) && fills.length ? sum(fills.map(f => f.costs.charges_paise)) / 100 : null;
   const notional = sum(fills.filter(f => finite(f.price) && finite(f.qty)).map(f => Number(f.price) * Number(f.qty)));
   return {count: fills.length, buys: buys.length, sells: sells.length, turnover, charges, notional, missingCosts: fills.filter(f => !f.costs).length,
-    avgSize: fills.length ? notional / fills.length : null};
+    avgSize: fills.length ? notional / fills.length : null,
+    buyValue: buys.length ? sum(buys.filter(f => finite(f.price) && finite(f.qty)).map(f => Number(f.price) * Number(f.qty))) : null};
 }
 
 // Fills bucketed by IST clock hour ("09:00–10:00"), with realized gross P&L of sells in that hour.
@@ -115,12 +117,62 @@ export function signalKind(reason) {
   const r = String(reason ?? '');
   if (r.startsWith('daily_entry')) return 'Entry';
   if (r.startsWith('daily_exit')) return 'Daily exit';
-  if (r === 'observed_LTP_below_close_highwater_stop') return 'Stop exit';
+  if (r === 'observed_LTP_below_close_highwater_stop' || r === 'trail_gap' || r === 'trail_touch') return 'Stop exit';
+  if (r === 'pending_exit_carry') return 'Carried exit';
   return '—';
 }
 export function exitSource(reason) {
   const r = String(reason ?? '');
   if (r.startsWith('daily_exit')) return 'Completed-bar daily exit rule';
   if (r === 'observed_LTP_below_close_highwater_stop') return 'Intraday stop check (LTP below close high-water stop)';
+  if (r === 'trail_gap') return 'Trail stop: session opened at or below the stop, filled at the open';
+  if (r === 'trail_touch') return 'Trail stop: session low touched the stop, filled at the stop';
+  if (r === 'pending_exit_carry') return 'Exit carried from a lower-circuit session';
   return 'Recorded by engine';
+}
+
+// Realized P&L per IST calendar month of the exit (gross; net only when every trade has fee rows).
+export function monthlyPnl(trades) {
+  const m = new Map();
+  for (const t of trades) {
+    const d = istDate(t.closed_at); if (!d || !finite(t.realized_pnl)) continue;
+    const k = d.slice(0, 7), a = m.get(k) ?? {month: k, trades: 0, pnl: 0};
+    a.trades += 1; a.pnl += Number(t.realized_pnl); m.set(k, a);
+  }
+  return [...m.values()].sort((a, b) => a.month.localeCompare(b.month));
+}
+// Win/loss distribution: count of closed trades per gross return-% bucket (only trades with a matched entry).
+export const RETURN_BUCKETS = [['< −5%', r => r < -5], ['−5% to −2%', r => r >= -5 && r < -2], ['−2% to 0%', r => r >= -2 && r < 0], ['0% (flat)', r => r === 0], ['0% to 2%', r => r > 0 && r <= 2], ['2% to 5%', r => r > 2 && r <= 5], ['> 5%', r => r > 5]];
+export function returnDistribution(trades) {
+  const rets = trades.map(t => t.pnl_pct).filter(finite).map(Number);
+  return RETURN_BUCKETS.map(([label, test]) => ({label, trades: rets.filter(test).length}));
+}
+// Closed trades and fills per IST session day.
+export function tradeFrequency(trades, fills) {
+  const m = new Map();
+  const add = (d, k) => { if (!d) return; const a = m.get(d) ?? {day: d, closed: 0, fills: 0}; a[k] += 1; m.set(d, a); };
+  for (const t of trades) add(istDate(t.closed_at), 'closed');
+  for (const f of fills) add(istDate(f.filled_at), 'fills');
+  return [...m.values()].sort((a, b) => a.day.localeCompare(b.day));
+}
+// Current allocation of open positions (market value at mark; cost basis when the mark is missing is NOT substituted).
+export function allocation(positions, keyOf) {
+  const m = new Map(); let total = 0, missing = 0;
+  for (const p of positions) {
+    if (!finite(p.market_value)) { missing += 1; continue; }
+    const k = keyOf(p) ?? 'Unclassified', a = m.get(k) ?? {key: k, positions: 0, value: 0};
+    a.positions += 1; a.value += Number(p.market_value); total += Number(p.market_value); m.set(k, a);
+  }
+  return {rows: [...m.values()].map(a => ({...a, share: total ? a.value / total * 100 : null})).sort((a, b) => b.value - a.value), total, missing};
+}
+// Strategy 07 open risk to the trail stops, from the positions' exit plans.
+export function stopRisk(positions) {
+  const s7 = positions.filter(p => p.exit_plan?.stop?.kind === 'trail');
+  const priced = s7.filter(p => finite(p.exit_plan.stop.level));
+  const withMark = priced.filter(p => finite(p.exit_plan.stop.open_risk_to_stop));
+  const nearest = withMark.filter(p => finite(p.exit_plan.stop.distance_pct)).sort((a, b) => a.exit_plan.stop.distance_pct - b.exit_plan.stop.distance_pct)[0] ?? null;
+  return {positions: s7.length, priced: priced.length, withMark: withMark.length,
+    openRisk: withMark.length ? withMark.reduce((a, p) => a + Number(p.exit_plan.stop.open_risk_to_stop), 0) : null,
+    entryRisk: priced.length && priced.every(p => finite(p.exit_plan.stop.risk_total)) ? priced.reduce((a, p) => a + Number(p.exit_plan.stop.risk_total), 0) : null,
+    nearest};
 }

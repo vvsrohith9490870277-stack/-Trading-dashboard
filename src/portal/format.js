@@ -12,6 +12,13 @@ export function istTime(v, withDate = true) {
   if (Number.isNaN(d.getTime())) return '—';
   return new Intl.DateTimeFormat('en-IN', {timeZone: 'Asia/Kolkata', ...(withDate ? {day: '2-digit', month: 'short'} : {}), hour: '2-digit', minute: '2-digit', hour12: false}).format(d) + ' IST';
 }
+// Same as istTime but with seconds, for audit rows where same-minute events must stay distinguishable.
+export function istTimeSec(v, withDate = true) {
+  if (!v) return '—';
+  const d = new Date(v);
+  if (Number.isNaN(d.getTime())) return '—';
+  return new Intl.DateTimeFormat('en-IN', {timeZone: 'Asia/Kolkata', ...(withDate ? {day: '2-digit', month: 'short'} : {}), hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false}).format(d) + ' IST';
+}
 export const STRATEGY_NAMES = ['Donchian / Turtle', 'Supertrend', 'RSI Pullback', 'Dual MA', 'Bollinger Reversion', 'MACD Trend', '52W Momentum'];
 export const STRATEGY_HUES = ['#6c7cff', '#ff8a4c', '#2bb8a3', '#e35d9c', '#c9a227', '#4aa3df', '#9b6bff'];
 export function strategyName(id) { return STRATEGY_NAMES[Number(id) - 1] ?? `Strategy ${id}`; }

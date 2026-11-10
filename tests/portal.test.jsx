@@ -72,7 +72,7 @@ describe('portal screens', () => {
     mockNetwork(); at('/paper');
     render(<Portal/>);
     await screen.findByText('What the engine is holding right now');
-    expect(screen.getByText('−₹123.45')).toBeInTheDocument();
+    expect(screen.getAllByText('−₹123.45').length).toBeGreaterThan(0);
     expect(screen.getByText('12 / 9')).toBeInTheDocument();
     expect(screen.getByText('Over slot limit — no new buys')).toBeInTheDocument();
     expect(screen.getByText('Manual demo — excluded from every total')).toBeInTheDocument();

@@ -25,7 +25,7 @@ describe('HTTP boundary',()=>{
 });
 
 it('redacts arbitrary database error text in public reason/status fields',()=>{expect(publicRows([{reason:'Bearer token=secret',status:'secret',kind:'private',source:'private'}])[0]).toEqual({reason:'recorded_event',status:'recorded',kind:'engine_run',source:'market_data'});});
-it('excludes closed qty-zero positions in overview and paginated queries',async()=>{const f=executeFixture();await readDashboard(parseOptions({view:'positions'}),f.execute,now);expect(f.calls.every(c=>c.sql.includes('qty>0'))).toBe(true);});
+it('excludes closed qty-zero positions in overview and paginated queries',async()=>{const f=executeFixture();await readDashboard(parseOptions({view:'positions'}),f.execute,now);const pos=f.calls.filter(c=>/FROM paper_positions/.test(c.sql));expect(pos.length).toBeGreaterThan(0);expect(pos.every(c=>c.sql.includes('qty>0'))).toBe(true);});
 it('explicit refresh bypasses cached data by executing the reader again, without inventing a new timestamp',async()=>{
  let reads=0;const reader=vi.fn(async()=>({readAt:`fixture-read-${++reads}`}));const h=createHandler(reader);const query={view:'quotes',page:'991'};
  const first=response();await h(request(query),first);const cached=response();await h(request(query),cached);expect(reader).toHaveBeenCalledTimes(1);expect(cached.body.readAt).toBe(first.body.readAt);

@@ -4,10 +4,14 @@
 // are parsed server-side and only whitelisted numeric/enum fields are returned.
 import capital from '../automation/paper-trading/capital_policy.json' with {type:'json'};
 import instruments from './instruments.json' with {type:'json'};
+import {engineExitRule,exitRule,NO_TARGET,RR_UNAVAILABLE,STOP_STRATEGIES} from '../src/exitRules.js';
+import {closedBreakEven} from './exit-plan.mjs';
 
 export const SIGNAL_STATUSES=['pending','filled','expired','blocked_prefilter','ignored_state','ignored_stale_position','ignored_same_bar','shadow_closed'];
 export const RUN_KINDS=['monitor','scan','bootstrap','probe','init','pnl','status'];
 export const FEE_KEYS=['brokerage','exchange','sebi','ipft','clearing','stt','stamp','gst','dp','dp_gst'];
+export const EXECUTION_PATHS=['LTP_LEGACY','FEED_OPEN','AUCTION_CAPTURE','FALLBACK_OPEN'];
+export const STOP_EXIT_REASONS=['trail_gap','trail_touch','observed_LTP_below_close_highwater_stop'];
 export const LEDGER_VIEWS=['trades','costs','credits','dataaudit','events'];
 export const STRATEGY_VIEWS=['fills','positions','signals','trades','costs','credits','events'];
 
@@ -49,6 +53,28 @@ export function eventSummary(raw){
  return s;
 }
 
+// Stop threshold used by a stop exit: the engine's risk_hit audit event for the same stock, recorded on the exit
+// session at or before the exit fill. Only the threshold / price / rule numbers are returned; nothing is guessed.
+async function stopHits(select,namespace,exits){
+ const syms=[...new Set(exits.map(r=>r.symbol))];if(!syms.length)return {available:true,rows:[]};
+ try{
+  const rows=await select(`SELECT strategy,symbol,source_at,data_json FROM paper_events WHERE namespace=? AND event_type='risk_hit' AND symbol IN (${syms.map(()=>'?').join(',')}) ORDER BY source_at DESC LIMIT 2000`,[namespace,...syms]);
+  return {available:true,rows:rows.map(r=>({strategy:int(r.strategy),symbol:r.symbol,source_at:r.source_at,...eventSummary(r.data_json)}))};
+ }catch(e){if(missingTable(e))return {available:false,rows:[]};throw e;}
+}
+const istDayOf=v=>{const t=Date.parse(v);return Number.isFinite(t)?new Date(t+19800000).toISOString().slice(0,10):null;};
+export function closedPlan(r,reason,hits){
+ const s=int(r.strategy),stopExit=STOP_EXIT_REASONS.includes(reason),closed=Date.parse(r.closed_at);
+ let stop={defined:STOP_STRATEGIES.includes(s),hit:stopExit,threshold:null,source:null};
+ if(stopExit){
+  const day=istDayOf(r.closed_at);
+  const hit=hits.rows.find(h=>h.symbol===r.symbol&&(h.strategy===null||h.strategy===s)&&istDayOf(h.source_at)===day&&Number.isFinite(Date.parse(h.source_at))&&Date.parse(h.source_at)<=closed+1000&&h.threshold!==undefined);
+  stop=hit?{...stop,threshold:hit.threshold,trigger_price:hit.price??null,rule:hit.reason??hit.rule??null,recorded_at:hit.source_at,source:'Engine risk_hit audit event for this exit'}
+   :{...stop,unavailable_reason:hits.available?'No risk_hit audit event with a threshold was recorded for this exit (legacy exits predate the audit log).':'The audit event log is not readable, so the threshold used is unavailable.'};
+ }
+ return {exit_rule:exitRule(s),engine_rule:engineExitRule(s),stop,target:{defined:false,label:NO_TARGET},risk_reward:{value:null,reason:RR_UNAVAILABLE}};
+}
+
 async function costsFor(select,namespace,ids){
  const list=[...new Set(ids.filter(i=>Number.isSafeInteger(Number(i))).map(Number))];
  if(!list.length)return {available:true,map:new Map()};
@@ -63,7 +89,7 @@ const page=(options,count,rows,extra={})=>({page:options.page,limit:options.limi
 // Fills, enriched with the fee/cash-flow row of each fill when one exists.
 export async function enrichFills(select,namespace,rows){
  const c=await costsFor(select,namespace,rows.map(r=>r.id));
- return {costsAvailable:c.available,rows:rows.map(r=>{const k=c.map.get(Number(r.id));return {...r,qty:int(r.qty),price:num(r.price),realized_pnl:num(r.realized_pnl),cashflow:num(r.cashflow),costs:k??null,industry:industryOf(r.symbol)};})};
+ return {costsAvailable:c.available,rows:rows.map(r=>{const k=c.map.get(Number(r.id));const {execution_path,...rest}=r;return {...rest,execution_path:EXECUTION_PATHS.includes(execution_path)?execution_path:null,qty:int(r.qty),price:num(r.price),realized_pnl:num(r.realized_pnl),cashflow:num(r.cashflow),costs:k??null,industry:industryOf(r.symbol)};})};
 }
 
 export async function readLedgerView(options,select,day,publicRows){
@@ -76,8 +102,8 @@ export async function readLedgerView(options,select,day,publicRows){
   const args=[ns];const where='s.namespace=? AND s.side=\'SELL\''+strat('s.strategy',args)+today('s.filled_at',args);
   const [count,raw]=await Promise.all([
    select(`SELECT COUNT(*) AS total FROM paper_fills s WHERE ${where}`,args),
-   select(`SELECT s.id,s.strategy,s.symbol,s.qty,s.price AS exit_price,s.filled_at AS closed_at,s.quote_at AS exit_quote_at,s.reason AS exit_reason,s.realized_pnl,b.id AS entry_fill_id,b.qty AS entry_qty,b.price AS entry_price,b.filled_at AS opened_at FROM paper_fills s LEFT JOIN paper_fills b ON b.namespace=s.namespace AND b.id=(SELECT b2.id FROM paper_fills b2 WHERE b2.namespace=s.namespace AND b2.strategy=s.strategy AND b2.symbol=s.symbol AND b2.side='BUY' AND b2.id<s.id ORDER BY b2.id DESC LIMIT 1) WHERE ${where} ORDER BY s.filled_at DESC,s.id DESC LIMIT ? OFFSET ?`,[...args,...lim])]);
-  const c=await costsFor(select,ns,raw.flatMap(r=>[r.id,r.entry_fill_id]).filter(v=>v!==null&&v!==undefined));
+   select(`SELECT s.id,s.strategy,s.symbol,s.qty,s.price AS exit_price,s.filled_at AS closed_at,s.quote_at AS exit_quote_at,s.reason AS exit_reason,s.realized_pnl,b.id AS entry_fill_id,b.qty AS entry_qty,b.price AS entry_price,b.filled_at AS opened_at,b.reason AS entry_reason,b.signal_id AS entry_signal_id FROM paper_fills s LEFT JOIN paper_fills b ON b.namespace=s.namespace AND b.id=(SELECT b2.id FROM paper_fills b2 WHERE b2.namespace=s.namespace AND b2.strategy=s.strategy AND b2.symbol=s.symbol AND b2.side='BUY' AND b2.id<s.id ORDER BY b2.id DESC LIMIT 1) WHERE ${where} ORDER BY s.filled_at DESC,s.id DESC LIMIT ? OFFSET ?`,[...args,...lim])]);
+  const [c,hits]=await Promise.all([costsFor(select,ns,raw.flatMap(r=>[r.id,r.entry_fill_id]).filter(v=>v!==null&&v!==undefined)),stopHits(select,ns,raw.filter(r=>STOP_EXIT_REASONS.includes(r.exit_reason)))]);
   const rows=publicRows(raw.map(r=>({...r,reason:r.exit_reason}))).map(r=>{
    const {reason,...rest}=r;const exitCost=c.map.get(Number(r.id))??null,entryCost=r.entry_fill_id===null||r.entry_fill_id===undefined?null:c.map.get(Number(r.entry_fill_id))??null;
    const entry=num(r.entry_price),exit=num(r.exit_price),qty=int(r.qty),opened=Date.parse(r.opened_at),closed=Date.parse(r.closed_at);
@@ -86,8 +112,10 @@ export async function readLedgerView(options,select,day,publicRows){
    const net=matched&&exitCost?.net_cashflow_paise!=null&&entryCost?.net_cashflow_paise!=null?exitCost.net_cashflow_paise+entryCost.net_cashflow_paise:null;
    return {...rest,exit_reason:reason,qty,entry_price:entry,exit_price:exit,realized_pnl:num(r.realized_pnl),entry_matched:entry!==null,
     pnl_pct:matched&&entry>0&&exit!==null?(exit-entry)/entry*100:null,hold_hours:Number.isFinite(opened)&&Number.isFinite(closed)?(closed-opened)/3600000:null,
-    charges_paise:charges,net_pnl_paise:net,entry_costs:entryCost,exit_costs:exitCost,industry:industryOf(r.symbol)};});
-  return page(options,count,rows,{costsAvailable:c.available,pairing:'Each exit is paired with the latest earlier BUY fill of the same strategy and stock. Unmatched exits show no entry.'});
+    charges_paise:charges,net_pnl_paise:net,entry_costs:entryCost,exit_costs:exitCost,industry:industryOf(r.symbol),exit_plan:closedPlan(r,reason,hits),
+    entry_reason:word(r.entry_reason,/^[A-Za-z0-9_:.+-]{1,120}$/),entry_signal_id:word(r.entry_signal_id,/^[A-Za-z0-9_:.+-]{1,120}$/),
+    break_even:matched&&charges!==null?closedBreakEven(entry,qty,charges):null,net_pnl_pct:matched&&net!==null&&entry>0?net/(Math.round(entry*100)*qty)*100:null};});
+  return page(options,count,rows,{costsAvailable:c.available,stopEventsAvailable:hits.available,pairing:'Each exit is paired with the latest earlier BUY fill of the same strategy and stock. Unmatched exits show no entry.'});
  }
  if(options.view==='costs'){
   // Transaction log with the running per-sleeve cash: sleeve capital + cumulative net cash flow.
