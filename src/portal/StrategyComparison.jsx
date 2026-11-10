@@ -1,9 +1,13 @@
 import {useMemo, useState} from 'react';
 import {Link, runIdFor, stockHref} from './router';
-import {paiseToInr, useStatic} from './data';
-import {fmt, pct, signedInr, strategyName, STRATEGY_HUES, ticker, tone} from './format';
-import {Blank, Callout, Loading, Section, SortTable, Tag} from './ui';
+import {useAllPages, useStatic} from './data';
+import {fmt, pct, strategyName, STRATEGY_HUES, ticker} from './format';
+import {Blank, Callout, Loading, Section} from './ui';
 import {Lines} from './charts';
+import {PaperAgeNote, PaperOverlap, ResearchVsPaper} from './PaperVsResearch';
+
+const ALL = [1, 2, 3, 4, 5, 6, 7];
+function readScope() { return new URLSearchParams(window.location.search).get('paper') === 'all' ? 'all' : 'selected'; }
 
 function readIds() {
   const raw = new URLSearchParams(window.location.search).get('ids') ?? '1,4,7';
@@ -28,9 +32,13 @@ export function overlapStats(sets) {
   return {union, intersection, jaccard: union.length ? intersection.length / union.length : null};
 }
 
-export default function StrategyComparison({overview}) {
+export default function StrategyComparison({overview, refreshKey = 0}) {
   const [ids, setIds] = useState(readIds);
+  const [scope, setScopeState] = useState(readScope);
   const history = useStatic('/data/historical.json');
+  // Complete paper record (paged, 5,000-row cap): never only the latest 100 fills.
+  const ledger = {trades: useAllPages({view: 'trades'}, refreshKey), positions: useAllPages({view: 'positions'}, refreshKey), fills: useAllPages({view: 'fills'}, refreshKey)};
+  const setScope = v => { setScopeState(v); const p = new URLSearchParams(window.location.search); if (v === 'all') p.set('paper', 'all'); else p.delete('paper'); window.history.replaceState(null, '', `${window.location.pathname}?${p}`); };
   const toggle = id => setIds(cur => {
     const next = cur.includes(id) ? (cur.length > 2 ? cur.filter(x => x !== id) : cur) : cur.length < 4 ? [...cur, id].sort() : cur;
     const p = new URLSearchParams(window.location.search); p.set('ids', next.join(','));
@@ -40,17 +48,24 @@ export default function StrategyComparison({overview}) {
   const chosen = useMemo(() => (history.data ? ids.map(id => history.data.strategies.find(s => s.id === id)).filter(Boolean) : []), [history.data, ids]);
   const sets = chosen.map(s => s.qualifiers.map(q => q.symbol));
   const all = overlapStats(sets);
-  const live = overview.data;
 
   if (history.error) return <Callout tone="error">{history.error}</Callout>;
   if (!history.data) return <Loading label="Loading saved runs…"/>;
   const asOf = history.data.asOf;
+  const paperIds = scope === 'all' ? ALL : ids;
   const years = [...new Set(chosen.flatMap(s => s.yearly.map(y => y.period)))].sort().slice(-12);
   return <div className="ad-screen">
     <div className="ad-hero compact"><div><span className="ad-eyebrow">Strategy comparison</span><h1>Side by side</h1>
-      <p>Choose two to four strategies. Saved-run figures are gross closed-trade statistics from the {asOf} export; live paper figures come from the paper_v1 ledger. They are never blended.</p></div></div>
+      <p>Choose two to four strategies. Saved-run figures are gross closed-trade statistics from the {asOf} export; live paper figures come from the paper_v1 ledger. They sit side by side and are never blended or ranked together.</p></div></div>
     <div className="ad-chooser" role="group" aria-label="Strategies to compare">{[1, 2, 3, 4, 5, 6, 7].map(id => <button key={id} aria-pressed={ids.includes(id)} className={ids.includes(id) ? 'on' : ''} style={{'--ad-accent': STRATEGY_HUES[id - 1]}} onClick={() => toggle(id)}>
       <i/>{strategyName(id)}</button>)}</div>
+    <div className="ad-ranges" role="group" aria-label="Strategies in the paper comparison">
+      <button className={`ad-chip ${scope === 'selected' ? 'on' : ''}`} aria-pressed={scope === 'selected'} onClick={() => setScope('selected')}>Paper views: selected ({ids.length})</button>
+      <button className={`ad-chip ${scope === 'all' ? 'on' : ''}`} aria-pressed={scope === 'all'} onClick={() => setScope('all')}>Paper views: all seven</button>
+    </div>
+    <PaperAgeNote fills={ledger.fills.data?.rows ?? []}/>
+    <ResearchVsPaper ids={paperIds} history={history.data} overview={overview.data} ledger={ledger}/>
+    <PaperOverlap ids={paperIds} ledger={ledger} researchShared={scope === 'all' ? [] : all.intersection} asOf={asOf}/>
     <Section eyebrow="Saved runs" title="Metric matrix">
       <div className="ad-table-scroll"><table className="ad-table ad-matrix">
         <thead><tr><th scope="col">Metric</th>{chosen.map(s => <th scope="col" key={s.id} className="r"><span className="ad-strat"><i style={{background: STRATEGY_HUES[s.id - 1]}}/>{s.name}</span></th>)}</tr></thead>
@@ -68,7 +83,7 @@ export default function StrategyComparison({overview}) {
       <Lines unit="%" baseline={0} series={chosen.map(s => ({name: s.name, color: STRATEGY_HUES[s.id - 1], points: s.yearly.filter(y => years.includes(y.period)).map(y => ({x: y.period, y: y.mean}))}))}/>
     </Section>
     <div className="ad-split">
-      <Section eyebrow={`Matched on ${asOf}`} title="Signal agreement">
+      <Section eyebrow={`Research scan · matched on ${asOf}`} title="Signal agreement (research scan, not paper performance)">
         <div className="ad-venn">
           <div><span>Union</span><strong>{all.union.length}</strong></div>
           <div><span>All agree</span><strong>{all.intersection.length}</strong></div>
@@ -79,7 +94,7 @@ export default function StrategyComparison({overview}) {
             {chosen.map((b, j) => { const o = overlapStats([sets[i], sets[j]]); return <td key={b.id} className="r num" title={`${o.intersection.length} shared of ${o.union.length}`}>{i === j ? sets[i].length : o.intersection.length}</td>; })}</tr>)}</tbody></table>
         <p className="ad-muted ad-fine">Diagonal: names matched by that strategy. Off-diagonal: names matched by both.</p>
       </Section>
-      <Section eyebrow={`Matched on ${asOf}`} title="Shared names">
+      <Section eyebrow={`Research scan · matched on ${asOf}`} title="Shared names (research scan)">
         {all.intersection.length ? <ul className="ad-chips">{all.intersection.map(s => <li key={s}><Link className="ad-sym" href={stockHref(s, runIdFor(asOf, chosen[0].id))}>{ticker(s)}</Link></li>)}</ul>
           : <Blank title="No name matched every selected strategy" text="Exclusive names per strategy are listed below."/>}
         <h3 className="ad-sub">Exclusive</h3>
@@ -87,18 +102,5 @@ export default function StrategyComparison({overview}) {
           return <li key={s.id}><span className="ad-strat"><i style={{background: STRATEGY_HUES[s.id - 1]}}/>{s.name}</span><strong>{own.length}</strong></li>; })}</ul>
       </Section>
     </div>
-    <Section eyebrow="Live paper ledger" title="How these strategies are doing on paper">
-      {!live ? <Blank title="Live ledger unavailable"/> : <SortTable caption="live paper by strategy" rows={chosen.map(s => {
-        const p = live.performance?.find(r => r.strategy === s.id), sl = live.cappedLedger?.sleeves?.[s.id];
-        return {strategy: s.id, closed: p?.closedTrades ?? 0, win: p?.winRate ?? null, realized: p?.realized ?? null, open: p?.openPositions ?? 0, slots: sl?.slots_max ?? null, net: paiseToInr(sl?.net_pnl_paise)};
-      })} columns={[
-        {key: 'strategy', title: 'Strategy', render: v => <span className="ad-strat"><i style={{background: STRATEGY_HUES[v - 1]}}/>{strategyName(v)}</span>},
-        {key: 'open', title: 'Open / slots', align: 'right', render: (v, r) => <span className={r.slots && v > r.slots ? 'ad-down' : ''}>{v} / {r.slots ?? '—'}</span>},
-        {key: 'closed', title: 'Closed', align: 'right'}, {key: 'win', title: 'Win', align: 'right', render: v => pct(v)},
-        {key: 'realized', title: 'Realized (gross)', align: 'right', render: v => <span className={`ad-${tone(v)}`}>{signedInr(v)}</span>},
-        {key: 'net', title: 'Sleeve net P&L', align: 'right', render: v => <span className={`ad-${tone(v)}`}>{signedInr(v)}</span>},
-      ]}/>}
-      <p className="ad-muted ad-fine">Live paper is a few sessions old; a handful of trades says little about a strategy. <Tag tone="neutral">demo excluded</Tag></p>
-    </Section>
   </div>;
 }

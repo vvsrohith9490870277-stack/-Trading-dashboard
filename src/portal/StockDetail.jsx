@@ -1,7 +1,8 @@
 import {useMemo, useState} from 'react';
 import {ArrowLeft, Check, X} from 'lucide-react';
 import {Link, runIdFor, stockHref} from './router';
-import {symbolCandidates, useDashboard, useStatic} from './data';
+import {symbolCandidates, useAllPages, useDashboard, useStatic} from './data';
+import {closedStats, openStats, withoutDemo} from './paper-vs-research';
 import {fmt, inr, istTime, pct, signedInr, strategyName, STRATEGY_HUES, ticker, tone} from './format';
 import {Blank, Callout, Loading, Section, SortTable, Tabs, Tag, Tile} from './ui';
 import {Columns, Spark} from './charts';
@@ -72,20 +73,27 @@ export default function StockDetail({route, refreshKey}) {
   const strategyId = runId?.strategyId ?? null;
   const backtest = useStatic(runId?.kind === 'hist' && resolved && history.data?.strategies.find(s => s.id === strategyId)?.qualifiers.some(q => q.symbol === resolved) ? `/data/stock-backtests/${strategyId}/${encodeURIComponent(resolved)}.json` : null);
   const quotes = useDashboard({view: 'history', symbol: resolved ?? 'X'}, refreshKey, Boolean(resolved));
-  const positions = useDashboard({view: 'positions', scope: 'all', limit: '100'}, refreshKey, Boolean(resolved));
-  const fills = useDashboard({view: 'fills', scope: 'all', limit: '100'}, refreshKey, Boolean(resolved));
+  // Complete paper record (paged, 5,000-row cap), filtered to this stock in the browser.
+  const positions = useAllPages({view: 'positions'}, refreshKey, Boolean(resolved));
+  const fills = useAllPages({view: 'fills'}, refreshKey, Boolean(resolved));
+  const trades = useAllPages({view: 'trades'}, refreshKey, Boolean(resolved));
   const scanParams = runId?.kind === 'scan' && resolved ? {view: 'qualifiers', strategy: String(strategyId), symbol: resolved} : null;
   const scan = useDashboard(scanParams ?? {view: 'qualifiers', strategy: '1'}, refreshKey, Boolean(scanParams));
   const [tab, setTab] = useState(runId ? 'run' : 'live');
 
   if (!symbol) return <Callout tone="error">That stock symbol is not valid.</Callout>;
+  const paperReady = Boolean(positions.data && trades.data);
   const footprint = history.data ? history.data.strategies.map(s => {
     const ps = s.perStock.find(p => p.symbol === resolved), qual = s.qualifiers.find(x => x.symbol === resolved);
-    return {strategy: s.id, closed: ps?.closed ?? null, winRate: ps?.winRate ?? null, mean: ps?.mean ?? null, best: ps?.best ?? null, worst: ps?.worst ?? null, matched: Boolean(qual), held: qual?.held ?? false};
+    const mine = rows => withoutDemo(rows?.data?.rows).filter(r => r.symbol === resolved && Number(r.strategy) === s.id);
+    const pc = closedStats(mine(trades)), po = openStats(mine(positions));
+    return {strategy: s.id, closed: ps?.closed ?? null, winRate: ps?.winRate ?? null, mean: ps?.mean ?? null, best: ps?.best ?? null, worst: ps?.worst ?? null, matched: Boolean(qual), held: qual?.held ?? false,
+      pClosed: paperReady ? pc.closed : null, pWin: pc.closed ? pc.winRate : null, pMean: pc.closed ? pc.mean : null, pRealized: pc.closed ? pc.realized : null,
+      pOpen: paperReady ? po.qty : null, pUnrealized: po.open ? po.unrealized : null, pNet: po.open ? po.unrealizedNet : null};
   }) : [];
   const meta = backtest.data?.stock ?? catalog.data?.strategies.flatMap(s => s.qualifiers).find(q => q.symbol === resolved);
-  const myPositions = (positions.data?.rows ?? []).filter(p => p.symbol === resolved);
-  const myFills = (fills.data?.rows ?? []).filter(f => f.symbol === resolved);
+  const myPositions = withoutDemo(positions.data?.rows).filter(p => p.symbol === resolved);
+  const myFills = withoutDemo(fills.data?.rows).filter(f => f.symbol === resolved);
   const q = quotes.data?.rows ?? [];
   const last = q.at(-1);
   const scanRow = scan.data?.rows?.[0];
@@ -121,17 +129,25 @@ export default function StockDetail({route, refreshKey}) {
           {key: 'filled_at', title: 'Filled', render: v => istTime(v)}, {key: 'strategy', title: 'Strategy', render: v => strategyName(v)},
           {key: 'side', title: 'Side', render: v => <Tag tone={v === 'BUY' ? 'good' : 'bad'}>{v}</Tag>}, {key: 'qty', title: 'Qty', align: 'right'},
           {key: 'price', title: 'Price', align: 'right', render: v => inr(v)}, {key: 'realized_pnl', title: 'Realized', align: 'right', render: v => (v === null || v === undefined ? '—' : signedInr(v))},
-        ]} empty={{title: 'No fills in the latest 100', text: 'Searched the 100 most recent paper fills.'}}/>}
-        <p className="ad-muted ad-fine">Searched the {fills.data?.rows?.length ?? 0} most recent fills of {fills.data?.total ?? 0}.</p>
+        ]} empty={{title: 'No paper fills for this stock', text: 'Searched every paper_v1 fill read.'}}/>}
+        <p className="ad-muted ad-fine">Searched {fills.data?.rows?.length ?? 0} of {fills.data?.total ?? 0} paper fills{fills.data && !fills.data.complete ? ' (partial record: 5,000-row cap)' : ''}.</p>
       </Section>
     </>}
-    {tab === 'footprint' && <Section eyebrow={history.data ? `Saved runs · ${history.data.asOf}` : 'Saved runs'} title="How each strategy traded this stock">
+    {tab === 'footprint' && <Section className="ad-ledger-palette ad-pvr" eyebrow={history.data ? `Saved runs · ${history.data.asOf}` : 'Saved runs'} title="How each strategy traded this stock: research vs paper">
       {history.error ? <Callout tone="error">{history.error}</Callout> : !history.data ? <Loading/> : <SortTable caption="footprint" rows={footprint} rowKey={r => r.strategy} columns={[
         {key: 'strategy', title: 'Strategy', render: v => <Link className="ad-link" href={stockHref(resolved, runIdFor(history.data.asOf, v))}><span className="ad-strat"><i style={{background: STRATEGY_HUES[v - 1]}}/>{strategyName(v)}</span></Link>},
         {key: 'closed', title: 'Closed', align: 'right', render: v => fmt(v, 0)}, {key: 'winRate', title: 'Win', align: 'right', render: v => pct(v)},
         {key: 'mean', title: 'Mean', align: 'right', render: ret}, {key: 'best', title: 'Best', align: 'right', render: ret}, {key: 'worst', title: 'Worst', align: 'right', render: ret},
         {key: 'matched', title: 'Matched', render: (v, r) => (v ? <Tag tone="good">{r.held ? 'held' : 'fresh'}</Tag> : '—')},
+        {key: 'pClosed', title: 'Paper closed', align: 'right', render: v => fmt(v, 0)},
+        {key: 'pWin', title: 'Paper win', align: 'right', render: (v, r) => (r.pClosed ? pct(v) : '—')},
+        {key: 'pMean', title: 'Paper mean', align: 'right', render: (v, r) => (r.pClosed ? ret(v) : '—')},
+        {key: 'pRealized', title: 'Paper realized ₹', align: 'right', render: v => <span className={`ad-${tone(v)}`}>{signedInr(v)}</span>},
+        {key: 'pOpen', title: 'Paper open qty', align: 'right', render: v => (v ? fmt(v, 0) : '—')},
+        {key: 'pUnrealized', title: 'Unrealized ₹', align: 'right', render: v => <span className={`ad-${tone(v)}`}>{signedInr(v)}</span>},
+        {key: 'pNet', title: 'Net of charges ₹', align: 'right', render: v => <span className={`ad-${tone(v)}`}>{signedInr(v)}</span>},
       ]}/>}
+      <p className="ad-muted ad-fine">Closed / Win / Mean / Best / Worst are the saved research run ({history.data?.asOf ?? '—'}, gross % per closed trade, costs excluded). “Paper” columns are this stock’s real paper_v1 record for the same strategy and are never blended with research. Paper win and mean need at least one closed paper trade; unrealized is open, not closed.</p>
     </Section>}
     <Section className="ad-stubbed" eyebrow="Not connected" title="Fundamentals, corporate events and news">
       <p className="ad-muted">Market cap, earnings and ex-dividend dates, and news are not available: the dashboard has no data source for them, so nothing is shown rather than made up.</p>
