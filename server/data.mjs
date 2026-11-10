@@ -2,6 +2,7 @@ import {cappedLedger,PUBLIC_LABELS} from './capped-ledger.mjs';
 import {readAutomation} from './automation-read.mjs';
 import {DEMO_NAMESPACE,DEMO_SELECT} from './demo-read.mjs';
 import {createClient} from '@libsql/client/web';
+import {readLedgerView,runHealth,runSummary,enrichFills,industryOf,LEDGER_VIEWS,SIGNAL_STATUSES,RUN_KINDS,STRATEGY_VIEWS} from './ledger-read.mjs';
 export const NAMESPACE='paper_v1';
 export const IST='Asia/Kolkata';
 export function istDay(value=new Date()){return new Intl.DateTimeFormat('en-CA',{timeZone:IST,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(value));}
@@ -16,11 +17,12 @@ export function marketState(now=new Date()){
 export function positionView(row,now=Date.now()){
  const qty=numeric(row.qty),entry=numeric(row.entry_price),mark=numeric(row.mark_price),age=ageSeconds(row.mark_at,now);
  const valid=mark!==null&&mark>0;
- return {...row,qty,entry_price:entry,mark_price:valid?mark:null,mark_age_seconds:age,mark_stale:!valid||age===null||age>60||age< -5,unrealized_pnl:valid&&qty!==null&&entry!==null?(mark-entry)*qty:null};
+ const state=!valid?'missing':age===null?'missing':age< -5?'future':age>60?'stale':'fresh';
+ return {...row,qty,entry_price:entry,mark_price:valid?mark:null,mark_age_seconds:age,mark_stale:!valid||age===null||age>60||age< -5,mark_state:state,unrealized_pnl:valid&&qty!==null&&entry!==null?(mark-entry)*qty:null,unrealized_pct:valid&&entry>0?(mark-entry)/entry*100:null,cost_basis:qty!==null&&entry!==null?entry*qty:null,market_value:valid&&qty!==null?mark*qty:null,high_water:numeric(row.high_water)};
 }
-export function publicRows(rows){return rows.map(row=>{const r={...row};if('reason' in r){const known=['daily_entry:beta_momentum_v1','blocked_prefilter_missing_active_pass','daily_entry','observed_LTP_below_close_highwater_stop','market_closed_or_unverified','provider_quote_error','nonpositive_or_missing_price','missing_exchange_timestamp','stale_or_future_quote','quote_outside_verified_session','fresh'];r.reason=known.includes(r.reason)?r.reason:/^daily_exit:\d{4}-\d{2}-\d{2}T[0-9:.+Z-]{8,40}$/.test(r.reason)?r.reason:'recorded_event';}if('status' in r&&!['blocked_prefilter','pending','filled','ignored_state','ignored_stale_position','expired','closed','ok','failed','success','noop'].includes(r.status))r.status='recorded';if('kind' in r&&!['monitor','scan','bootstrap','probe','init','pnl','status'].includes(r.kind))r.kind='engine_run';if('source' in r)r.source=r.source==='FYERS_QUOTES'?'FYERS_QUOTES':'market_data';return r;});}
+export function publicRows(rows){return rows.map(row=>{const r={...row};if('reason' in r){const known=['daily_entry:beta_momentum_v1','blocked_prefilter_missing_active_pass','daily_entry','observed_LTP_below_close_highwater_stop','market_closed_or_unverified','provider_quote_error','nonpositive_or_missing_price','missing_exchange_timestamp','stale_or_future_quote','quote_outside_verified_session','fresh','unverified_or_closed_session_candle','invalid_Fyers_OHLC','nonpositive_nonfinite_or_inconsistent_OHLC'];r.reason=known.includes(r.reason)||/^daily_entry:[A-Za-z0-9_.-]{1,60}$/.test(r.reason)?r.reason:/^daily_exit:\d{4}-\d{2}-\d{2}T[0-9:.+Z-]{8,40}$/.test(r.reason)?r.reason:'recorded_event';}if('status' in r&&!['blocked_prefilter','pending','filled','ignored_state','ignored_stale_position','ignored_same_bar','shadow_closed','expired','closed','ok','partial','failed','success','noop'].includes(r.status))r.status='recorded';if('kind' in r&&!['monitor','scan','bootstrap','probe','init','pnl','status'].includes(r.kind))r.kind='engine_run';if('source' in r)r.source=r.source==='FYERS_QUOTES'?'FYERS_QUOTES':'market_data';return r;});}
 export function parseOptions(query={}){
- const view=query.view??'overview';if(!['overview','fills','positions','signals','runs','quotes','history','demo','analytics','scan','qualifiers','prefilter'].includes(view))throw new Error('BAD_REQUEST');
+ const view=query.view??'overview';if(!['overview','fills','positions','signals','runs','quotes','history','demo','analytics','scan','qualifiers','prefilter',...LEDGER_VIEWS].includes(view))throw new Error('BAD_REQUEST');
  const integer=(v,def,max)=>{const n=v===undefined?def:Number(v);if(!Number.isInteger(n)||n<1||n>max)throw new Error('BAD_REQUEST');return n;};
  const page=integer(query.page,1,10000),limit=integer(query.limit,25,100);
  const strategy=query.strategy===undefined||query.strategy===''?null:integer(query.strategy,1,7);
@@ -30,8 +32,14 @@ export function parseOptions(query={}){
  if(['scan','analytics','qualifiers'].includes(view)&&scope!=='all'||['scan','analytics','prefilter'].includes(view)&&strategy!==null)throw new Error('BAD_REQUEST');
  if(view==='qualifiers'&&strategy===null)throw new Error('BAD_REQUEST');
  const q=query.q;if(q!==undefined&&(!['qualifiers','prefilter'].includes(view)||typeof q!=='string'||q.length>60||!/^[A-Za-z0-9&_. -]*$/.test(q)))throw new Error('BAD_REQUEST');
- const allowed=new Set(['q','view','page','limit','strategy','scope','symbol','refresh']);if(Object.keys(query).some(k=>!allowed.has(k)))throw new Error('BAD_REQUEST');
- return {view,page,limit,strategy,scope,...(q?{q}:{}),...(symbol?{symbol}:{}),...(refresh==='1'?{forceRefresh:true}:{})};
+ const allowed=new Set(['q','view','page','limit','strategy','scope','symbol','refresh','status','kind','accepted']);if(Object.keys(query).some(k=>!allowed.has(k)))throw new Error('BAD_REQUEST');
+ // Tab filters: each is bound to exactly one view and a fixed enum.
+ const status=query.status,kind=query.kind,accepted=query.accepted;
+ if(status!==undefined&&(view!=='signals'||!SIGNAL_STATUSES.includes(status)))throw new Error('BAD_REQUEST');
+ if(kind!==undefined&&(view!=='runs'||!RUN_KINDS.includes(kind)))throw new Error('BAD_REQUEST');
+ if(accepted!==undefined&&(view!=='quotes'||!['0','1'].includes(accepted)))throw new Error('BAD_REQUEST');
+ if(LEDGER_VIEWS.includes(view)&&strategy!==null&&!STRATEGY_VIEWS.includes(view))throw new Error('BAD_REQUEST');
+ return {view,page,limit,strategy,scope,...(q?{q}:{}),...(symbol?{symbol}:{}),...(status?{status}:{}),...(kind?{kind}:{}),...(accepted?{accepted:Number(accepted)}:{}),...(refresh==='1'?{forceRefresh:true}:{})};
 }
 let client;
 export function readConfig(env=process.env){
@@ -63,19 +71,35 @@ export async function readDashboard(options,execute,now=new Date()){
   const seen=new Set();const rows=raw.filter(r=>{if(seen.has(r.quote_at))return false;seen.add(r.quote_at);return numeric(r.price)>0;}).reverse();
   return {readAt:now.toISOString(),namespace:NAMESPACE,symbol:options.symbol,source:'Accepted recorded Fyers quotes',rows};
  }
+ if(LEDGER_VIEWS.includes(options.view)){if(options.strategy!==null&&!STRATEGY_VIEWS.includes(options.view))throw new Error('BAD_REQUEST');return {readAt:now.toISOString(),namespace:NAMESPACE,view:options.view,market:marketState(now),...await readLedgerView({...options,namespace:NAMESPACE},select,day,publicRows)};}
  if(options.view!=='overview'){
   const definitions={
-   fills:{table:'paper_fills',fields:'id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl',order:'filled_at DESC,id DESC',date:'filled_at'},
+   fills:{table:'paper_fills',fields:'id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl,cashflow',order:'filled_at DESC,id DESC',date:'filled_at'},
    positions:{table:'paper_positions',fields:'strategy,symbol,qty,entry_price,entry_at,high_water,mark_price,mark_at,updated_at',order:'strategy,symbol',date:'entry_at'},
    signals:{table:'paper_signals',fields:'id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date',order:'created_at DESC,id DESC',date:'created_at'},
-   runs:{table:'paper_runs',fields:'kind,at,status',order:'at DESC,id DESC',date:'at'},
+   runs:{table:'paper_runs',fields:'kind,at,status,details_json',order:'at DESC,id DESC',date:'at'},
    quotes:{table:'paper_quote_audit',fields:'symbol,observed_at,quote_at,price,accepted,reason,source',order:'observed_at DESC,id DESC',date:'observed_at'}
   };
   const d=definitions[options.view],args=[...ns];let where='namespace=?'+(options.view==='positions'?' AND qty>0':'');
   if(options.strategy!==null){if(!['fills','positions','signals'].includes(options.view))throw new Error('BAD_REQUEST');where+=' AND strategy=?';args.push(options.strategy);}
+  if(options.status!==undefined){where+=' AND status=?';args.push(options.status);}
+  if(options.kind!==undefined){where+=' AND kind=?';args.push(options.kind);}
+  if(options.accepted!==undefined){where+=' AND accepted=?';args.push(options.accepted);}
   if(options.scope==='today'){where+=` AND date(${d.date},'+5 hours','+30 minutes')=?`;args.push(day);}
   const [counts,rows]=await Promise.all([select(`SELECT COUNT(*) AS total FROM ${d.table} WHERE ${where}`,args),select(`SELECT ${d.fields} FROM ${d.table} WHERE ${where} ORDER BY ${d.order} LIMIT ? OFFSET ?`,[...args,options.limit,(options.page-1)*options.limit])]);
-  return {readAt:now.toISOString(),namespace:NAMESPACE,page:options.page,limit:options.limit,total:Number(counts[0].total),rows:options.view==='positions'?rows.map(r=>positionView(r,now.getTime())):publicRows(rows)};
+  const base={readAt:now.toISOString(),namespace:NAMESPACE,view:options.view,market:marketState(now),page:options.page,limit:options.limit,total:Number(counts[0].total)};
+  if(options.view==='positions')return {...base,rows:rows.map(r=>({...positionView(r,now.getTime()),industry:industryOf(r.symbol)}))};
+  if(options.view==='runs'){const health=await runHealth(select,NAMESPACE);return {...base,health:{...health,latestByKind:publicRows(health.latestByKind)},rows:publicRows(rows.map(({details_json,...r})=>({...r,summary:runSummary(details_json)})))};}
+  if(options.view==='fills'){const e=await enrichFills(select,NAMESPACE,publicRows(rows));return {...base,...e};}
+  if(options.view==='signals'){
+   // Attach the fill (qty/price/time) that executed each signal, when one exists.
+   const ids=rows.map(r=>r.id).filter(Boolean);let fills=[];
+   if(ids.length)fills=await select(`SELECT signal_id,qty,price,filled_at FROM paper_fills WHERE namespace=? AND signal_id IN (${ids.map(()=>'?').join(',')})`,[NAMESPACE,...ids]);
+   const byId=new Map(fills.map(f=>[f.signal_id,f]));
+   return {...base,rows:publicRows(rows).map(r=>{const f=byId.get(r.id);return {...r,fill_qty:f?numeric(f.qty):null,fill_price:f?numeric(f.price):null,filled_at:f?.filled_at??null};})};
+  }
+  if(options.view==='quotes')return {...base,rows:publicRows(rows).map(r=>{const o=Date.parse(r.observed_at),q=Date.parse(r.quote_at);return {...r,price:numeric(r.price),lag_seconds:Number.isFinite(o)&&Number.isFinite(q)?(o-q)/1000:null};})};
+  return {...base,rows:publicRows(rows)};
  }
  const [totals,positions,pnl,performance,recentFills,recentSignals,lastRuns,audit,coverage,closedStats,demoTrades]=await Promise.all([
   select("SELECT COUNT(*) AS filled_orders,COALESCE(SUM(realized_pnl),0) AS realized,COALESCE(SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END),0) AS closed_trades,COALESCE(SUM(CASE WHEN date(filled_at,'+5 hours','+30 minutes')=? THEN 1 ELSE 0 END),0) AS today_fills FROM paper_fills WHERE namespace=?",[day,NAMESPACE]),

@@ -50,7 +50,7 @@ function compare(a, b) {
 }
 
 // Sortable, paginated table. `columns`: [{key, title, render?, align?, sortValue?}].
-export function SortTable({rows = [], columns, pageSize = 12, empty, caption, rowKey = (r, i) => r.id ?? `${r.symbol ?? ''}-${r.strategy ?? ''}-${i}`, filter}) {
+export function SortTable({rows = [], columns, pageSize = 12, empty, caption, rowKey = (r, i) => r.id ?? `${r.symbol ?? ''}-${r.strategy ?? ''}-${i}`, filter, onRowClick, selectedKey}) {
   const [sort, setSort] = useState({key: null, dir: 1});
   const [page, setPage] = useState(1);
   const [q, setQ] = useState('');
@@ -72,7 +72,9 @@ export function SortTable({rows = [], columns, pageSize = 12, empty, caption, ro
       <thead><tr>{columns.map(c => <th key={c.key} scope="col" className={c.align === 'right' ? 'r' : ''} aria-sort={sort.key === c.key ? (sort.dir > 0 ? 'ascending' : 'descending') : 'none'}>
         <button onClick={() => setSort(s => ({key: c.key, dir: s.key === c.key ? -s.dir : 1}))}>{c.title}{sort.key === c.key && (sort.dir > 0 ? <ArrowUp size={11}/> : <ArrowDown size={11}/>)}</button>
       </th>)}</tr></thead>
-      <tbody>{visible.map((r, i) => <tr key={rowKey(r, i)}>{columns.map(c => <td key={c.key} className={c.align === 'right' ? 'r num' : ''}>{c.render ? c.render(r[c.key], r) : (r[c.key] ?? '—')}</td>)}</tr>)}</tbody>
+      <tbody>{visible.map((r, i) => <tr key={rowKey(r, i)} className={onRowClick ? `ad-clickable ${selectedKey !== undefined && selectedKey === rowKey(r, i) ? 'on' : ''}` : undefined}
+        tabIndex={onRowClick ? 0 : undefined} onClick={onRowClick ? () => onRowClick(r, rowKey(r, i)) : undefined}
+        onKeyDown={onRowClick ? e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onRowClick(r, rowKey(r, i)); } } : undefined}>{columns.map(c => <td key={c.key} className={c.align === 'right' ? 'r num' : ''}>{c.render ? c.render(r[c.key], r) : (r[c.key] ?? '—')}</td>)}</tr>)}</tbody>
     </table></div> : <Blank {...(empty ?? {})}/>}
     {pages > 1 && <div className="ad-pager">
       <button aria-label="Previous page" disabled={current <= 1} onClick={() => setPage(current - 1)}><ChevronLeft size={14}/></button>
@@ -88,4 +90,9 @@ export function Meter({value, max, label}) {
   return <div className={`ad-meter ${over ? 'over' : ''}`} role="meter" aria-valuemin={0} aria-valuemax={max} aria-valuenow={value} aria-label={label}>
     <span style={{width: `${ratio * 100}%`}}/>
   </div>;
+}
+
+// Definition list for a record's full detail. items: [[label, value, hint?]]
+export function KeyValues({items}) {
+  return <dl className="ad-kv">{items.filter(Boolean).map(([k, v, hint]) => <div key={k}><dt>{k}</dt><dd>{v ?? '—'}{hint && <small className="ad-muted"> {hint}</small>}</dd></div>)}</dl>;
 }
