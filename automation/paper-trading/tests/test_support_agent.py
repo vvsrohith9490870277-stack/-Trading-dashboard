@@ -480,11 +480,11 @@ class SupportAgentV3ProductionPlanTests(unittest.TestCase):
                 v1 = sv.run_verifier_1_correctness(clean)
                 v2 = sv.run_verifier_2_safety(clean, safe_verdict, proposer_model_family='claude', verifier_model_family='gemini')
                 v3 = sv.run_verifier_3_regression(clean)
-                rec_out = sv.reconcile_verdicts(v1, v2, v3, revision_round=0)
+                rec_out = sv.reconcile_verdicts(v1, v2, v3, revision_round=0, binding_verdict=verdict_path)
                 self.assertEqual(rec_out['outcome'], 'READY_FOR_HUMAN')
 
                 # Second failure on revision_round=1 yields REJECT
-                rec_reject = sv.reconcile_verdicts(v1, v2_veto, v3, revision_round=1)
+                rec_reject = sv.reconcile_verdicts(v1, v2_veto, v3, revision_round=1, binding_verdict=unsafe_safety)
                 self.assertEqual(rec_reject['outcome'], 'REJECT')
             finally:
                 if verdict_path.exists():
@@ -524,7 +524,7 @@ class SupportAgentV3ProductionPlanTests(unittest.TestCase):
                 si_mod.execute_install(
                     self.support_store, 'paper_v1', batch_id, report,
                     install_started_at='2026-11-12T21:45:00+05:30',
-                    release_sha='11111111', pt_root_dir=tmp,
+                    release_sha='tree-c1', pt_root_dir=tmp,
                     safety_verdict=safe_verdict, subset_reverified=False,
                 )
 
@@ -532,7 +532,7 @@ class SupportAgentV3ProductionPlanTests(unittest.TestCase):
             aborted = si_mod.execute_install(
                 self.support_store, 'paper_v1', batch_id, report,
                 install_started_at='2026-11-12T21:45:00+05:30',
-                release_sha='11111111', pt_root_dir=tmp,
+                release_sha='tree-c1', pt_root_dir=tmp,
                 safety_verdict=safe_verdict, subset_reverified=True, subset_tree_sha='tree-c1',
                 active_locks_or_procs=['engine.lock'],
             )
@@ -545,7 +545,7 @@ class SupportAgentV3ProductionPlanTests(unittest.TestCase):
             rolled_back = si_mod.execute_install(
                 self.support_store, 'paper_v1', batch_id, report,
                 install_started_at='2026-11-13T07:50:00+05:30',
-                release_sha='11111111', pt_root_dir=tmp,
+                release_sha='tree-c1', pt_root_dir=tmp,
                 safety_verdict=safe_verdict, subset_reverified=True, subset_tree_sha='tree-c1',
                 smoke_test_fn=lambda rel_dir: True,
                 smoke_finished_at='2026-11-13T08:06:00+05:30',
@@ -561,13 +561,13 @@ class SupportAgentV3ProductionPlanTests(unittest.TestCase):
             installed = si_mod.execute_install(
                 self.support_store, 'paper_v1', batch_id, report,
                 install_started_at='2026-11-12T21:45:00+05:30',
-                release_sha='11111111', pt_root_dir=tmp,
+                release_sha='tree-c1', pt_root_dir=tmp,
                 safety_verdict=safe_verdict, subset_reverified=True, subset_tree_sha='tree-c1',
                 smoke_test_fn=lambda rel_dir: (rel_dir / 'RELEASE_SHA').exists(),
                 smoke_finished_at='2026-11-12T21:47:00+05:30',
             )
             self.assertEqual(installed['status'], 'INSTALLED')
-            self.assertEqual(installed['active_release'], '11111111')
+            self.assertEqual(installed['active_release'], 'tree-c1')
 
             f_res = sa.append_finding(
                 self.support_store, 'paper_v1', 'error_taxonomy_gap', 'err-1',

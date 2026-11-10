@@ -8,8 +8,8 @@ Enforces:
 - Quiescence gate: aborts with SEV2 install_aborted_process_active if any engine/scan/worker/guardian process or lock is active.
 - Morning abort at policy install.morning_abort_at (08:05 IST) or install.max_seconds (900s) triggers unconditional rollback and SEV2 install_rolled_back.
 """
-import hashlib, json, re, shutil
-from datetime import datetime, time as dt_time
+import hashlib, json, os, re, shutil
+from datetime import datetime, time as dt_time, timedelta
 from pathlib import Path
 import support_agent as sa
 import support_verifiers as sv
@@ -156,8 +156,9 @@ def select_install_slot(approval_at, cfg=None):
 
     ev_cut = dt_time(*[int(x) for x in inst['evening_cutoff'].split(':')])
     mo_cut = dt_time(*[int(x) for x in inst['morning_cutoff'].split(':')])
+    report_at = dt_time(*[int(x) for x in sa.SUPPORT_POLICY['schedule']['evening_daily_report'].split(':')])
 
-    if sa.is_trading_day(d, cfg=c) and dt_time(16, 45) <= wall <= ev_cut:
+    if sa.is_trading_day(d, cfg=c) and report_at <= wall <= ev_cut:
         return {
             'eligible': True,
             'slot': 'evening',
@@ -169,16 +170,60 @@ def select_install_slot(approval_at, cfg=None):
             'slot': 'morning',
             'scheduled_at': f"{d.isoformat()}T{inst['morning_slot']}:00+05:30",
         }
+    # Plan 5.4: an approval after the 21:30 evening cutoff, or on a weekend/holiday, is still before the
+    # 07:45 cutoff of the next trading day, so it takes that day's 07:50 morning slot.
+    if (sa.is_trading_day(d, cfg=c) and wall > ev_cut) or not sa.is_trading_day(d, cfg=c):
+        nxt = sa.next_trading_day(d, cfg=c)
+        return {
+            'eligible': True,
+            'slot': 'morning',
+            'scheduled_at': f"{nxt.isoformat()}T{inst['morning_slot']}:00+05:30",
+        }
     return {'eligible': False, 'reason': 'missed_cutoff_waits_for_next_evening_report'}
 
 
-def check_quiescence_gate(root_dir=None, active_processes=None):
-    """Quiescence gate: verify no engine, scan, worker, or guardian process or lock file is active."""
+QUIESCENCE_LOCKS = ('engine.lock', 'monitor.lock', 'guardian.lock')
+
+
+def _held_lock_inodes(proc_locks_path='/proc/locks'):
+    """Read-only view of held POSIX/flock locks as {(major, minor, inode)}. None if unreadable."""
+    try:
+        text = Path(proc_locks_path).read_text(encoding='utf8')
+    except OSError:
+        return None
+    held = set()
+    for line in text.splitlines():
+        parts = line.split()
+        dev = next((x for x in parts if x.count(':') == 2), None)
+        if not dev:
+            continue
+        try:
+            maj, mnr, ino = dev.split(':')
+            held.add((int(maj, 16), int(mnr, 16), int(ino)))
+        except ValueError:
+            continue
+    return held
+
+
+def check_quiescence_gate(root_dir=None, active_processes=None, proc_locks_path='/proc/locks'):
+    """Quiescence gate: verify no engine, scan, worker, or guardian process or lock is active.
+
+    The engine, worker and guardian hold empty lock files with fcntl.flock, so file size says nothing.
+    The gate reads /proc/locks (read-only, never takes the lock itself, so it cannot make a starting
+    engine see singleton_busy). If held locks cannot be read, the gate fails closed.
+    """
     base = Path(root_dir) if root_dir is not None else sa.ROOT
     active_locks = []
-    for lock_name in ('engine.lock', 'monitor.lock', 'guardian.lock'):
+    held = _held_lock_inodes(proc_locks_path)
+    for lock_name in QUIESCENCE_LOCKS:
         lp = base / lock_name
-        if lp.exists() and lp.stat().st_size > 0:
+        if not lp.exists():
+            continue
+        if held is None:
+            active_locks.append(f'{lock_name}:lock_state_unreadable')
+            continue
+        st = lp.stat()
+        if (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino) in held:
             active_locks.append(lock_name)
     procs = list(active_processes or [])
     busy = active_locks + procs
@@ -199,6 +244,7 @@ def execute_install(
     active_locks_or_procs=None,
     smoke_test_fn=None,
     smoke_finished_at=None,
+    runtime_root=None,
 ):
     """Execute pre-flight, quiescence gate, atomic release switch, smoke test, and morning abort rollback."""
     start_ist = sa.parse_ist(install_started_at)
@@ -215,10 +261,17 @@ def execute_install(
 
     # 2. Check subset re-verification if subset of batch was approved
     approved_ids = json.loads(app['approved_changes_json'])
+    approved_shas = set(json.loads(app['commit_shas_json']))
     total_changes = len(batch_manifest.get('changes', []))
-    if len(approved_ids) < total_changes:
+    is_subset = len(approved_ids) < total_changes
+    if is_subset:
         if not subset_reverified or not subset_tree_sha:
             raise PermissionError('subset_approval_requires_reverified_tree_sha')
+    # Approval binds to the exact SHAs in the report (plan 5.4): never install anything else.
+    allowed_release = {str(subset_tree_sha)} if is_subset else approved_shas
+    if str(release_sha) not in allowed_release:
+        raise PermissionError('release_sha_not_in_approved_batch')
+    if is_subset:
         sa._write_support_only(support_store, [(
             'UPDATE support_approvals SET subset_tree_sha=? WHERE batch_id=?',
             (str(subset_tree_sha), batch_id),
@@ -231,8 +284,10 @@ def execute_install(
     if not safety_verdict or safety_verdict.get('overall') != 'PASS' or safety_verdict.get('hard_veto'):
         raise PermissionError('binding_safety_verdict_failed')
 
-    # 4. Quiescence gate
-    if active_locks_or_procs:
+    # 4. Quiescence gate (always probes the runtime's own locks; caller-supplied processes are added)
+    gate = check_quiescence_gate(runtime_root, active_processes=active_locks_or_procs)
+    if not gate['quiescent']:
+        active_locks_or_procs = gate['active_locks'] + gate['active_processes']
         sa.append_finding(
             support_store, namespace, 'install_aborted_process_active',
             f'install_abort:{batch_id}', start_ist.isoformat(), session_day,

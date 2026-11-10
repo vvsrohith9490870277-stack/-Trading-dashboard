@@ -11,6 +11,7 @@ import csv, hashlib, json, math, re, sqlite3
 from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 import reconciliation as rec
+import capital
 
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text(encoding='utf8'))
@@ -206,10 +207,16 @@ ALLOWED_WRITE_TABLES = (
 )
 
 
+APPEND_ONLY_TABLES = ('support_findings',)
+
+
 def _write_support_only(db, statements):
     """Enforce that the Support Agent never mutates trading tables (H2)."""
     for sql, _ in statements:
         norm = ' '.join(str(sql).strip().split()).upper()
+        for t in APPEND_ONLY_TABLES:
+            if norm.startswith(f'UPDATE {t.upper()} ') or norm.startswith(f'INSERT OR REPLACE INTO {t.upper()}'):
+                raise PermissionError(f'support_findings_append_only_violation:{sql}')
         if not any(
             norm.startswith(f'INSERT INTO {t.upper()}')
             or norm.startswith(f'INSERT OR REPLACE INTO {t.upper()}')
@@ -490,6 +497,38 @@ def transition_finding(db, namespace, fid, new_status, note=None, recorded_at=No
         ),
     )])
     return {'finding_id': fid, 'status_seq': seq, 'status': new_status, 'severity': sev, 'actor': actor, 'entry_hash': entry_hash}
+
+
+_EVIDENCE_BOOKKEEPING_KEYS = frozenset({'previous_status', 'status_actor', 'status_note'})
+
+
+def update_finding_evidence(db, namespace, fid, details, recorded_at=None, actor='support_agent', as_of=None):
+    """Append an OPEN->OPEN evidence row when an aggregate finding's evidence grew (append-only, idempotent).
+
+    Aggregate per-session findings (counts, samples, last_check) are first written at the first tick that
+    sees the problem. Later ticks must not lose the rest of the session's evidence, but an unchanged
+    re-run must not add any row (zero duplicates).
+    """
+    rows = db.query(
+        'SELECT details_json FROM support_findings WHERE namespace=? AND finding_id=? ORDER BY status_seq DESC LIMIT 1',
+        (namespace, fid),
+    )
+    if not rows:
+        return None
+    raw = json.loads(rows[0]['details_json'] or '{}')
+    chain = raw.get('_chain', {})
+    if chain.get('status', 'OPEN') != 'OPEN':
+        return None
+    cur = {k: v for k, v in raw.items() if k != '_chain'}
+    if as_of is not None and cur.get('evidence_as_of') and parse_ist(cur['evidence_as_of']) >= parse_ist(as_of):
+        # A replay or late re-run of an earlier tick must never roll evidence back.
+        return None
+    new = json.loads(json.dumps(details or {}, sort_keys=True, default=str))
+    if all(k in cur and _stable_json(cur[k]) == _stable_json(v) for k, v in new.items()):
+        return None
+    if as_of is not None:
+        new['evidence_as_of'] = parse_ist(as_of).isoformat()
+    return transition_finding(db, namespace, fid, 'OPEN', note='evidence_updated', recorded_at=recorded_at, actor=actor, extra_details=new)
 
 
 def record_episode(db, namespace, session_day, expectation, detector, event_at, blind_seconds=0.0, base_severity='SEV3', details=None, observation_only=True, recorded_at=None, event_id=None):
@@ -779,8 +818,12 @@ def verify_decision_reconstruction(decisions):
 
 def run_detectors(db, namespace, session_day, observation_only=True, stale_threshold_seconds=None, recorded_at=None, trading_db=None):
     """Run the deterministic support detectors (read-only on trading tables)."""
-    if INCOMPLETE_LIFECYCLE_MINUTES is not None:
-        raise RuntimeError('incomplete_lifecycle_minutes_must_not_be_invented')
+    # The timeout lives in support_policy.json (null until the user decides). Setting it must enable the
+    # timeout, not crash every support pass.
+    lifecycle_minutes = INCOMPLETE_LIFECYCLE_MINUTES
+    if lifecycle_minutes is not None and (isinstance(lifecycle_minutes, bool) or not isinstance(lifecycle_minutes, (int, float)) or lifecycle_minutes <= 0):
+        raise ValueError('incomplete_lifecycle_timeout_minutes_invalid')
+    lifecycle_now = parse_ist(recorded_at) if recorded_at else ist_now()
     reader = trading_db if trading_db is not None else db
     session_day = ist_session_day(session_day)
     if stale_threshold_seconds is None:
@@ -850,18 +893,22 @@ def run_detectors(db, namespace, session_day, observation_only=True, stale_thres
     for dec in day_decisions:
         resolved_orders.add(str(dec['correlation_id']))
     for cid, first_at in attempts.items():
+        if lifecycle_minutes is not None and (lifecycle_now - parse_ist(first_at)).total_seconds() < float(lifecycle_minutes) * 60:
+            continue
         if cid not in resolved_orders:
             record('incomplete_lifecycle', cid, first_at, 'ERROR', {
                 'kind': 'order_attempt_without_decision_or_result',
-                'incomplete_lifecycle_timeout_minutes': INCOMPLETE_LIFECYCLE_MINUTES,
-                'timeout_source': 'not_numeric_in_plan_not_invented',
+                'incomplete_lifecycle_timeout_minutes': lifecycle_minutes,
+                'timeout_source': 'support_policy.json' if lifecycle_minutes is not None else 'not_numeric_in_plan_not_invented',
             })
     for rid, first_at in runs_started.items():
+        if lifecycle_minutes is not None and (lifecycle_now - parse_ist(first_at)).total_seconds() < float(lifecycle_minutes) * 60:
+            continue
         if rid not in runs_finished:
             record('incomplete_lifecycle', rid, first_at, 'WARN', {
                 'kind': 'run_started_without_completion',
-                'incomplete_lifecycle_timeout_minutes': INCOMPLETE_LIFECYCLE_MINUTES,
-                'timeout_source': 'not_numeric_in_plan_not_invented',
+                'incomplete_lifecycle_timeout_minutes': lifecycle_minutes,
+                'timeout_source': 'support_policy.json' if lifecycle_minutes is not None else 'not_numeric_in_plan_not_invented',
             })
 
     # 3. unexpected_skip
@@ -968,7 +1015,10 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
     stamp = recorded_at or now_ist.isoformat()
 
     raw_events = reader.query('SELECT * FROM paper_events WHERE namespace=? AND session_day=? ORDER BY source_at,event_id', (namespace, session_day))
-    events = [ev for ev in raw_events if parse_ist(ev['source_at']) <= now_ist]
+    events = sorted(
+        (ev for ev in raw_events if parse_ist(ev['source_at']) <= now_ist),
+        key=lambda ev: (parse_ist(ev['source_at']), str(ev.get('event_id'))),
+    )
     all_decisions = reader.query('SELECT * FROM paper_decisions WHERE namespace=? ORDER BY seq', (namespace,))
     day_decisions = [
         d for d in all_decisions
@@ -997,19 +1047,14 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             severity=severity, status='OPEN', details=details,
             observation_only=observation_only, notified=False, recorded_at=stamp,
         )
+        if not res['created']:
+            # Aggregate findings keep the whole session's evidence (append-only evidence row, no-op if unchanged).
+            update_finding_evidence(db, namespace, res['finding_id'], details, recorded_at=stamp, as_of=now_ist)
         results.append({**res, 'detector': detector, 'correlation_id': cid})
         return res
 
-    # Policy hygiene at 08:30 (once per day and key for null SEV3/SEV4 values)
-    if check_policy_hygiene or (now_ist.hour == 8 and now_ist.minute == 30):
-        for item in missing_policy_values():
-            key = item['key']
-            emit('policy_value_missing', f'policy_missing:{session_day}:{key}', f'{session_day}T08:30:00+05:30', 'SEV4', {
-                'policy_key': key,
-                'target_severity': item['target_severity'],
-            })
-
     if not is_trading_day(session_day):
+        # Holidays and weekends are silent (plan section 4 / H8), including policy hygiene.
         return {
             'namespace': namespace,
             'session_day': session_day,
@@ -1017,6 +1062,16 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             'results': results,
             'not_evaluable': not_evaluable,
         }
+
+    # Policy hygiene at 08:30 (once per day and key for null SEV3/SEV4 values)
+    ph_h, ph_m = [int(x) for x in SUPPORT_POLICY['schedule']['pre_open_readiness'].split(':')]
+    if check_policy_hygiene or (now_ist.hour == ph_h and now_ist.minute == ph_m):
+        for item in missing_policy_values():
+            key = item['key']
+            emit('policy_value_missing', f'policy_missing:{session_day}:{key}', f"{session_day}T{SUPPORT_POLICY['schedule']['pre_open_readiness']}:00+05:30", 'SEV4', {
+                'policy_key': key,
+                'target_severity': item['target_severity'],
+            })
 
     exp = SUPPORT_POLICY['expectations']
     thresh = SUPPORT_POLICY['thresholds']
@@ -1069,36 +1124,87 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             ep = record_episode(
                 db, namespace, session_day, 'worker_active_0915', 'worker_down',
                 session_start.isoformat(), blind_seconds=blind,
-                base_severity='SEV2', details={'window_start': '09:15', 'first_check': None, 'blind_seconds': blind},
+                base_severity='SEV2', details={'window_start': w_exp['start_at'], 'first_check': None, 'blind_seconds': blind},
                 observation_only=observation_only, recorded_at=stamp, event_id=f'worker_down:{session_day}:0915',
             )
+            if now_ist >= session_end:
+                # Whole session blind: record the final blind time once after the close (not one row per pass).
+                update_finding_evidence(db, namespace, ep['finding_id'], {'blind_seconds': blind, 'cumulative_blind_seconds': blind}, recorded_at=stamp, as_of=now_ist)
             results.append({**ep, 'detector': 'worker_down'})
         else:
             first_check_dt, first_ev = monitor_events[0]
             last_check_dt, _ = monitor_events[-1]
             initial_gap = (first_check_dt - session_start).total_seconds()
+            in_session = [dt for dt, _ in monitor_events if session_start <= dt <= session_end]
+            max_gap = max([(b - a).total_seconds() for a, b in zip(in_session, in_session[1:])] or [0.0])
+            stale_s = float(CFG['worker_stale_seconds'])
+            late_last = now_ist >= session_end and (session_end - last_check_dt).total_seconds() > stale_s
             if initial_gap > float(w_exp['grace_seconds']):
+                recovery = {
+                    'window_start': w_exp['start_at'],
+                    'first_check': first_check_dt.strftime('%H:%M:%S'),
+                    'blind_window': f"{w_exp['start_at']}-{first_check_dt.strftime('%H:%M')}",
+                    'blind_seconds': initial_gap,
+                    'cumulative_blind_seconds': initial_gap,
+                    'time_to_recover_seconds': initial_gap,
+                }
                 ep = record_episode(
                     db, namespace, session_day, 'worker_active_0915', 'worker_down',
                     session_start.isoformat(), blind_seconds=initial_gap,
-                    base_severity='SEV2',
-                    details={
-                        'window_start': '09:15',
-                        'first_check': first_check_dt.strftime('%H:%M:%S'),
-                        'blind_window': f"09:15-{first_check_dt.strftime('%H:%M')}",
-                        'blind_seconds': initial_gap,
-                    },
+                    base_severity='SEV2', details=recovery,
                     observation_only=observation_only, recorded_at=stamp, event_id=f'worker_down:{session_day}:0915',
                 )
+                # Plan 3.4: the episode closes on the recovery event (first monitor check) and records time-to-recover.
+                close_episode(
+                    db, namespace, session_day, 'worker_active_0915', 'worker_down',
+                    first_ev['source_at'], recovery_details=recovery, recorded_at=stamp,
+                )
                 results.append({**ep, 'detector': 'worker_down'})
-                emit('monitor_staleness', f'monitor_staleness:{session_day}', first_ev['source_at'], 'SEV2', {
+            if initial_gap > float(w_exp['grace_seconds']) or max_gap > stale_s or late_last:
+                ms_details = {
                     'first_check': first_check_dt.strftime('%H:%M:%S'),
-                    'last_check': last_check_dt.strftime('%H:%M:%S'),
                     'initial_gap_seconds': initial_gap,
-                })
+                    'max_check_gap_seconds': max_gap,
+                    'threshold_seconds': stale_s,
+                }
+                if now_ist >= session_end:
+                    # last check vs close is only final after the close (avoids one evidence row per pass).
+                    ms_details['last_check'] = last_check_dt.strftime('%H:%M:%S')
+                    ms_details['last_check_gap_to_close_seconds'] = (session_end - last_check_dt).total_seconds()
+                emit('monitor_staleness', f'monitor_staleness:{session_day}', first_ev['source_at'], 'SEV2', ms_details)
 
     # 3. Scan lock blocked gaps -> lock_blocked_gap (SEV3, escalates to SEV2 via episode rules)
     lock_gap_min = float(thresh['lock_blocked_gap_seconds'])
+    # The engine emits worker_waiting(reason=singleton_busy) every poll while a scan holds engine.lock.
+    # A streak of those, bounded by the last check before and the first check after, is one check gap.
+    check_types = ('monitor_completed', 'monitor_idle', 'worker_check')
+    last_check_at = None
+    streak = None
+    for ev in events:
+        et = ev['event_type']
+        if et == 'worker_waiting':
+            try:
+                reason = json.loads(ev.get('data_json') or '{}').get('reason')
+            except Exception:
+                reason = None
+            if reason == 'singleton_busy' and streak is None:
+                streak = {'first': ev, 'gap_start': last_check_at or parse_ist(ev['source_at']), 'waits': 0}
+            if reason == 'singleton_busy':
+                streak['waits'] += 1
+        elif et in check_types:
+            at = parse_ist(ev['source_at'])
+            if streak is not None:
+                gap_s = (at - streak['gap_start']).total_seconds()
+                if gap_s >= lock_gap_min:
+                    ep = record_episode(
+                        db, namespace, session_day, 'scan_lock_contention', 'lock_blocked_gap',
+                        streak['first']['source_at'], blind_seconds=gap_s, base_severity='SEV3',
+                        details={'gap_seconds': gap_s, 'event_id': streak['first']['event_id'], 'worker_waiting_events': streak['waits'], 'gap_end_at': ev['source_at']},
+                        observation_only=observation_only, recorded_at=stamp, event_id=streak['first']['event_id'],
+                    )
+                    results.append({**ep, 'detector': 'lock_blocked_gap'})
+                streak = None
+            last_check_at = at
     for ev in events:
         if ev['event_type'] in ('lock_blocked_gap', 'worker_lock_blocked'):
             data = json.loads(ev.get('data_json') or '{}')
@@ -1130,9 +1236,17 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         })
 
     # 5. Quotes -> quote_batch_failed + recovery (SEV3) & quote_field_regression (SEV1)
+    quote_failed_open = False
     for ev in events:
         data = json.loads(ev.get('data_json') or '{}')
+        if ev['event_type'] == 'quote_batch_response' and quote_failed_open and ev.get('outcome') == 'ok':
+            close_episode(
+                db, namespace, session_day, 'quote_batch', 'quote_batch_failed',
+                ev['source_at'], recovery_details={'recovered_at': ev['source_at'], 'recovered_by': 'quote_batch_response'}, recorded_at=stamp,
+            )
+            quote_failed_open = False
         if ev['event_type'] == 'quote_batch_failed':
+            quote_failed_open = True
             ep = record_episode(
                 db, namespace, session_day, 'quote_batch', 'quote_batch_failed',
                 ev['source_at'], blind_seconds=float(data.get('timeout_seconds') or thresh['quote_timeout_seconds']),
@@ -1141,6 +1255,7 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             )
             results.append({**ep, 'detector': 'quote_batch_failed'})
         elif ev['event_type'] == 'quote_batch_recovered':
+            quote_failed_open = False
             close_episode(
                 db, namespace, session_day, 'quote_batch', 'quote_batch_failed',
                 ev['source_at'], recovery_details={'recovered_at': ev['source_at']}, recorded_at=stamp,
@@ -1160,8 +1275,11 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         price = float(f.get('price') or 0.0)
         qty = int(f.get('qty') or f.get('quantity') or 0)
         if price > 0:
-            expected_qty = int(math.floor(target_notional / price))
-            if qty == 1 and expected_qty > 1:
+            try:
+                expected_qty = int(capital.integer_shares(price, int(CAP_POLICY['target_notional_inr'])))
+            except ValueError:
+                expected_qty = int(math.floor(target_notional / price))
+            if qty != expected_qty:
                 one_share_anomalies.append({
                     'fill_id': f.get('id'),
                     'symbol': f.get('symbol'),
@@ -1528,6 +1646,8 @@ def write_heartbeat(store_or_dir, namespace='paper_v1', now_at=None, source='sys
 def run_scheduled_pass(db, namespace, session_day, session_bounds=None, now_at=None, observation_only=True, out_dir=None, notify_fn=None):
     """Execute one non-blocking support pass (checkpoint -> detectors -> report) without engine.lock."""
     session_day = ist_session_day(session_day)
+    # Plan 3.1: the agent refuses to run when support_policy.json does not match its lock.
+    assert_support_policy_lock()
     obs = bool(observation_only)
     window = schedule_window(now_at, session_bounds) if now_at is not None else {'due': True, 'phase': 'manual', 'schedule': SCHEDULE_SPEC}
     cp_res = consume_checkpoint(db, namespace)

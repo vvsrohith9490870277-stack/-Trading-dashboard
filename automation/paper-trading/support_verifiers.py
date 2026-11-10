@@ -15,6 +15,7 @@ import support_agent as sa
 
 ROOT = Path(__file__).resolve().parent
 LOCKED_TRADING_FILES = frozenset({
+    'config.json',
     'capital_policy.json',
     'charge_policy.json',
     'charge_rates.json',
@@ -37,7 +38,24 @@ PROTECTED_ENGINE_FUNCTIONS = frozenset({
     'strategy_5',
     'strategy_6',
     'strategy_7',
+    # Signal, sizing, price and order-routing functions that exist today (engine.py / capital.py).
+    'decide',
+    'slot_rank',
+    'price_paise',
+    'execution_reference',
+    'book_price',
+    'best_level',
+    'circuit_haircut',
+    'trail_level',
+    'band_for',
+    'current_lock',
 })
+# Plan 5.2: engine_instrumentation_or_locking may touch logging, error taxonomy and lock paths in these files only.
+ENGINE_CLASS_FILES = frozenset({'engine.py', 'audit.py', 'automation.py', 'guardian.py'})
+# Plan H1: dynamic import / process execution bans in support code (AST, not grep).
+BANNED_IMPORT_MODULES = frozenset({'subprocess', 'importlib', 'ctypes', 'fyers_apiv3', 'fyers_api', 'kiteconnect'})
+BANNED_CALLS = frozenset({'__import__', 'eval', 'exec', 'compile'})
+BANNED_ATTR_CALLS = frozenset({('os', 'system'), ('os', 'popen'), ('os', 'execv'), ('os', 'execve'), ('os', 'spawnv'), ('importlib', 'import_module')})
 FORBIDDEN_ORDER_CALLS = frozenset({
     'place_order',
     'place_basket_order',
@@ -124,12 +142,21 @@ def check_order_route_ast(py_sources_map):
             violations.append({'file': filename, 'reason': f'syntax_error:{exc.msg}'})
             continue
         for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                mods = [a.name for a in node.names] if isinstance(node, ast.Import) else [node.module or '']
+                for mod in mods:
+                    if mod.split('.')[0] in BANNED_IMPORT_MODULES:
+                        violations.append({'file': filename, 'line': getattr(node, 'lineno', 0), 'banned_import': mod})
             if isinstance(node, ast.Call):
                 func_name = None
                 if isinstance(node.func, ast.Name):
                     func_name = node.func.id
+                    if func_name in BANNED_CALLS:
+                        violations.append({'file': filename, 'line': getattr(node, 'lineno', 0), 'banned_call': func_name})
                 elif isinstance(node.func, ast.Attribute):
                     func_name = node.func.attr
+                    if isinstance(node.func.value, ast.Name) and (node.func.value.id, func_name) in BANNED_ATTR_CALLS:
+                        violations.append({'file': filename, 'line': getattr(node, 'lineno', 0), 'banned_call': f'{node.func.value.id}.{func_name}'})
                 if func_name in FORBIDDEN_ORDER_CALLS:
                     violations.append({'file': filename, 'line': getattr(node, 'lineno', 0), 'call': func_name})
             elif isinstance(node, ast.Constant) and isinstance(node.value, str):
@@ -161,10 +188,18 @@ def check_naive_clock_ast(py_sources_map):
                     if node.func.attr == 'utcnow':
                         violations.append({'file': filename, 'line': getattr(node, 'lineno', 0), 'reason': 'banned_utcnow'})
                     elif node.func.attr == 'now':
-                        # datetime.now() with no args and no tz keyword is naive
-                        if isinstance(node.func.value, ast.Name) and node.func.value.id in ('datetime', 'dt'):
-                            if len(node.args) == 0 and not any(kw.arg == 'tz' for kw in node.keywords):
+                        # datetime.now() / datetime.datetime.now() with no tz is naive
+                        owner = node.func.value
+                        is_dt = (isinstance(owner, ast.Name) and owner.id in ('datetime', 'dt')) or (isinstance(owner, ast.Attribute) and owner.attr == 'datetime')
+                        if is_dt:
+                            tz_kw = [kw for kw in node.keywords if kw.arg == 'tz']
+                            tz_arg = node.args[0] if node.args else (tz_kw[0].value if tz_kw else None)
+                            if tz_arg is None or (isinstance(tz_arg, ast.Constant) and tz_arg.value is None):
                                 violations.append({'file': filename, 'line': getattr(node, 'lineno', 0), 'reason': 'naive_datetime_now'})
+                    elif node.func.attr == 'today':
+                        owner = node.func.value
+                        if (isinstance(owner, ast.Name) and owner.id in ('date', 'datetime', 'dt')) or (isinstance(owner, ast.Attribute) and owner.attr in ('date', 'datetime')):
+                            violations.append({'file': filename, 'line': getattr(node, 'lineno', 0), 'reason': 'naive_today'})
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstring_nodes:
                 if re.search(r"(?i)\bdate\s*\(\s*'now'\s*\)", node.value) or re.search(r'(?i)\bdatetime\s*\(\s*\'now\'\s*\)', node.value):
                     violations.append({'file': filename, 'line': getattr(node, 'lineno', 0), 'reason': 'sqlite_date_now_banned'})
@@ -286,10 +321,18 @@ def check_change_class_ast(change_class, changed_files, before_sources=None, aft
         return {'passed': True, 'change_class': change_class}
 
     # engine_instrumentation_or_locking
+    outside = [f for f in files if not (f in ENGINE_CLASS_FILES or f.startswith('support_') or f.startswith('test_') or f.endswith('.md'))]
+    if outside:
+        return {'passed': False, 'reason': 'engine_class_touched_files_outside_allowlist', 'files': outside}
     if int(track_a_decision_diff) != 0:
         return {'passed': False, 'reason': 'non_zero_track_a_decision_diff', 'track_a_decision_diff': track_a_decision_diff}
     before_sources = before_sources or {}
     after_sources = after_sources or {}
+    provided = {Path(k).name for k in set(before_sources) & set(after_sources)}
+    unproven = sorted(f for f in files if f in ENGINE_CLASS_FILES and f not in provided)
+    if unproven:
+        # No before/after source means no AST proof; fail closed instead of passing vacuously.
+        return {'passed': False, 'reason': 'engine_class_ast_proof_missing_sources', 'files': unproven}
     modified_protected = []
     for fname in set(before_sources.keys()) | set(after_sources.keys()):
         b_sigs = _function_ast_signatures(before_sources.get(fname, ''))
@@ -413,7 +456,18 @@ def run_verifier_3_regression(handoff_bundle, proposer_agent_id='proposer_1', ve
     return {'role': 'verifier_3_regression', 'verdict': overall, 'items': items}
 
 
-def reconcile_verdicts(v1, v2, v3, revision_round=0):
+def load_binding_verdict(binding_verdict):
+    """Read the binding script verdict directly (dict or the read-only verdict file) with its sha256."""
+    if binding_verdict is None:
+        return None, None
+    if isinstance(binding_verdict, (str, Path)):
+        raw = Path(binding_verdict).read_bytes()
+        return json.loads(raw.decode('utf8')), hashlib.sha256(raw).hexdigest()
+    raw = json.dumps(binding_verdict, sort_keys=True, default=str).encode('utf8')
+    return binding_verdict, hashlib.sha256(raw).hexdigest()
+
+
+def reconcile_verdicts(v1, v2, v3, revision_round=0, binding_verdict=None):
     """Reconciler / Judge: merges V1, V2, V3 after all three are final.
 
     Rules:
@@ -426,6 +480,20 @@ def reconcile_verdicts(v1, v2, v3, revision_round=0):
     """
     verdicts = [v1, v2, v3]
     max_revs = int(sa.SUPPORT_POLICY['verifier_rules']['max_revisions'])
+
+    # Plan 5.1(3): the Reconciler reads the binding script verdict itself; no model verdict can overrule it.
+    script, script_sha = load_binding_verdict(binding_verdict)
+    if script is None or script.get('overall') != 'PASS' or script.get('hard_veto', True) or script.get('failed_checks'):
+        outcome = 'REJECT' if revision_round >= max_revs else 'REVISE'
+        return {
+            'outcome': outcome,
+            'vetoed_by_verifier_2': True,
+            'reason': 'binding_script_verdict_missing' if script is None else 'binding_script_veto',
+            'binding_verdict_sha256': script_sha,
+            'revision_round': revision_round,
+            'dissent': [],
+            'verdicts': verdicts,
+        }
 
     if v2.get('hard_veto') or v2.get('verdict') != 'PASS':
         outcome = 'REJECT' if revision_round >= max_revs else 'REVISE'
@@ -448,7 +516,10 @@ def reconcile_verdicts(v1, v2, v3, revision_round=0):
             'verdicts': verdicts,
         }
 
-    must_failures = []
+    must_failures = [
+        f"{v.get('role', 'verifier')}:verdict:{v.get('verdict')}"
+        for v in verdicts if v.get('verdict') not in ('PASS', 'PASS_WITH_WARNINGS')
+    ]
     should_Statuses = []
     dissent = []
     for v in verdicts:
@@ -462,7 +533,7 @@ def reconcile_verdicts(v1, v2, v3, revision_round=0):
                     dissent.append(f"{role}:{item.get('id')}:{item.get('status')}")
 
     # Check 2-of-3 rule across verifiers
-    pass_count = sum(1 for v in verdicts if v.get('verdict') == 'PASS')
+    pass_count = sum(1 for v in verdicts if v.get('verdict') in ('PASS', 'PASS_WITH_WARNINGS'))
     if must_failures or pass_count < int(sa.SUPPORT_POLICY['verifier_rules']['should_min_pass']):
         outcome = 'REJECT' if revision_round >= max_revs else 'REVISE'
         return {
@@ -477,6 +548,7 @@ def reconcile_verdicts(v1, v2, v3, revision_round=0):
     return {
         'outcome': 'READY_FOR_HUMAN',
         'vetoed_by_verifier_2': False,
+        'binding_verdict_sha256': script_sha,
         'must_failures': [],
         'revision_round': revision_round,
         'dissent': dissent,
