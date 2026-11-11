@@ -221,15 +221,26 @@ class CycleHeartbeat:
  """Refreshes the 'polling' heartbeat every worker_heartbeat_interval_seconds while one cycle runs.
  Stops refreshing after worker_cycle_max_seconds so a genuinely hung cycle still turns stale."""
  def __init__(self,e,db,polls):
-  self.e,self.db,self.polls=e,db,polls;self.stop=threading.Event();self.began=time.monotonic();self.beats=0
+  self.e,self.db,self.polls=e,db,polls;self.stop=threading.Event();self.began=time.monotonic();self.beats=0;self.failures=0
   self.thread=threading.Thread(target=self.run,name='worker-cycle-heartbeat',daemon=True)
  def run(self):
   interval=self.e.CFG['worker_heartbeat_interval_seconds'];limit=self.e.CFG['worker_cycle_max_seconds']
   while not self.stop.wait(interval):
    elapsed=time.monotonic()-self.began
    if elapsed>limit:return
+   began=time.monotonic()
    try:heartbeat(self.e,self.db,'polling',polls=self.polls,cycle_elapsed_seconds=round(elapsed,1));self.beats+=1
-   except Exception:pass
+   except Exception as ex:self.report('worker_heartbeat_failed','failed','WARN',error_code=safe_error(ex),duration_ms=round((time.monotonic()-began)*1000))
+   else:
+    took=time.monotonic()-began
+    if took>interval:self.report('worker_heartbeat_slow','ok','WARN',duration_ms=round(took*1000),poll_seconds=interval)
+ def report(self,kind,outcome,severity,**data):
+  # Never silent: a durable audit event (falls back to the fsynced spool when Turso is down) plus the local engine log.
+  self.failures+=kind=='worker_heartbeat_failed'
+  try:al.emit(self.e,self.db,kind,outcome=outcome,severity=severity,failures=self.failures,**data)
+  except Exception:pass
+  try:self.e.log(kind,failures=self.failures,**data)
+  except Exception:pass
  def __enter__(self):self.thread.start();return self
  def __exit__(self,*exc):self.stop.set();self.thread.join(self.e.CFG['worker_heartbeat_interval_seconds']);return False
 _children=[]

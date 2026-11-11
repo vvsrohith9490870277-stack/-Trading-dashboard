@@ -482,12 +482,14 @@ def _monitor(db,api):
   r=fill(db,s,q,now())
   if r['filled']:fills+=1;used.add(key)
  # Entry-day stop cannot be hit by the exact same entry LTP; it is checked on subsequent fresh polls.
+ # Positions change only through fill(); with no fill attempted this cycle the post-gate snapshot is current.
+ # The price band feeds market_guard only for a carried exit's lower-circuit haircut, so it is read only then.
  st=[];t=now()
- for p in db.positions():
+ for p in (db.positions() if actions else positions):
   q=quotes.get(p['symbol']);ok,_=valid_quote(q,t)
   if not ok:continue
-  price=q['price'];guard=market_guard(q,band_for(db,p['symbol'],t.date().isoformat()))
-  if p.get('pending_exit') and guard['circuit']=='LOWER':
+  price=q['price']
+  if p.get('pending_exit') and market_guard(q,band_for(db,p['symbol'],t.date().isoformat()))['circuit']=='LOWER':
    days=db.query('SELECT COUNT(*) AS n FROM paper_circuit_locks WHERE namespace=? AND strategy=? AND symbol=?',(NS,p['strategy'],p['symbol']))[0]['n'];marked=circuit_haircut(price,days)
    if marked is not None:price=marked
   st.append(('UPDATE paper_positions SET mark_price=?,mark_at=?,updated_at=? WHERE namespace=? AND strategy=? AND symbol=?',(price,q['quote_at'],t.isoformat(),NS,p['strategy'],p['symbol'])))
@@ -501,6 +503,15 @@ def monitor(db,api):
   al.emit(e,db,'monitor_completed',status=r.get('status'),fills=r.get('fills',0),fresh_quotes=r.get('fresh_quotes',0),duration_ms=round((time.monotonic()-start)*1000),poll_seconds=CFG['poll_seconds'])
   return r
 
+def prior_closes(db,symbols,day,chunk=None):
+ """Latest positive close strictly before day for each symbol, as {symbol:[{trade_date,close}]} (empty list when none).
+ Same row the per-symbol 'ORDER BY trade_date DESC LIMIT 1' lookup returns, fetched in a few round-trips."""
+ chunk=chunk or CFG['pnl_prior_close_query_chunk'];out={s:[] for s in symbols}
+ for i in range(0,len(symbols),chunk):
+  sy=symbols[i:i+chunk];marks=','.join('?'*len(sy))
+  for r in db.query('SELECT d.symbol,d.trade_date,d.close FROM daily_ohlcv d JOIN (SELECT symbol,MAX(trade_date) AS td FROM daily_ohlcv WHERE symbol IN ('+marks+') AND trade_date<? AND close>0 GROUP BY symbol) m ON d.symbol=m.symbol AND d.trade_date=m.td WHERE d.close>0',sy+[day]):
+   if not out[r['symbol']]:out[r['symbol']]=[{'trade_date':r['trade_date'],'close':r['close']}]
+ return out
 def pnl(db):
  t=now();day=t.date().isoformat();ps=db.positions();fills=db.query('SELECT * FROM paper_fills WHERE namespace=?',(NS,));today=[x for x in fills if datetime.fromisoformat(x['filled_at']).astimezone(IST).date()==t.date()];realized=sum(x['realized_pnl'] for x in fills);unrealized=0.;unknown=[];stale=[]
  for p in ps:
@@ -508,11 +519,12 @@ def pnl(db):
   unrealized+=(p['mark_price']-p['entry_price'])*p['qty']
   if not p['mark_at'] or (t-datetime.fromisoformat(p['mark_at'])).total_seconds()>CFG['quote_max_age_seconds']:stale.append(p['symbol'])
  keys={(p['strategy'],p['symbol']) for p in ps}|{(x['strategy'],x['symbol']) for x in today};daily=0.;missing=[]
+ prior=prior_closes(db,sorted({sym for _,sym in keys}),day)
  for strategy,sym in keys:
   pos=next((p for p in ps if p['strategy']==strategy and p['symbol']==sym),None);ff=[x for x in today if x['strategy']==strategy and x['symbol']==sym];endqty=pos['qty'] if pos else 0;startqty=endqty-sum(x['qty'] if x['side']=='BUY' else -x['qty'] for x in ff)
   base=0
   if startqty:
-   r=db.query('SELECT trade_date,close FROM daily_ohlcv WHERE symbol=? AND trade_date<? AND close>0 ORDER BY trade_date DESC LIMIT 1',(sym,day))
+   r=prior.get(sym)
    if not r or r[0]['trade_date']!=str(completed_day(t.replace(hour=0,minute=0,second=0,microsecond=0))):missing.append(sym);continue
    base=startqty*r[0]['close']
   if endqty and pos['mark_price'] is None:missing.append(sym);continue
