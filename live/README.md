@@ -32,3 +32,21 @@ These command lines parse and resolve paths. Do not run `eod` or `backfill` befo
 Backfill now: uses `curl --http2` (urllib HTTP/1.1 often gets HTTP 403 from this host), a browser User-Agent, calendar session days (skips weekends, config holidays, Muhurat 2026-11-08), treats HTTP 404 and TradDt mismatches as `no_session`, retries 403/429, and still refuses a production ingest until Track A EOD for `2026-11-11` is reconciled. A sidecar lockfile `state/adaptive.lock` plus niceness/ionice wrap `eod`/`backfill`.
 
 Support Agent 16:45 also reads `logs/engine.jsonl` (read-only) so `reference_feeds` HTTP 403s are visible, and `monitor_staleness` lists each check gap above `worker_stale_seconds`.
+
+
+## 11 Nov 2026 — sidecar readiness (16:45 / 16:50 / 18:05 / 18:30 IST)
+
+Verified command lines (argument parser + paths; the eod/backfill jobs themselves are not started from here):
+
+- 16:45 `run_support.sh --session 2026-11-11`
+- 16:50 `run_adaptive.sh eod --session 2026-11-11`
+- 18:05 `run_adaptive.sh backfill --session 2026-11-11 --from 2026-06-02 --to 2026-11-11`
+- 18:30 `run_adaptive.sh eod --session 2026-11-11 --no-wait`
+
+`eod` and `backfill` refuse to start between 09:00 and 15:35 IST, take a sidecar lockfile (`state/adaptive.lock`), and apply nice/ionice plus the existing memory cap. Backfill day lists are calendar-based (weekdays minus holidays minus Muhurat); 404 or a TradDt mismatch is `no_session`, not a consecutive failure. Downloads use `curl --http2` with a browser User-Agent (plain urllib from this host often gets HTTP 403).
+
+Support Agent reads Turso paper_events and also `/workspace/paper-trading/logs/engine.jsonl` (read-only) so `reference_feeds` HTTP 403s are detected. `monitor_staleness` lists each check gap above `worker_stale_seconds`. Dry-run against 11 Nov data (scratch findings DB, `--now 15:40`) produced `scan_missed`, `monitor_staleness` gaps at 09:18–09:22, 09:33–09:41 and 11:08–11:15, and `feed_http_403` for corporate_actions/ASM/GSM. Tonight’s 16:45 run should use the default tick set (ends 16:35) so it can also see the 16:10 EOD.
+
+Official UDiFF bhavcopy for 2026-11-06 parsed (3715 raw / 2980 EQ+BE+BZ). All 824 overlapping opens matched Turso `daily_ohlcv`; some closes differ where the Turso source is a Fyers live 1D bar. 2026-11-09 returned HTTP 403 from this host after earlier probes; 2026-11-10 (holiday) correctly returned 404. The 18:05 job retries 403s with backoff.
+
+Circuit data: official `sec_list_DDMMYYYY.csv` (CM Price Band complete list) downloaded for 2026-11-06 (3608 rows, 3051 with a static 2/5/10/20/40% band). Adaptive does not call Fyers. Turso `paper_price_bands` currently holds only ASM/GSM flags, not upper/lower prices. F&O names often have a blank Band (dynamic flex) and stay `UNKNOWN`.
