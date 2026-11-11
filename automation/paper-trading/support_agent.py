@@ -417,6 +417,16 @@ def append_finding(db, namespace, detector, correlation_id, first_event_at, sess
     if severity not in VALID_SEVERITIES:
         raise ValueError('invalid_finding_severity')
     session_day = ist_session_day(session_day)
+    # Reruns and repeated events must not mint a second finding_id just because first_event_at differs
+    # (finding_id hashes detector + correlation_id + first_event_at).
+    prior = db.query(
+        'SELECT finding_id, first_event_at FROM support_findings '
+        'WHERE namespace=? AND session_day=? AND detector=? AND correlation_id=? '
+        'ORDER BY first_event_at, status_seq LIMIT 1',
+        (namespace, session_day, detector, correlation_id),
+    )
+    if prior:
+        first_event_at = prior[0]['first_event_at']
     fid = finding_id(detector, correlation_id, first_event_at)
     existing = db.query(
         'SELECT status_seq,status,severity,details_json FROM support_findings WHERE namespace=? AND finding_id=? ORDER BY status_seq DESC LIMIT 1',
@@ -1051,6 +1061,75 @@ def reference_feed_403_hits(event):
     return out
 
 
+def latency_clock_start(created_dt, session_start):
+    """Official-open fills wait until 09:15. Measure signal-to-fill from max(created_at, session open)."""
+    if created_dt is None:
+        return session_start
+    return created_dt if created_dt >= session_start else session_start
+
+
+def reference_feed_ok(info):
+    """True when a sources.<feed> entry is a successful fetch (not 403 / unavailable)."""
+    if not isinstance(info, dict):
+        return str(info).lower() in ('ok', 'success', 'available')
+    err = str(info.get('error') or '')
+    if info.get('http_status') == 403 or '403' in err:
+        return False
+    st = str(info.get('status') or 'ok').lower()
+    return st in ('ok', 'success', 'available', '') and '403' not in st
+
+
+def reference_feed_latest_status(events):
+    """Return {feed: {at, ok, payload}} for the latest reference_feeds / reference_feed_error event per feed."""
+    latest = {}
+    for ev in events:
+        et = ev.get('event_type')
+        try:
+            data = json.loads(ev.get('data_json') or '{}') if not isinstance(ev.get('data_json'), dict) else ev['data_json']
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        at = ev.get('source_at')
+        sources = data.get('sources') if isinstance(data.get('sources'), dict) else {}
+        if sources:
+            for feed, info in sources.items():
+                prev = latest.get(feed)
+                if prev is None or str(at) >= str(prev['at']):
+                    latest[feed] = {'at': at, 'ok': reference_feed_ok(info), 'info': info if isinstance(info, dict) else {'status': info}}
+        elif et in ('reference_feed_error', 'reference_feed') or '403' in str(ev.get('data_json') or ''):
+            feed = data.get('feed') or data.get('name') or 'nse'
+            prev = latest.get(feed)
+            if prev is None or str(at) >= str(prev['at']):
+                latest[feed] = {'at': at, 'ok': reference_feed_ok(data), 'info': data}
+    return latest
+
+
+def collapse_duplicate_findings(db, namespace, session_day, recorded_at=None):
+    """If earlier reruns minted more than one finding_id for the same correlation, keep the earliest and resolve the rest."""
+    latest = current_findings(db, namespace, session_day)
+    groups = {}
+    for f in latest:
+        groups.setdefault((f.get('detector'), f.get('correlation_id')), []).append(f)
+    closed = 0
+    for items in groups.values():
+        if len(items) < 2:
+            continue
+        items.sort(key=lambda x: (str(x.get('first_event_at') or ''), str(x.get('finding_id') or '')))
+        keeper = items[0]
+        for dup in items[1:]:
+            if dup.get('status') in ('RESOLVED', 'WONT_FIX'):
+                continue
+            transition_finding(
+                db, namespace, dup['finding_id'], 'RESOLVED',
+                note='duplicate_correlation_id',
+                recorded_at=recorded_at,
+                extra_details={'deduplicated': True, 'kept_finding_id': keeper['finding_id']},
+            )
+            closed += 1
+    return closed
+
+
 def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading_db=None, observation_only=True, check_policy_hygiene=False, box_metrics=None, dashboard_probe=None, recorded_at=None):
     """Run the full Production Action Plan v3 detector suite (SEV1-SEV4 + expectation ledger + episodes)."""
     assert_support_policy_lock()
@@ -1058,6 +1137,7 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
     session_day = ist_session_day(session_day)
     now_ist = parse_ist(now_at) if now_at is not None else parse_ist(f'{session_day}T16:35:00+05:30')
     stamp = recorded_at or now_ist.isoformat()
+    collapse_duplicate_findings(db, namespace, session_day, recorded_at=stamp)
 
     raw_events = reader.query('SELECT * FROM paper_events WHERE namespace=? AND session_day=? ORDER BY source_at,event_id', (namespace, session_day))
     events = sorted(
@@ -1286,10 +1366,39 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             unclassified_events.append(dec)
     if unclassified_events:
         first_src = unclassified_events[0].get('source_at') or f'{session_day}T09:15:00+05:30'
+        last_src = unclassified_events[-1].get('source_at') or first_src
         emit('error_taxonomy_gap', f'error_taxonomy_gap:{session_day}', first_src, 'SEV3', {
             'unclassified_count': len(unclassified_events),
             'events': [str(x.get('event_id') or x.get('correlation_id')) for x in unclassified_events],
+            'last_at': last_src,
         })
+        recovered_at = None
+        for ev in events:
+            try:
+                if parse_ist(ev.get('source_at') or last_src) <= parse_ist(last_src):
+                    continue
+            except Exception:
+                if str(ev.get('source_at') or '') <= str(last_src):
+                    continue
+            if ev['event_type'] in ('eod_completed', 'eod_reconciled', 'quote_batch_recovered'):
+                recovered_at = ev['source_at']
+                break
+            if ev['event_type'] in ('reference_feeds', 'reference_feed'):
+                latest = reference_feed_latest_status([ev])
+                if latest and all(v['ok'] for v in latest.values()):
+                    recovered_at = ev['source_at']
+                    break
+        if recovered_at:
+            existing = [f for f in current_findings(db, namespace, session_day)
+                        if f['detector'] == 'error_taxonomy_gap' and f['status'] == 'OPEN']
+            for f in existing:
+                transition_finding(
+                    db, namespace, f['finding_id'], 'RESOLVED',
+                    note='condition_recovered',
+                    recorded_at=stamp,
+                    extra_details={'recovered': True, 'recovered_at': recovered_at, 'last_unclassified_at': last_src},
+                )
+
 
     # 5. Quotes -> quote_batch_failed + recovery (SEV3) & quote_field_regression (SEV1)
     quote_failed_open = False
@@ -1322,6 +1431,47 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                     'field_used': 'tt',
                     'expected_field': 'ltt',
                 })
+
+    # Close a still-open quote episode when the stall/rate-limit class recovered even if later
+    # fail-fast errors (short RuntimeError) were logged after the fix was installed.
+    timeout_ms = float(thresh['quote_timeout_seconds']) * 1000.0
+    last_stall_at = None
+    for ev in events:
+        if ev['event_type'] != 'quote_batch_failed':
+            continue
+        data = json.loads(ev.get('data_json') or '{}')
+        dur = float(data.get('duration_ms') or 0.0)
+        err = str(data.get('error_code') or data.get('error') or ev.get('outcome') or '')
+        if dur >= timeout_ms or '429' in err.lower() or 'timeout' in err.lower() or data.get('timeout_seconds'):
+            last_stall_at = ev['source_at']
+    if last_stall_at:
+        recover_at, recover_by = None, None
+        for ev in events:
+            try:
+                if parse_ist(ev['source_at']) <= parse_ist(last_stall_at):
+                    continue
+            except Exception:
+                if ev['source_at'] <= last_stall_at:
+                    continue
+            et = ev['event_type']
+            if et == 'quote_batch_recovered' or (et == 'quote_batch_response' and ev.get('outcome') == 'ok'):
+                recover_at, recover_by = ev['source_at'], et
+                break
+            if et in ('eod_completed', 'eod_reconciled'):
+                recover_at, recover_by = ev['source_at'], et
+                break
+            if et in ('reference_feeds', 'reference_feed'):
+                latest = reference_feed_latest_status([ev])
+                if latest and all(v['ok'] for v in latest.values()):
+                    recover_at, recover_by = ev['source_at'], et
+                    break
+        if recover_at:
+            close_episode(
+                db, namespace, session_day, 'quote_batch', 'quote_batch_failed',
+                recover_at, recovery_details={'recovered_at': recover_at, 'recovered_by': recover_by,
+                                              'last_timeout_or_429_at': last_stall_at},
+                recorded_at=stamp,
+            )
 
     # 6. Fill sizing -> fill_sizing_anomaly (SEV1, new v3)
     one_share_anomalies = []
@@ -1397,25 +1547,38 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             created_dt = parse_ist(sig['created_at'])
             filled_dt = parse_ist(f['filled_at'])
             if created_dt.date() == filled_dt.date():
-                lat_sec = (filled_dt - created_dt).total_seconds()
-                if lat_sec > max_latency_sec:
+                start_dt = latency_clock_start(created_dt, session_start)
+                lat_sec = (filled_dt - start_dt).total_seconds()
+                if lat_sec > max_latency_sec + 1:
                     high_latency_fills.append({
                         'signal_id': sid,
                         'symbol': f.get('symbol'),
                         'created_at': sig['created_at'],
                         'filled_at': f['filled_at'],
+                        'latency_start': start_dt.isoformat(),
                         'latency_seconds': lat_sec,
                         'threshold_seconds': max_latency_sec,
+                        'execution_path': f.get('execution_path'),
                     })
     for ev in events:
         if ev['event_type'] == 'signal_to_fill_latency':
             data = json.loads(ev.get('data_json') or '{}')
-            lat_sec = float(data.get('latency_seconds') or 0.0)
-            if lat_sec > max_latency_sec:
+            created_raw = data.get('scan_at') or data.get('created_at')
+            filled_raw = data.get('fill_at') or ev['source_at']
+            created_dt = parse_ist(created_raw) if created_raw else None
+            filled_dt = parse_ist(filled_raw) if filled_raw else None
+            if created_dt and filled_dt:
+                start_dt = latency_clock_start(created_dt, session_start)
+                lat_sec = (filled_dt - start_dt).total_seconds()
+            else:
+                lat_sec = float(data.get('latency_seconds') or 0.0)
+                start_dt = None
+            if lat_sec > max_latency_sec + 1:
                 high_latency_fills.append({
                     'signal_id': ev.get('signal_id'),
-                    'created_at': data.get('scan_at'),
-                    'filled_at': data.get('fill_at') or ev['source_at'],
+                    'created_at': created_raw,
+                    'filled_at': filled_raw,
+                    'latency_start': start_dt.isoformat() if start_dt else None,
                     'latency_seconds': lat_sec,
                     'threshold_seconds': max_latency_sec,
                 })
@@ -1460,12 +1623,47 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         first_at = str(fail.get('source_at') or f'{session_day}T15:30:00+05:30')
         emit('reconstruction_failure', cid, first_at, 'SEV1', fail)
 
-    # 12. Reference feeds HTTP 403 -> feed_http_403 (SEV3)
+    # 12. Reference feeds HTTP 403 -> feed_http_403 (SEV3), one finding per feed per session.
+    # A later successful fetch (for example after the 15:40 NSE session fix) marks the finding recovered.
+    feed_hits = {}
     for ev in events:
         if ev['event_type'] in ('reference_feed_error', 'reference_feeds', 'reference_feed') or '403' in str(ev.get('data_json') or ''):
-            hits = reference_feed_403_hits(ev)
-            for hit in hits:
-                emit('feed_http_403', f"feed_http_403:{session_day}:{hit.get('feed', 'nse')}", ev['source_at'], 'SEV3', hit)
+            for hit in reference_feed_403_hits(ev):
+                feed = hit.get('feed') or 'nse'
+                rec = feed_hits.setdefault(feed, {'first_at': ev['source_at'], 'last_at': ev['source_at'], 'count': 0, 'hit': hit})
+                rec['count'] += 1
+                rec['last_at'] = ev['source_at']
+                rec['hit'] = hit
+    latest_feeds = reference_feed_latest_status(events)
+    for feed, rec in sorted(feed_hits.items()):
+        cid = f'feed_http_403:{session_day}:{feed}'
+        details = {
+            **rec['hit'],
+            'feed': feed,
+            'occurrence_count': rec['count'],
+            'first_at': rec['first_at'],
+            'last_at': rec['last_at'],
+        }
+        emit('feed_http_403', cid, rec['first_at'], 'SEV3', details)
+        later = latest_feeds.get(feed)
+        if later and later['ok'] and parse_ist(later['at']) >= parse_ist(rec['last_at']):
+            existing = [f for f in current_findings(db, namespace, session_day)
+                        if f['detector'] == 'feed_http_403' and f['correlation_id'] == cid]
+            if existing and existing[0]['status'] == 'OPEN':
+                info = later.get('info') or {}
+                transition_finding(
+                    db, namespace, existing[0]['finding_id'], 'RESOLVED',
+                    note='feed_recovered',
+                    recorded_at=stamp,
+                    extra_details={
+                        'recovered': True,
+                        'recovered_at': later['at'],
+                        'recovered_status': info.get('status'),
+                        'rows_written': info.get('rows_written'),
+                        'kinds': info.get('kinds'),
+                    },
+                )
+
 
     # 13. Install pipeline events -> install_aborted_process_active, install_rolled_back (SEV2)
     for ev in events:
@@ -1484,6 +1682,8 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             emit('box_health', f'box_health:venv:{session_day}', stamp, 'SEV2', {'kind': 'venv'})
     if dashboard_probe and not dashboard_probe.get('ok', True):
         emit('dashboard_health', f'dashboard_health:{session_day}', stamp, 'SEV3', dashboard_probe)
+
+    collapse_duplicate_findings(db, namespace, session_day, recorded_at=stamp)
 
     return {
         'namespace': namespace,

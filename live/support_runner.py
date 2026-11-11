@@ -17,6 +17,7 @@ LIB = HERE.parent / 'automation' / 'paper-trading'
 sys.path.insert(0, str(LIB)); sys.path.insert(0, str(HERE))
 import support_agent as sa   # noqa: E402  (library copy, not the installed runtime)
 import snapshot              # noqa: E402
+import support_finding_verify as sfv  # noqa: E402
 
 IST = ZoneInfo('Asia/Kolkata')
 LIVE_ROOT = Path(os.environ.get('TRACK_A_ROOT', '/workspace/paper-trading'))
@@ -183,8 +184,38 @@ def main(argv=None):
            f"Hash-chain failures: {len(summary['chain_failures'])}",
            f"Engine log events merged: {counts.get('engine_jsonl_events', 0)} (reference_feeds={counts.get('engine_jsonl_reference_feeds', 0)})",
            '', 'Actions taken: none (findings only).']
+        # Independent verification stage (read-only). Does not mutate finding status.
+    now_for_v = a.now if a.now else datetime.now(IST)
+    verification = sfv.verify_findings(
+        findings,
+        snapshot_path=snap_path,
+        engine_path=engine_path,
+        audit_path=audit,
+        namespace=ns,
+        session_day=day,
+        now_ist=now_for_v,
+        findings_db=store,
+    )
+    vpaths = sfv.write_report(verification, out_dir)
+    summary['verification'] = {
+        'findings_total': verification['findings_total'],
+        'by_status': verification['by_status'],
+        'log_meta': verification['log_meta'],
+        'report': vpaths,
+    }
+    md += ['', '## Independent verification', '',
+           'Each finding was re-derived by two deterministic verifiers (`events_sql` from the snapshot, '
+           '`log_files` from engine.jsonl/audit). Confirmed only when both CONFIRM and neither REJECTS.',
+           'Paste-ready external review prompts: `REVIEW_PROMPTS.md` and `review-prompts/`.',
+           '']
+    md += [f"- **{k}**: {v}" for k, v in sorted((verification.get('by_status') or {}).items())]
+    md += ['', '| Finding | Detector | Status | events_sql | log_files |', '|---|---|---|---|---|']
+    for f in verification['findings']:
+        vmap = {x['verifier_id']: x['verdict'] for x in f['verifiers']}
+        md.append(f"| `{f['finding_id']}` | {f.get('detector')} | **{f['status']}** | {vmap.get('events_sql')} | {vmap.get('log_files')} |")
+
     (out_dir / 'SUMMARY.md').write_text('\n'.join(md) + '\n')
-    print(json.dumps({k: summary[k] for k in ('session_day', 'findings_total', 'by_severity', 'by_detector', 'not_evaluable', 'audit_parity', 'snapshot_rows')}, indent=1, default=str))
+    print(json.dumps({k: summary[k] for k in ('session_day', 'findings_total', 'by_severity', 'by_detector', 'not_evaluable', 'audit_parity', 'snapshot_rows', 'verification')}, indent=1, default=str))
 
 if __name__ == '__main__':
     main()

@@ -3,9 +3,31 @@
 // - Executes inside a libsql 'read' transaction, so the server rejects any write even if validation missed one.
 // - Prints rows as JSON on stdout. Never prints credentials; errors are reduced to a short code.
 import fs from 'fs';
+import path from 'path';
 import {createRequire} from 'module';
-const require = createRequire(import.meta.url);
-const {createClient} = require('@libsql/client');
+import {pathToFileURL} from 'url';
+
+function loadLibsql() {
+  // Official Track A install is the usual location of @libsql/client. The sidecar
+  // must not depend on a worktree-local node_modules symlink that may be missing.
+  const bases = [];
+  const trackA = process.env.TRACK_A_ROOT || '/workspace/paper-trading';
+  bases.push(import.meta.url);
+  if (process.env.LIBSQL_NODE_PATH) bases.push(pathToFileURL(path.join(process.env.LIBSQL_NODE_PATH, 'package.json')).href);
+  bases.push(pathToFileURL(path.join(trackA, 'package.json')).href);
+  bases.push(pathToFileURL(path.join(trackA, 'node_modules', '@libsql', 'client', 'package.json')).href);
+  const errors = [];
+  for (const base of bases) {
+    try {
+      const {createClient} = createRequire(base)('@libsql/client');
+      return {createClient};
+    } catch (e) {
+      errors.push(String(e && e.message || e).split('\n')[0]);
+    }
+  }
+  throw new Error('ro_missing_libsql_client');
+}
+const {createClient} = loadLibsql();
 
 const FORBIDDEN = /\b(INSERT|UPDATE|DELETE|REPLACE|UPSERT|CREATE|DROP|ALTER|ATTACH|DETACH|PRAGMA|VACUUM|REINDEX|ANALYZE|BEGIN|COMMIT|ROLLBACK|SAVEPOINT|RELEASE)\b/i;
 export function assertReadOnly(sql) {
