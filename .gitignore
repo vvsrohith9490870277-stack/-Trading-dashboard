@@ -8,3 +8,12 @@ coverage/
 *.log
 *.pid
 .DS_Store
+# adaptive-live sidecar local state (never commit)
+state/
+logs/
+live/__pycache__/
+live/tests/__pycache__/
+*.sqlite
+*.sqlite-journal
+state/bhavcopy/
+state/circuit_bands/

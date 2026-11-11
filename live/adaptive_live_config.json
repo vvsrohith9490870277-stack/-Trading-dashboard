@@ -1,0 +1,47 @@
+{
+  "version": "adaptive_live_runner_v1",
+  "note": "Operational config for the paper-only adaptive sidecar in /workspace/adaptive-live. Statistical/economic numbers stay in automation/paper-trading/adaptive_policy.json; this file only holds runner plumbing and the pending-review Track B candidate rule.",
+  "namespace": "adaptive_v1",
+  "track_a_root": "/workspace/paper-trading",
+  "adaptive_db": "state/adaptive.sqlite",
+  "snapshot_history_calendar_days": 700,
+  "snapshot_overlap_calendar_days": 7,
+  "snapshot_slice_calendar_days": 31,
+  "track_b_candidates": {
+    "status": "pending_review_D6",
+    "rule": "baseline +/- one step from adaptive_policy.plateau_step_sizes on the strategy's first N parameters (in BASELINE_PARAMS order), capped at adaptive_policy.max_track_b_challengers"
+  },
+  "eod_wait_poll_seconds": 120,
+  "protected_namespaces": [
+    "paper_v1",
+    "paper_demo_v1"
+  ],
+  "backfill": {
+    "status": "built_not_yet_run; first run allowed only after Track A EOD for not_before_session is reconciled",
+    "not_before_session": "2026-11-11",
+    "udiff_first_session": "2024-07-08",
+    "udiff_url_template": "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip",
+    "instrument_type": "STK",
+    "series_keep_in_priority": [
+      "EQ",
+      "BE",
+      "BZ"
+    ],
+    "source_label": "NSE_BHAVCOPY_UDIFF",
+    "raw_dir": "state/bhavcopy",
+    "stop_file": "state/BACKFILL_STOP",
+    "request_timeout_seconds": 30,
+    "max_consecutive_failures": 3,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "referer": "https://www.nseindia.com/",
+    "fetch_retries": 3,
+    "fetch_via": "curl_http2"
+  },
+  "circuit_bands": {
+    "status": "official_nse_sec_list_when_downloadable; fyers_live_quotes_not_used_in_adaptive",
+    "note": "CM Price Band complete list is an official NSE archive file with a per-symbol band percent. Adaptive must not call the Fyers API. paper_price_bands in Turso currently holds only ASM/GSM flags (no upper/lower prices). F&O names often have no static band (dynamic 10% flex).",
+    "url_template_ddmmyyyy": "https://nsearchives.nseindia.com/content/equities/sec_list_{ddmmyyyy}.csv",
+    "raw_dir": "state/circuit_bands",
+    "source_label": "NSE_SEC_LIST_PRICE_BAND"
+  }
+}
