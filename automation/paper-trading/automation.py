@@ -294,7 +294,7 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
   try:fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:return {'status':'already_running','polls':0}
   failures=0;polls=0;last_pnl=-1000;api=None;paused=False;factory=api_factory or e.MarketData
-  state={'in_cycle':False,'stop':False}
+  state={'in_cycle':False,'stop':False};db.enable_helper() if hasattr(db,'enable_helper') else None
   def on_term(signum,frame):
    # Between cycles exit at once; mid-cycle finish the cycle (fills stay atomic) and exit after it.
    # A second SIGTERM falls back to the default action, so a hung cycle can still be terminated.
@@ -313,7 +313,7 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
       with CycleHeartbeat(e,db,polls):
        api=api or factory();r=e.monitor(db,api);polls+=1;failures=0
        if time.monotonic()-last_pnl>=e.CFG['pnl_snapshot_seconds']:e.pnl(db);last_pnl=time.monotonic()
-      heartbeat(e,db,'healthy',polls=polls,last_result=r)
+      heartbeat(e,db,'healthy',polls=polls,last_result=r,db_helper=db.helper_stats() if hasattr(db,'helper_stats') else None)
       al.emit(e,db,'worker_check',duration_ms=round((time.monotonic()-start)*1000),poll_seconds=delay,missed_checks=max(0,int((time.monotonic()-start)//delay)-1),status=r.get('status'))
      except Exception as ex:
       reason=safe_error(ex);failures+=1;polls+=1;al.emit(e,db,'worker_failure',outcome='failed',severity='ERROR',error_code=reason,failures=failures);heartbeat(e,db,'backoff',error=reason,failures=failures)
@@ -324,5 +324,6 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
     sleep(max(0,delay-(time.monotonic()-start)))
   finally:
    if previous is not None and not state['stop']:signal.signal(signal.SIGTERM,previous)
-   if not paused:heartbeat(e,db,'stopped',polls=polls,terminated=state['stop'])
+   if not paused:heartbeat(e,db,'stopped',polls=polls,terminated=state['stop'],db_helper=db.helper_stats() if hasattr(db,'helper_stats') else None)
+   if hasattr(db,'close_helper'):db.close_helper()
   return {'status':'terminated' if state['stop'] else 'session_finished','polls':polls}

@@ -18,6 +18,7 @@ import corporate_actions as ca
 import pauses as pz
 import support_agent as sa
 import reference_feeds as rf
+import db_helper as dbh
 ROOT=Path(__file__).resolve().parent; LEGACY=Path('/workspace/sahil-fyers-turso'); IST=ZoneInfo('Asia/Kolkata'); CFG=json.loads((ROOT/'config.json').read_text()); PY=sys.executable
 RULES=json.loads((ROOT/'strategy_rules.json').read_text());ISINS={r['db_symbol']:r['ISIN Code'] for r in csv.DictReader((ROOT/'universe.csv').open())}
 RULE_HASH={str(k):hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':')).encode()).hexdigest() for k,v in RULES.items() if str(k).isdigit()}
@@ -37,8 +38,19 @@ def log(kind,**data):
  with (ROOT/('logs/tests.jsonl' if NS.startswith('test_') else 'logs/engine.jsonl')).open('a') as f:f.write(js(r)+'\n')
  return r
 class DB:
- def __init__(self,test_database=None):self.test_database=test_database
+ def __init__(self,test_database=None):self.test_database=test_database;self.helper=None
+ def enable_helper(self):
+  """Long-running callers (the worker) route query/batch through one persistent connection; see db_helper.py."""
+  if self.helper is None and CFG.get('db_helper',{}).get('enabled'):self.helper=dbh.Helper(ROOT,self.test_database,CFG['db_helper'],self._call_per_process,log)
+  return self.helper
+ def close_helper(self):
+  h,self.helper=self.helper,None
+  if h is not None:h.close()
+ def helper_stats(self):return dict(self.helper.stats) if self.helper is not None else None
  def call(self,a):
+  if self.helper is not None and a.get('action') in ('query','batch'):return self.helper.call(a)
+  return self._call_per_process(a)
+ def _call_per_process(self,a):
   if self.test_database:a={**a,'test_database':self.test_database}
   r=subprocess.run(['node',str(ROOT/'db.mjs')],input=js(a),text=True,capture_output=True,timeout=120)
   if r.returncode:
