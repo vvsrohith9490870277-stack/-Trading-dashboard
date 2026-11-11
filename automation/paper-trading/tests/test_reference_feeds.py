@@ -16,7 +16,7 @@ MASTER = '\n'.join([
 
 def fixture_fetch(url, as_json=True):
     cfg = e.CFG['reference_feeds']
-    if url == cfg['nse_corporate_actions_url']:
+    if url.startswith(cfg['nse_corporate_actions_url']):
         return [
             {'symbol': 'RELIANCE', 'isin': ISIN, 'exDate': '09-Nov-2026', 'subject': 'Bonus 1:1'},
             {'symbol': 'RELIANCE', 'isin': ISIN, 'exDate': '09-Nov-2026', 'subject': 'Interim Dividend - Rs 5 Per Share'},
