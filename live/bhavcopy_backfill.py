@@ -156,7 +156,11 @@ def compare_to_ohlcv(rows, trade_date, ohlcv_by_symbol):
     checked, open_match, close_match, missing_in_ohlcv, missing_in_bhav, mismatches = 0, 0, 0, 0, 0, []
     bhav = {}
     for r in rows:
-        sym = pit.canonical_symbol(r.get('TckrSymb') or r.get('symbol'))
+        # Match daily_ohlcv keys: BAJAJ-AUTO-EQ, HFCL-BE (series from the row, hyphenated base kept).
+        sym = pit.market_symbol(
+            r.get('TckrSymb') or r.get('symbol') or r.get('SYMBOL'),
+            r.get('SctySrs') or r.get('series') or r.get('SERIES'),
+        )
         if not sym:
             continue
         bhav[sym] = r

@@ -95,5 +95,32 @@ class Backfill(unittest.TestCase):
             finally:
                 bb.HERE = old
 
+    def test_compare_hyphenated_and_be_keys_match_ohlcv(self):
+        # The six 2026-11-06 Turso daily_ohlcv symbols that previously missed the bhavcopy map.
+        rows = [
+            {'TckrSymb': 'BAJAJ-AUTO', 'SctySrs': 'EQ', 'OpnPric': '1', 'ClsPric': '1'},
+            {'TckrSymb': 'NAM-INDIA', 'SctySrs': 'EQ', 'OpnPric': '2', 'ClsPric': '2'},
+            {'TckrSymb': 'HFCL', 'SctySrs': 'BE', 'OpnPric': '3', 'ClsPric': '3'},
+            {'TckrSymb': 'RELINFRA', 'SctySrs': 'BE', 'OpnPric': '4', 'ClsPric': '4'},
+            {'TckrSymb': 'STLTECH', 'SctySrs': 'BE', 'OpnPric': '5', 'ClsPric': '5'},
+            {'TckrSymb': 'TVSHLTD', 'SctySrs': 'BE', 'OpnPric': '6', 'ClsPric': '6'},
+        ]
+        ohlcv = {
+            'BAJAJ-AUTO-EQ': {'open': 1, 'close': 1},
+            'NAM-INDIA-EQ': {'open': 2, 'close': 2},
+            'HFCL-BE': {'open': 3, 'close': 3},
+            'RELINFRA-BE': {'open': 4, 'close': 4},
+            'STLTECH-BE': {'open': 5, 'close': 5},
+            'TVSHLTD-BE': {'open': 6, 'close': 6},
+        }
+        cmp = bb.compare_to_ohlcv(rows, '2026-11-06', ohlcv)
+        self.assertEqual(cmp['compared'], 6)
+        self.assertEqual(cmp['open_match'], 6)
+        self.assertEqual(cmp['close_match'], 6)
+        self.assertEqual(cmp['missing_in_bhav'], 0)
+        self.assertEqual(cmp['missing_in_ohlcv'], 0)
+        self.assertEqual(cmp['mismatches'], [])
+
+
 if __name__ == '__main__':
     unittest.main()

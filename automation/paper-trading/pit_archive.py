@@ -42,15 +42,60 @@ def assert_pit(trade_date, as_of_date=None):
         raise ValueError(f'pit_lookahead_violation:{trade_date}>{as_of_date}')
 
 
-def canonical_symbol(raw_symbol):
-    """Normalize symbol to <BASE>-EQ canonical key used across paper tables."""
+# Trailing tokens treated as an NSE series code, never as part of a hyphenated ticker
+# (BAJAJ-AUTO, NAM-INDIA). Short reserved suffixes only.
+KNOWN_SERIES = frozenset({
+    'EQ', 'BE', 'BZ', 'BL', 'BT', 'SM', 'ST', 'SZ', 'IL', 'IQ',
+    'GB', 'GS', 'GC', 'NG', 'NL',
+    'N0', 'N1', 'N2', 'N3', 'N4', 'N5', 'N6', 'N7', 'N8', 'N9',
+    'E1', 'IT', 'IV', 'RR', 'W1',
+})
+
+
+def symbol_base(raw_symbol):
+    """Ticker without a trailing series suffix. Keeps hyphenated names (BAJAJ-AUTO, NAM-INDIA)."""
     if raw_symbol is None:
         return None
     sym = str(raw_symbol).strip().upper()
     if not sym:
         return None
-    base = sym.split('-')[0]
-    return f'{base}-EQ'
+    if '-' in sym:
+        left, right = sym.rsplit('-', 1)
+        if right in KNOWN_SERIES:
+            return left
+    return sym
+
+
+def canonical_symbol(raw_symbol, series=None):
+    """Normalize to the paper-table key.
+
+    The archive and most paper tables use <BASE>-EQ even when the PIT series column is BE/BZ
+    (see get_pit_series). Hyphenated tickers keep the hyphen: BAJAJ-AUTO -> BAJAJ-AUTO-EQ,
+    not BAJAJ-EQ. If raw_symbol already ends in a known series and no override is passed,
+    that suffix is kept (HFCL-BE -> HFCL-BE).
+
+    Pass series= when matching daily_ohlcv / feed symbols that encode the series in the key
+    (HFCL + BE -> HFCL-BE). That is market_symbol().
+    """
+    base = symbol_base(raw_symbol)
+    if not base:
+        return None
+    raw = str(raw_symbol).strip().upper()
+    suffix = None
+    if '-' in raw:
+        right = raw.rsplit('-', 1)[1]
+        if right in KNOWN_SERIES:
+            suffix = right
+    if series is not None and str(series).strip():
+        ser = str(series).strip().upper()
+    else:
+        ser = suffix or 'EQ'
+    return f'{base}-{ser}'
+
+
+def market_symbol(raw_symbol, series=None):
+    """daily_ohlcv-style key: hyphenated base plus the actual series (EQ/BE/BZ)."""
+    return canonical_symbol(raw_symbol, series=series)
 
 
 def _float_or_none(val):
@@ -74,13 +119,16 @@ def _int_or_none(val):
 def normalize_bhavcopy_row(row, default_trade_date=None):
     """Extract canonical symbol, PIT series, OHLCV, and ISIN from classic or UDiFF Bhavcopy row."""
     raw_sym = row.get('symbol') or row.get('SYMBOL') or row.get('TckrSymb')
+    raw_series = row.get('series') or row.get('SERIES') or row.get('SctySrs')
+    if not raw_series and raw_sym and '-' in str(raw_sym):
+        maybe = str(raw_sym).strip().upper().rsplit('-', 1)[1]
+        if maybe in KNOWN_SERIES:
+            raw_series = maybe
+    series = str(raw_series or 'EQ').strip().upper()
+    # Archive key stays <BASE>-EQ (PIT convention) but preserves hyphenated bases.
     sym = canonical_symbol(raw_sym)
     if not sym:
         return None
-    raw_series = row.get('series') or row.get('SERIES') or row.get('SctySrs')
-    if not raw_series and raw_sym and '-' in str(raw_sym):
-        raw_series = str(raw_sym).strip().upper().split('-', 1)[1]
-    series = str(raw_series or 'EQ').strip().upper()
     tdate = str(
         row.get('trade_date')
         or row.get('TIMESTAMP')

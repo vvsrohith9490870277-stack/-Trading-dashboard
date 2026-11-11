@@ -152,5 +152,58 @@ class PitArchiveTests(unittest.TestCase):
             pit.get_pit_prefilter_universe(self.db, 'test_pit', target_dates[-1], as_of_date=d0)
 
 
+
+class CanonicalSymbolTests(unittest.TestCase):
+    def test_plain_and_existing_eq_suffix(self):
+        self.assertEqual(pit.canonical_symbol('RELIANCE'), 'RELIANCE-EQ')
+        self.assertEqual(pit.canonical_symbol('reliance-eq'), 'RELIANCE-EQ')
+        self.assertEqual(pit.canonical_symbol('WEAKCO-EQ'), 'WEAKCO-EQ')
+
+    def test_hyphenated_tickers_keep_the_full_base(self):
+        self.assertEqual(pit.symbol_base('BAJAJ-AUTO'), 'BAJAJ-AUTO')
+        self.assertEqual(pit.canonical_symbol('BAJAJ-AUTO'), 'BAJAJ-AUTO-EQ')
+        self.assertEqual(pit.canonical_symbol('BAJAJ-AUTO-EQ'), 'BAJAJ-AUTO-EQ')
+        self.assertEqual(pit.canonical_symbol('NAM-INDIA'), 'NAM-INDIA-EQ')
+        self.assertEqual(pit.canonical_symbol('NAM-INDIA-EQ'), 'NAM-INDIA-EQ')
+        self.assertEqual(pit.canonical_symbol('bajaj-auto'), 'BAJAJ-AUTO-EQ')
+
+    def test_known_series_suffix_is_not_eaten_as_the_base(self):
+        self.assertEqual(pit.canonical_symbol('HFCL-BE'), 'HFCL-BE')
+        self.assertEqual(pit.canonical_symbol('RELINFRA-BE'), 'RELINFRA-BE')
+        self.assertEqual(pit.symbol_base('HFCL-BE'), 'HFCL')
+        # Archive convention: no series override -> still -EQ
+        self.assertEqual(pit.canonical_symbol('HFCL'), 'HFCL-EQ')
+
+    def test_market_symbol_uses_the_row_series(self):
+        self.assertEqual(pit.market_symbol('HFCL', 'BE'), 'HFCL-BE')
+        self.assertEqual(pit.market_symbol('STLTECH', 'BE'), 'STLTECH-BE')
+        self.assertEqual(pit.market_symbol('TVSHLTD', 'BE'), 'TVSHLTD-BE')
+        self.assertEqual(pit.market_symbol('BAJAJ-AUTO', 'EQ'), 'BAJAJ-AUTO-EQ')
+        self.assertEqual(pit.market_symbol('NAM-INDIA', 'EQ'), 'NAM-INDIA-EQ')
+
+    def test_normalize_does_not_treat_auto_as_a_series(self):
+        row = pit.normalize_bhavcopy_row({
+            'TckrSymb': 'BAJAJ-AUTO', 'SctySrs': 'EQ', 'TradDt': '2026-11-06',
+            'OpnPric': '1', 'HghPric': '1', 'LwPric': '1', 'ClsPric': '1', 'TtlTradgVol': '1',
+        })
+        self.assertEqual(row['symbol'], 'BAJAJ-AUTO-EQ')
+        self.assertEqual(row['series'], 'EQ')
+        # No SctySrs: hyphenated name must not become series=AUTO
+        row2 = pit.normalize_bhavcopy_row({
+            'TckrSymb': 'NAM-INDIA', 'TradDt': '2026-11-06',
+            'OpnPric': '1', 'HghPric': '1', 'LwPric': '1', 'ClsPric': '1', 'TtlTradgVol': '1',
+        })
+        self.assertEqual(row2['symbol'], 'NAM-INDIA-EQ')
+        self.assertEqual(row2['series'], 'EQ')
+        # BE still recorded in the series column; archive key stays -EQ
+        row3 = pit.normalize_bhavcopy_row({
+            'SYMBOL': 'HFCL', 'SERIES': 'BE', 'TIMESTAMP': '2026-11-06',
+            'OPEN': '1', 'HIGH': '1', 'LOW': '1', 'CLOSE': '1', 'TOTTRDQTY': '1',
+        })
+        self.assertEqual(row3['symbol'], 'HFCL-EQ')
+        self.assertEqual(row3['series'], 'BE')
+
+
+
 if __name__ == '__main__':
     unittest.main()
