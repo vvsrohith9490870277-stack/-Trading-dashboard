@@ -123,16 +123,20 @@ def canonical_trade_date(raw):
     s = str(raw).strip()
     if not s:
         return None
-    if len(s) >= 10 and s[4] == '-' and s[7] == '-':
+    form = apol.POLICY['trade_date_canonical_form']
+    iso_len = form['iso_length']
+    year_hyphen = form['iso_year_hyphen_at']
+    month_hyphen = form['iso_month_hyphen_at']
+    compact_len = form['compact_length']
+    if len(s) >= iso_len and s[year_hyphen] == '-' and s[month_hyphen] == '-':
         try:
-            datetime.strptime(s[:10], '%Y-%m-%d')
-            return s[:10]
+            datetime.strptime(s[:iso_len], '%Y-%m-%d')
+            return s[:iso_len]
         except ValueError:
             pass
-    if len(s) == 8 and s.isdigit():
+    if len(s) == compact_len and s.isdigit():
         try:
-            datetime.strptime(s, '%Y%m%d')
-            return f'{s[0:4]}-{s[4:6]}-{s[6:8]}'
+            return datetime.strptime(s, '%Y%m%d').date().isoformat()
         except ValueError:
             return None
     s2 = s.replace('/', '-').replace(' ', '-')

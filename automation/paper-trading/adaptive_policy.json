@@ -94,7 +94,8 @@
       "ci_github_repo",
       "ci_required_check_names",
       "harness_dashboard_read_module",
-      "db_batch_chunk_rows"
+      "db_batch_chunk_rows",
+      "trade_date_canonical_form"
     ]
   },
   "provenance_sources": {
@@ -110,7 +111,8 @@
     "runner_memory_max_mb": "Plan v2: 2 GB.",
     "runner_cpu_quota_pct": "Plan v2: 200%.",
     "ci_local_truncation_timeout_seconds": "Implementer: wall-clock cap for the local truncation re-run; timeout => fail closed.",
-    "db_batch_chunk_rows": "Pre-existing pit_archive.py write batching (rows per db.batch); throughput only, not a decision threshold."
+    "db_batch_chunk_rows": "Pre-existing pit_archive.py write batching (rows per db.batch); throughput only, not a decision threshold.",
+    "trade_date_canonical_form": "Operational: ISO-8601 calendar date width and hyphen positions, plus the compact YYYYMMDD width used by official NSE archive filenames. Not a trading threshold."
   },
   "max_track_b_challengers": 3,
   "max_track_c_champions": 1,
@@ -251,5 +253,11 @@
   ],
   "harness_dashboard_read_module": "../../server/automation-read.mjs",
   "ci_local_truncation_timeout_seconds": 600,
-  "db_batch_chunk_rows": 200
+  "db_batch_chunk_rows": 200,
+  "trade_date_canonical_form": {
+    "iso_length": 10,
+    "iso_year_hyphen_at": 4,
+    "iso_month_hyphen_at": 7,
+    "compact_length": 8
+  }
 }

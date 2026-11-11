@@ -107,6 +107,11 @@ def load(path=POLICY_PATH):
     if not isinstance(agg, dict) or agg.get('statistic') not in ('median', 'mean') or not isinstance(agg.get('neighbour_radius_steps'), int) \
             or agg['neighbour_radius_steps'] < 1 or not _num(agg.get('min_neighbour_improvement')):
         _fail('plateau_aggregation')
+    form = p.get('trade_date_canonical_form')
+    form_keys = ('iso_length', 'iso_year_hyphen_at', 'iso_month_hyphen_at', 'compact_length')
+    if (not isinstance(form, dict) or set(form) != set(form_keys)
+            or not all(isinstance(form.get(k), int) and not isinstance(form.get(k), bool) and form[k] > 0 for k in form_keys)):
+        _fail('trade_date_canonical_form')
 
     prov = p.get('provenance') or {}
     if set(prov) - set(PROVENANCE_GROUPS):
