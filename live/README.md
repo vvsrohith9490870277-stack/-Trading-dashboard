@@ -51,6 +51,8 @@ Official NSE `sec_list` (CM price-band percent file) is ingested into local `nse
 
 After detectors run, a findings-only verification stage re-derives each finding with two independent deterministic verifiers (`events_sql` from the snapshot, `log_files` from engine.jsonl / audit jsonl). Findings are marked confirmed / disputed / rejected / unconfirmed with evidence; paste-ready review prompts are written to `REVIEW_PROMPTS.md` and `review-prompts/`. Finding status in the store is not mutated. No patches, installs, or notifications.
 
+Findings are deduped by detector+correlation across reruns (a 15:40 dry-run must not double the official 16:45 403s). Signal-to-fill latency is measured from the 09:15 official open, not pre-open scan time. A later successful reference-feed fetch (e.g. 15:41, corporate actions ok) or recovery after a rate-limit stall resolves those findings so they are not left OPEN after the fix is installed.
+
 Official UDiFF bhavcopy for 2026-11-06 parsed (3715 raw / 2980 EQ+BE+BZ). All 824 overlapping opens matched Turso `daily_ohlcv`; some closes differ where the Turso source is a Fyers live 1D bar. 2026-11-09 returned HTTP 403 from this host after earlier probes; 2026-11-10 (holiday) correctly returned 404. The 18:05 job retries 403s with backoff.
 
 Circuit data: official `sec_list_DDMMYYYY.csv` (CM Price Band complete list) downloaded for 2026-11-06 (3608 rows, 3051 with a static 2/5/10/20/40% band). Adaptive does not call Fyers. Turso `paper_price_bands` currently holds only ASM/GSM flags, not upper/lower prices. F&O names often have a blank Band (dynamic flex) and stay `UNKNOWN`.

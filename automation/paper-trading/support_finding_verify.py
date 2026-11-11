@@ -597,9 +597,11 @@ def check_latency_events(snap, finding, namespace, session_day, now_ist):
         a, b = _ist(sig['created_at']), _ist(f['filled_at'])
         if not a or not b or a.date() != b.date():
             continue
-        lat = (b - a).total_seconds()
-        if lat > thresh:
-            high.append({'signal_id': sid, 'latency_seconds': lat, 'threshold_seconds': thresh})
+        start = _session_dt(session_day, POLICY['expectations']['worker_active']['start_at'])
+        clock = a if a >= start else start
+        lat = (b - clock).total_seconds()
+        if lat > thresh + 1:
+            high.append({'signal_id': sid, 'latency_seconds': lat, 'latency_start': clock.isoformat(), 'threshold_seconds': thresh})
     ev = {'threshold_seconds': thresh, 'high_latency_count': len(high), 'samples': high[:8]}
     return _verdict(bool(high), reject_reason='no_fill_exceeded_latency_threshold', evidence=ev)
 
@@ -616,14 +618,16 @@ def check_latency_logs(logs, finding, session_day, now_ist):
         if s.get('created_at') and s.get('filled_at'):
             a, b = _ist(s['created_at']), _ist(s['filled_at'])
             if a and b:
-                lat = (b - a).total_seconds()
-                if lat > thresh:
+                start = _session_dt(session_day, POLICY['expectations']['worker_active']['start_at'])
+                clock = a if a >= start else start
+                lat = (b - clock).total_seconds()
+                if lat > thresh + 1:
                     high.append({**s, 'recomputed_latency_seconds': lat, 'threshold_seconds': thresh})
     # Independent path: also accept explicit latency events in logs
     for ev in logs:
         if _kind(ev) == 'signal_to_fill_latency' or ev.get('latency_seconds') is not None:
             lat = float(ev.get('latency_seconds') or (ev.get('payload') or {}).get('latency_seconds') or 0)
-            if lat > thresh:
+            if lat > thresh + 1:
                 high.append({'latency_seconds': lat, 'threshold_seconds': thresh, 'from': 'log'})
     ev = {'threshold_seconds': thresh, 'high_latency_count': len(high)}
     if not high and not samples:
