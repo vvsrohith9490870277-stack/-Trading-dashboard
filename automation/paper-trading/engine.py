@@ -112,6 +112,55 @@ def depth_quote(sym,d):
  upper,lower=positive_price(x.get('upper_ckt')),positive_price(x.get('lower_ckt'))
  if upper is not None and lower is not None and upper>lower:row['upper_band']=upper;row['lower_band']=lower
  return row
+
+class RequestBudget:
+ """Shared IST-day Fyers Data API budget. Counts every HTTP attempt, including 429s."""
+ def __init__(self,path=None,clock=None):
+  self.path=Path(path or MD.get('budget_state_path') or 'fyers_request_budget.json')
+  if not self.path.is_absolute():self.path=ROOT/self.path
+  self.clock=clock or now
+ def snapshot(self):
+  state=self._load()
+  return {'day':state['day'],'requests':state['requests'],'by_route':state['by_route'],'per_minute':self._window(state,60),'per_second':self._window(state,1),'limits':{'per_second':int(MD.get('budget_requests_per_second',4)),'per_minute':int(MD.get('budget_requests_per_minute',40)),'per_day':int(MD.get('budget_requests_per_day',4000)),'reserve_for_session_monitor':int(MD.get('budget_reserve_for_session_monitor',1500))},'remaining_today':max(0,int(MD.get('budget_requests_per_day',4000))-state['requests'])}
+ def _day(self,t):return t.astimezone(IST).date().isoformat()
+ def _load(self):
+  empty={'day':self._day(self.clock()),'requests':0,'by_route':{},'times':[]}
+  if not self.path.exists():return empty
+  try:
+   state=json.loads(self.path.read_text())
+  except Exception:
+   return empty
+  if state.get('day')!=empty['day']:return empty
+  state.setdefault('by_route',{});state.setdefault('times',[]);state.setdefault('requests',0)
+  return state
+ def _window(self,state,seconds):
+  t=self.clock();cut=t.timestamp()-seconds
+  return sum(1 for x in state.get('times') or [] if x>cut)
+ def check(self,route):
+  """Raise market_data_budget_exhausted before sending if this request would breach a cap."""
+  state=self._load();t=self.clock()
+  day=int(MD.get('budget_requests_per_day',4000));minute=int(MD.get('budget_requests_per_minute',40));second=int(MD.get('budget_requests_per_second',4))
+  reserve=int(MD.get('budget_reserve_for_session_monitor',1500))
+  used=int(state['requests']);per_min=self._window(state,60);per_sec=self._window(state,1)
+  if per_sec>=second:raise RuntimeError('market_data_budget_exhausted_second')
+  if per_min>=minute:raise RuntimeError('market_data_budget_exhausted_minute')
+  if used>=day:raise RuntimeError('market_data_budget_exhausted_day')
+  if route=='history' and used>=max(0,day-reserve):raise RuntimeError('market_data_budget_exhausted_reserve')
+ def record(self,route):
+  self.path.parent.mkdir(parents=True,exist_ok=True)
+  with self.path.open('a+') as fh:
+   fcntl.flock(fh,fcntl.LOCK_EX)
+   fh.seek(0);raw=fh.read()
+   t=self.clock();day=self._day(t)
+   try:state=json.loads(raw) if raw else {}
+   except Exception:state={}
+   if state.get('day')!=day:state={'day':day,'requests':0,'by_route':{},'times':[]}
+   state['requests']=int(state.get('requests') or 0)+1
+   state.setdefault('by_route',{});state['by_route'][route]=int(state['by_route'].get(route) or 0)+1
+   times=[x for x in (state.get('times') or []) if x>t.timestamp()-120];times.append(t.timestamp());state['times']=times
+   state['updated_at']=t.isoformat()
+   fh.seek(0);fh.truncate();fh.write(js(state));fh.flush()
+   return state
 def quote_trade_stamp(v):
  """Exchange last-traded time from a quotes payload. Never uses `tt` (session midnight)."""
  v=v or {}
@@ -120,7 +169,8 @@ def quote_trade_stamp(v):
   if stamp:return stamp
  return None
 class MarketData:
- def __init__(self):self.env=load_env();self.refreshed=False;self.last=0
+ def __init__(self):self.env=load_env();self.refreshed=False;self.last=0;self.budget=RequestBudget()
+ def budget_snapshot(self):return self.budget.snapshot()
  def refresh(self):
   if self.refreshed:
    (ROOT/'auth_circuit.json').write_text(js({'open':True,'at':now().isoformat()}));raise RuntimeError('auth_failed_after_single_refresh')
@@ -146,11 +196,15 @@ class MarketData:
   assert route in AUTH_ROUTES
   attempts=int(MD['max_attempts'])
   for attempt in range(attempts):
+   if not hasattr(self,'budget'):self.budget=RequestBudget()
+   self.budget.check(route)
    wait=MD['min_request_interval_seconds']-(time.monotonic()-self.last)
    if wait>0:time.sleep(wait)
    self.last=time.monotonic()
    try:r=requests.get(AUTH_ROUTES[route],params=params,headers={'Authorization':self.env['FYERS_APP_ID']+':'+self.env['FYERS_ACCESS_TOKEN']},timeout=MD['request_timeout_seconds']);d=r.json()
-   except Exception:raise RuntimeError('market_data_transport_failed') from None
+   except Exception:
+    self.budget.record(route);raise RuntimeError('market_data_transport_failed') from None
+   self.budget.record(route)
    if r.status_code in (401,403) or d.get('code') in (-8,-15,-16,-17):
     self.refresh();continue
    if r.status_code==429 or d.get('code')==-360:
@@ -160,27 +214,44 @@ class MarketData:
    return d
   raise RuntimeError('market_data_request_failed')
  def quotes(self,symbols):
-  # One /data/quotes request first when enabled. Freshness still requires exchange ltt, never midnight `tt`.
-  # Symbols without a usable ltt fall back to /data/depth (one symbol per request). A 429 on quotes
-  # fails fast and does not start a depth batch, so the worker can cool off instead of hammering.
-  symbols=list(symbols);out={};batch_at=now();clock=time.monotonic();batch_id=al.run_id()+':quotes'
+  # Primary path: one /data/quotes request (chunked). Never use midnight `tt` as trade time.
+  # If exchange ltt is absent during a verified open session, quote_at is the response time.
+  # Depth is used only when official open or auction price is missing.
+  symbols=list(symbols);out={};batch_at=now();clock=time.monotonic();batch_id=al.run_id()+':quotes';observed=now()
   if MD.get('quotes_batch_first',True) and symbols:
    al.note('quote_batch_request',batch_id=batch_id,symbols=list(symbols),request_started_at=batch_at,symbols_count=len(symbols),source='FYERS_QUOTES')
    try:
-    d=self.get('quotes',{'symbols':','.join('NSE:'+s for s in symbols)})
-    for x in (d.get('d') or []):
-     v=x.get('v') or {};stamp=quote_trade_stamp(v);q=quote_from_fyers(x,stamp=stamp)
-     if stamp is None:q['quote_at']=None
-     sym=q.get('symbol')
-     if sym:out[sym]=q
+    chunk=int(MD.get('quotes_max_symbols_per_request',50) or 50)
+    for i in range(0,len(symbols),chunk):
+     part=symbols[i:i+chunk]
+     d=self.get('quotes',{'symbols':','.join('NSE:'+s for s in part)})
+     observed=now()
+     for x in (d.get('d') or []):
+      v=x.get('v') or {};stamp=quote_trade_stamp(v);q=quote_from_fyers(x,stamp=stamp)
+      if stamp is None:
+       if MD.get('quotes_freshness')=='exchange_ltt_or_session_observation' and is_open(observed) and positive_price(q.get('price')) is not None:
+        q['quote_at']=observed.isoformat();q['freshness']='session_observation'
+       else:
+        q['quote_at']=None
+      sym=q.get('symbol')
+      if sym:out[sym]=q
    except RuntimeError as ex:
     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
    except Exception as ex:
     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
-  missing=[s for s in symbols if not (out.get(s) or {}).get('quote_at')]
-  if missing:
-   depth_id=al.run_id()+':depth';depth_at=now();al.note('quote_batch_request',batch_id=depth_id,symbols=list(missing),request_started_at=depth_at,symbols_count=len(missing),source='FYERS_DEPTH_LTT')
-   for sym in missing:
+   al.note('quote_batch_response',batch_id=batch_id,request_started_at=batch_at,response_received_at=observed,duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(symbols),fyers_budget=(self.budget.snapshot() if hasattr(self,'budget') else None))
+  depth_when=set(MD.get('depth_when') or [])
+  need_depth=[]
+  if not MD.get('quotes_batch_first',True):
+   need_depth=list(symbols)
+  elif 'official_open_or_auction_missing' in depth_when:
+   for sym in symbols:
+    q=out.get(sym) or {}
+    if q.get('price') and positive_price(q.get('open')) is None and positive_price(q.get('auction_price')) is None:
+     need_depth.append(sym)
+  if need_depth:
+   depth_id=al.run_id()+':depth';depth_at=now();al.note('quote_batch_request',batch_id=depth_id,symbols=list(need_depth),request_started_at=depth_at,symbols_count=len(need_depth),source='FYERS_DEPTH_LTT',reason='official_open_or_auction_missing')
+   for sym in need_depth:
     try:d=self.get('depth',{'symbol':'NSE:'+sym,'ohlcv_flag':'1'})
     except RuntimeError as ex:
      if str(ex).startswith('market_data_error_'):
@@ -188,11 +259,9 @@ class MarketData:
      al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
     except Exception as ex:
      al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
-    out[sym]=depth_quote(sym,d)
-   al.note('quote_batch_response',batch_id=depth_id,request_started_at=depth_at,response_received_at=now(),duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(missing))
-  elif symbols:
-   al.note('quote_batch_response',batch_id=batch_id,request_started_at=batch_at,response_received_at=now(),duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(symbols))
-  for sym in symbols:out.setdefault(sym,{'symbol':sym,'price':None,'quote_at':None,'provider_status':'missing','source':'FYERS_QUOTES' if sym in out else 'FYERS_DEPTH_LTT'})
+    dq=depth_quote(sym,d);base=out.get(sym) or {};base.update({k:dq[k] for k in dq if dq.get(k) is not None or k not in base});out[sym]=base
+   al.note('quote_batch_response',batch_id=depth_id,request_started_at=depth_at,response_received_at=now(),duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(need_depth),fyers_budget=(self.budget.snapshot() if hasattr(self,'budget') else None))
+  for sym in symbols:out.setdefault(sym,{'symbol':sym,'price':None,'quote_at':None,'provider_status':'missing','source':'FYERS_QUOTES'})
   return out
  def history(self,symbol,start,end):
   return self.get('history',{'symbol':'NSE:'+symbol,'resolution':'1D','date_format':'1','range_from':str(start),'range_to':str(end) }).get('candles') or []
@@ -616,7 +685,16 @@ def main():
    with audit_scope:
     if args.command=='init':out=init(db)
     elif args.command=='probe':
-     api=MarketData();q=api.quotes(['RELIANCE-EQ']);t=now();audit_quotes(db,q,t);out={'market_open':is_open(t),'at_IST':t.isoformat(),'quotes':q,'acceptance':{k:valid_quote(v,t) for k,v in q.items()},'orders_sent_to_broker':0,'token_refreshed':api.refreshed};db.run('probe','ok',**out)
+     api=MarketData();t=now();out={'paper_only':True,'market_open':is_open(t),'at_IST':t.isoformat(),'orders_sent_to_broker':0,'token_refreshed':False,'fyers_budget':None}
+     try:
+      q=api.quotes(['RELIANCE-EQ']);t=now();audit_quotes(db,q,t)
+      out.update({'status':'ok','quotes':q,'acceptance':{k:valid_quote(v,t) for k,v in q.items()},'token_refreshed':api.refreshed,'fyers_budget':api.budget_snapshot()})
+      db.run('probe','ok',**out)
+     except RuntimeError as ex:
+      reason=au.safe_error(ex)
+      status='fyers_rate_limited' if 'rate_limit' in reason else ('fyers_budget_exhausted' if 'budget' in reason else 'failed')
+      out.update({'status':status,'error':reason,'token_refreshed':api.refreshed,'fyers_budget':api.budget_snapshot(),'lockout_or_rate_limit':status=='fyers_rate_limited'})
+      db.run('probe',status,**out)
     elif args.command=='repair-history':out=hr.repair(sys.modules[__name__],db,MarketData(),completed_day(now()),budget=args.max_history_requests,deadline_seconds=args.max_history_seconds,progress=str(ROOT/'out/history-repair-progress.json'))
     elif args.command in ['bootstrap','scan','screen-only']:out=scan(db,MarketData(),args.sync,args.command=='bootstrap',args.command=='screen-only')
     elif args.command=='monitor-once':

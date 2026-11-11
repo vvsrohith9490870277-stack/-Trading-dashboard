@@ -1,4 +1,4 @@
-import json,sys,unittest,uuid,threading
+import json,sys,unittest,uuid,threading,tempfile
 from pathlib import Path
 from datetime import datetime,timedelta
 from concurrent.futures import ThreadPoolExecutor
@@ -338,6 +338,7 @@ class PaperTests(unittest.TestCase):
  def test_auth_retry_bounded_once(self):
   from unittest.mock import patch
   api=e.MarketData.__new__(e.MarketData);api.env={'FYERS_APP_ID':'fixture','FYERS_ACCESS_TOKEN':'fixture'};api.last=0;api.refreshed=False;count=[0]
+  tmp=tempfile.NamedTemporaryFile(suffix='.json',delete=False);tmp.close();self.addCleanup(lambda: Path(tmp.name).unlink(missing_ok=True));api.budget=e.RequestBudget(tmp.name)
   def refresh():
    if api.refreshed:raise RuntimeError('auth_failed_after_single_refresh')
    api.refreshed=True;count[0]+=1
@@ -353,11 +354,12 @@ class PaperTests(unittest.TestCase):
   def get(route,params):
    if route=='quotes':calls.append((route,(params.get('symbols') or '').split(',')));return {'s':'ok','d':[]}
    calls.append((route,params['symbol'].split(',')));return {'s':'ok','d':{}}
-  api.get=get;q=api.quotes(['X'+str(i)+'-EQ' for i in range(101)]);self.assertEqual(calls[0][0],'quotes');self.assertEqual(len(calls[0][1]),101)
-  self.assertEqual(len(calls),102);self.assertTrue(all(r=='depth' and len(x)==1 for r,x in calls[1:]));self.assertTrue(all(v['quote_at'] is None for v in q.values()))
+  api.get=get;q=api.quotes(['X'+str(i)+'-EQ' for i in range(101)]);self.assertEqual(calls[0][0],'quotes');self.assertEqual(len(calls[0][1]),50)
+  self.assertEqual([r for r,_ in calls],['quotes','quotes','quotes']);self.assertEqual(sum(len(x) for _,x in calls),101);self.assertTrue(all(v['quote_at'] is None for v in q.values()))
  def test_rate_limit_fail_fast_does_not_retry_inside_get(self):
   from unittest.mock import patch
   api=e.MarketData.__new__(e.MarketData);api.env={'FYERS_APP_ID':'fixture','FYERS_ACCESS_TOKEN':'fixture'};api.last=0;api.refreshed=False
+  tmp=tempfile.NamedTemporaryFile(suffix='.json',delete=False);tmp.close();self.addCleanup(lambda: Path(tmp.name).unlink(missing_ok=True));api.budget=e.RequestBudget(tmp.name)
   class Response:
    status_code=429
    def json(self):return {'s':'error','code':-360}

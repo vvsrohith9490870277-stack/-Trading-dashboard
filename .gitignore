@@ -17,3 +17,5 @@ live/tests/__pycache__/
 *.sqlite-journal
 state/bhavcopy/
 state/circuit_bands/
+# Fyers request budget (local rolling counters, never commit)
+fyers_request_budget.json
