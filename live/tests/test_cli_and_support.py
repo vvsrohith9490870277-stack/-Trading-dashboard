@@ -97,6 +97,81 @@ class CalendarAndParse(unittest.TestCase):
             bb.parse_udiff(bad, '2026-11-06')
         self.assertIn('udiff_trade_date_mismatch', str(ctx.exception))
 
+    def test_official_archive_candidate_urls_are_nse_only(self):
+        cands = bb.official_archive_candidates('2026-07-23')
+        forms = [c[0] for c in cands]
+        self.assertEqual(forms, ['udiff', 'legacy_cm', 'sec_bhavdata_full'])
+        urls = [c[1] for c in cands]
+        self.assertTrue(all(u.startswith('https://nsearchives.nseindia.com/') for u in urls))
+        self.assertIn('BhavCopy_NSE_CM_0_0_0_20260723_F_0000.csv.zip', urls[0])
+        self.assertEqual(urls[1], 'https://nsearchives.nseindia.com/content/historical/EQUITIES/2026/JUL/cm23JUL2026bhav.csv.zip')
+        self.assertEqual(urls[2], 'https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_23072026.csv')
+
+    def test_parse_legacy_cm_and_sec_bhavdata_full_and_reject_mismatch(self):
+        legacy_csv = (
+            'SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP,TOTALTRADES,ISIN\n'
+            'RELIANCE,EQ,1400,1410,1390,1405,1405,1399,1000,14000,23-JUL-2026,10,INE002A01018\n'
+            'RELIANCE,BE,1,1,1,1,1,1,1,1,23-JUL-2026,1,INE002A01018\n'
+        )
+        zbuf = io.BytesIO()
+        with zipfile.ZipFile(zbuf, 'w') as zf:
+            zf.writestr('cm23JUL2026bhav.csv', legacy_csv)
+        with tempfile.TemporaryDirectory() as td:
+            zp = Path(td) / 'cm23JUL2026bhav.csv.zip'
+            zp.write_bytes(zbuf.getvalue())
+            rows, raw, form, source = bb.parse_official_file(zp, '2026-07-23')
+        self.assertEqual(form, 'legacy_cm')
+        self.assertEqual(source, 'NSE_BHAVCOPY_LEGACY_CM')
+        self.assertEqual(raw, 2)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['symbol'], 'RELIANCE-EQ')
+        self.assertEqual(rows[0]['trade_date'], '2026-07-23')
+        self.assertEqual(rows[0]['close'], 1405.0)
+
+        full = (
+            'SYMBOL,SERIES,DATE1,PREV_CLOSE,OPEN_PRICE,HIGH_PRICE,LOW_PRICE,LAST_PRICE,CLOSE_PRICE,AVG_PRICE,TTL_TRD_QNTY,TURNOVER_LACS,NO_OF_TRADES,DELIV_QTY,DELIV_PER\n'
+            'HFCL,EQ,14-AUG-2026,10,10,11,9,10.2,10.5,10.3,50,0.05,3,20,40\n'
+        )
+        with tempfile.TemporaryDirectory() as td:
+            cp = Path(td) / 'sec_bhavdata_full_14082026.csv'
+            cp.write_text(full)
+            rows, raw, form, source = bb.parse_official_file(cp, '2026-08-14')
+        self.assertEqual(form, 'sec_bhavdata_full')
+        self.assertEqual(source, 'NSE_BHAVCOPY_SEC_BHAVDATA_FULL')
+        self.assertEqual(rows[0]['symbol'], 'HFCL-EQ')
+        self.assertEqual(rows[0]['trade_date'], '2026-08-14')
+        self.assertEqual(rows[0]['close'], 10.5)
+
+        with tempfile.TemporaryDirectory() as td:
+            bad = Path(td) / 'cm21AUG2026bhav.csv.zip'
+            zbuf = io.BytesIO()
+            with zipfile.ZipFile(zbuf, 'w') as zf:
+                zf.writestr('cm21AUG2026bhav.csv', legacy_csv)  # TradDt 23-JUL, requested 21-AUG
+            bad.write_bytes(zbuf.getvalue())
+            with self.assertRaises(ValueError) as ctx:
+                bb.parse_official_file(bad, '2026-08-21')
+            self.assertIn('trade_date_mismatch', str(ctx.exception))
+
+    def test_obtain_offline_parses_cached_legacy_and_never_synthesizes(self):
+        with tempfile.TemporaryDirectory() as td:
+            td = Path(td)
+            missing = bb.obtain_session_file('2026-07-23', td, offline=True)
+            self.assertEqual(missing['status'], 'missing_offline')
+            # Cached official file is used without a network call.
+            csv_text = (
+                'SYMBOL,SERIES,OPEN,HIGH,LOW,CLOSE,LAST,PREVCLOSE,TOTTRDQTY,TOTTRDVAL,TIMESTAMP,TOTALTRADES,ISIN\n'
+                'TCS,EQ,3000,3010,2990,3005,3005,2999,10,30,23-JUL-2026,1,INE467B01029\n'
+            )
+            zbuf = io.BytesIO()
+            with zipfile.ZipFile(zbuf, 'w') as zf:
+                zf.writestr('cm23JUL2026bhav.csv', csv_text)
+            (td / 'cm23JUL2026bhav.csv.zip').write_bytes(zbuf.getvalue())
+            got = bb.obtain_session_file('2026-07-23', td, offline=True)
+            self.assertEqual(got['status'], 'ok')
+            self.assertEqual(got['form'], 'legacy_cm')
+            self.assertTrue(got['from_cache'])
+            self.assertEqual(got['rows'][0]['symbol'], 'TCS-EQ')
+
 
 class SupportDetectors(unittest.TestCase):
     def test_reference_feed_403_from_engine_shape(self):

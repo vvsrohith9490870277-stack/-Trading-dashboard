@@ -205,5 +205,41 @@ class CanonicalSymbolTests(unittest.TestCase):
 
 
 
+
+
+class CanonicalTradeDateTests(unittest.TestCase):
+    def test_iso_and_nse_forms(self):
+        self.assertEqual(pit.canonical_trade_date('2026-07-23'), '2026-07-23')
+        self.assertEqual(pit.canonical_trade_date('20260723'), '2026-07-23')
+        self.assertEqual(pit.canonical_trade_date('23-JUL-2026'), '2026-07-23')
+        self.assertEqual(pit.canonical_trade_date('23-Jul-2026'), '2026-07-23')
+        self.assertEqual(pit.canonical_trade_date('23/07/2026'), '2026-07-23')
+        self.assertIsNone(pit.canonical_trade_date(''))
+        self.assertIsNone(pit.canonical_trade_date('not-a-date'))
+
+    def test_sec_bhavdata_full_and_legacy_rows_normalize_to_iso(self):
+        legacy = pit.normalize_bhavcopy_row({
+            'SYMBOL': 'RELIANCE', 'SERIES': 'EQ', 'OPEN': '1400', 'HIGH': '1410', 'LOW': '1390',
+            'CLOSE': '1405', 'TOTTRDQTY': '1000', 'TIMESTAMP': '23-JUL-2026',
+        }, default_trade_date='2026-07-23')
+        self.assertEqual(legacy['trade_date'], '2026-07-23')
+        self.assertEqual(legacy['symbol'], 'RELIANCE-EQ')
+        self.assertEqual(legacy['close'], 1405.0)
+        full = pit.normalize_bhavcopy_row({
+            'SYMBOL': 'HFCL', 'SERIES': 'BE', 'OPEN_PRICE': '10', 'HIGH_PRICE': '11', 'LOW_PRICE': '9',
+            'CLOSE_PRICE': '10.5', 'TTL_TRD_QNTY': '50', 'DATE1': '23-Jul-2026',
+        }, default_trade_date='2026-07-23')
+        self.assertEqual(full['trade_date'], '2026-07-23')
+        self.assertEqual(full['symbol'], 'HFCL-EQ')
+        self.assertEqual(full['series'], 'BE')
+        self.assertEqual(full['close'], 10.5)
+        with self.assertRaises(ValueError) as ctx:
+            pit.normalize_bhavcopy_row({
+                'SYMBOL': 'AAA', 'SERIES': 'EQ', 'OPEN': '1', 'HIGH': '1', 'LOW': '1', 'CLOSE': '1',
+                'TIMESTAMP': '14-AUG-2026',
+            }, default_trade_date='2026-07-23')
+        self.assertIn('bhavcopy_trade_date_mismatch', str(ctx.exception))
+
+
 if __name__ == '__main__':
     unittest.main()

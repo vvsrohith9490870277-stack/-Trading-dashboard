@@ -116,6 +116,37 @@ def _int_or_none(val):
         return None
 
 
+def canonical_trade_date(raw):
+    """Return YYYY-MM-DD or None. Accepts ISO, YYYYMMDD, and NSE TIMESTAMP/DATE1 forms (23-JUL-2026)."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    if len(s) >= 10 and s[4] == '-' and s[7] == '-':
+        try:
+            datetime.strptime(s[:10], '%Y-%m-%d')
+            return s[:10]
+        except ValueError:
+            pass
+    if len(s) == 8 and s.isdigit():
+        try:
+            datetime.strptime(s, '%Y%m%d')
+            return f'{s[0:4]}-{s[4:6]}-{s[6:8]}'
+        except ValueError:
+            return None
+    s2 = s.replace('/', '-').replace(' ', '-')
+    parts = s2.split('-')
+    if len(parts) == 3 and parts[1].isalpha():
+        s2 = f'{parts[0]}-{parts[1].title()}-{parts[2]}'
+    for fmt in ('%d-%b-%Y', '%d-%B-%Y', '%d-%m-%Y', '%Y-%b-%d'):
+        try:
+            return datetime.strptime(s2, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 def normalize_bhavcopy_row(row, default_trade_date=None):
     """Extract canonical symbol, PIT series, OHLCV, and ISIN from classic or UDiFF Bhavcopy row."""
     raw_sym = row.get('symbol') or row.get('SYMBOL') or row.get('TckrSymb')
@@ -129,20 +160,27 @@ def normalize_bhavcopy_row(row, default_trade_date=None):
     sym = canonical_symbol(raw_sym)
     if not sym:
         return None
-    tdate = str(
+    raw_date = (
         row.get('trade_date')
         or row.get('TIMESTAMP')
         or row.get('TradDt')
+        or row.get('DATE1')
+        or row.get('DATE')
         or default_trade_date
         or ''
-    ).strip()
+    )
+    tdate = canonical_trade_date(raw_date) or (str(raw_date).strip() if raw_date else '')
     if not tdate:
         raise ValueError('bhavcopy_trade_date_required')
-    open_p = _float_or_none(row.get('open') if 'open' in row else (row.get('OPEN') if 'OPEN' in row else row.get('OpnPric')))
-    high_p = _float_or_none(row.get('high') if 'high' in row else (row.get('HIGH') if 'HIGH' in row else row.get('HghPric')))
-    low_p = _float_or_none(row.get('low') if 'low' in row else (row.get('LOW') if 'LOW' in row else row.get('LwPric')))
-    close_p = _float_or_none(row.get('close') if 'close' in row else (row.get('CLOSE') if 'CLOSE' in row else row.get('ClsPric')))
-    vol = _int_or_none(row.get('volume') if 'volume' in row else (row.get('TOTTRDQTY') if 'TOTTRDQTY' in row else row.get('TtlTradgVol')))
+    default_iso = canonical_trade_date(default_trade_date) if default_trade_date else None
+    if default_iso and canonical_trade_date(tdate) and canonical_trade_date(tdate) != default_iso:
+        raise ValueError(f'bhavcopy_trade_date_mismatch:{tdate}!={default_iso}')
+    tdate = canonical_trade_date(tdate) or tdate
+    open_p = _float_or_none(row.get('open') if 'open' in row else (row.get('OPEN') if 'OPEN' in row else (row.get('OPEN_PRICE') if 'OPEN_PRICE' in row else row.get('OpnPric'))))
+    high_p = _float_or_none(row.get('high') if 'high' in row else (row.get('HIGH') if 'HIGH' in row else (row.get('HIGH_PRICE') if 'HIGH_PRICE' in row else row.get('HghPric'))))
+    low_p = _float_or_none(row.get('low') if 'low' in row else (row.get('LOW') if 'LOW' in row else (row.get('LOW_PRICE') if 'LOW_PRICE' in row else row.get('LwPric'))))
+    close_p = _float_or_none(row.get('close') if 'close' in row else (row.get('CLOSE') if 'CLOSE' in row else (row.get('CLOSE_PRICE') if 'CLOSE_PRICE' in row else row.get('ClsPric'))))
+    vol = _int_or_none(row.get('volume') if 'volume' in row else (row.get('TOTTRDQTY') if 'TOTTRDQTY' in row else (row.get('TTL_TRD_QNTY') if 'TTL_TRD_QNTY' in row else row.get('TtlTradgVol'))))
     turn = _float_or_none(row.get('turnover') if 'turnover' in row else (row.get('TOTTRDVAL') if 'TOTTRDVAL' in row else row.get('TtlTrfVal')))
     isin = str(row.get('isin') or row.get('ISIN') or row.get('ISINCode') or '').strip() or None
     payload = {
