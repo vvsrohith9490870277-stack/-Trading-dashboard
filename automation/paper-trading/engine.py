@@ -112,6 +112,13 @@ def depth_quote(sym,d):
  upper,lower=positive_price(x.get('upper_ckt')),positive_price(x.get('lower_ckt'))
  if upper is not None and lower is not None and upper>lower:row['upper_band']=upper;row['lower_band']=lower
  return row
+def quote_trade_stamp(v):
+ """Exchange last-traded time from a quotes payload. Never uses `tt` (session midnight)."""
+ v=v or {}
+ for key in ('ltt','last_traded_time','exch_t'):
+  stamp=last_trade_stamp(v.get(key))
+  if stamp:return stamp
+ return None
 class MarketData:
  def __init__(self):self.env=load_env();self.refreshed=False;self.last=0
  def refresh(self):
@@ -147,27 +154,45 @@ class MarketData:
    if r.status_code in (401,403) or d.get('code') in (-8,-15,-16,-17):
     self.refresh();continue
    if r.status_code==429 or d.get('code')==-360:
-    if attempt<attempts-1:time.sleep(MD['rate_limit_backoff_seconds']);continue
+    if attempt<attempts-1 and not MD.get('rate_limit_fail_fast',True):time.sleep(MD['rate_limit_backoff_seconds']);continue
     raise RuntimeError('market_data_rate_limit')
    if d.get('s')!='ok':raise RuntimeError('market_data_error_'+str(d.get('code')))
    return d
   raise RuntimeError('market_data_request_failed')
  def quotes(self,symbols):
-  # Fyers /data/quotes `tt` is the session date (midnight), not a trade time. Freshness uses the
-  # exchange last-traded time `ltt` from read-only /data/depth, which accepts one symbol per request;
-  # MarketData.get paces every request (>=1.3s) and handles auth refresh/429 backoff.
-  out={};batch_at=now();clock=time.monotonic();batch_id=al.run_id()+':depth';al.note('quote_batch_request',batch_id=batch_id,symbols=list(symbols),request_started_at=batch_at,symbols_count=len(symbols),source='FYERS_DEPTH_LTT')
-  for sym in symbols:
-   try:d=self.get('depth',{'symbol':'NSE:'+sym,'ohlcv_flag':'1'})
+  # One /data/quotes request first when enabled. Freshness still requires exchange ltt, never midnight `tt`.
+  # Symbols without a usable ltt fall back to /data/depth (one symbol per request). A 429 on quotes
+  # fails fast and does not start a depth batch, so the worker can cool off instead of hammering.
+  symbols=list(symbols);out={};batch_at=now();clock=time.monotonic();batch_id=al.run_id()+':quotes'
+  if MD.get('quotes_batch_first',True) and symbols:
+   al.note('quote_batch_request',batch_id=batch_id,symbols=list(symbols),request_started_at=batch_at,symbols_count=len(symbols),source='FYERS_QUOTES')
+   try:
+    d=self.get('quotes',{'symbols':','.join('NSE:'+s for s in symbols)})
+    for x in (d.get('d') or []):
+     v=x.get('v') or {};stamp=quote_trade_stamp(v);q=quote_from_fyers(x,stamp=stamp)
+     if stamp is None:q['quote_at']=None
+     sym=q.get('symbol')
+     if sym:out[sym]=q
    except RuntimeError as ex:
-    if str(ex).startswith('market_data_error_'):
-     al.note('quote_symbol_failed',outcome='failed',severity='WARN',symbol=sym,error_code=str(ex));out[sym]={'symbol':sym,'price':None,'quote_at':None,'provider_status':'error','source':'FYERS_DEPTH_LTT'};continue
     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
    except Exception as ex:
     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
-   out[sym]=depth_quote(sym,d)
-  al.note('quote_batch_response',batch_id=batch_id,request_started_at=batch_at,response_received_at=now(),duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(symbols))
-  for sym in symbols:out.setdefault(sym,{'symbol':sym,'price':None,'quote_at':None,'provider_status':'missing','source':'FYERS_DEPTH_LTT'})
+  missing=[s for s in symbols if not (out.get(s) or {}).get('quote_at')]
+  if missing:
+   depth_id=al.run_id()+':depth';depth_at=now();al.note('quote_batch_request',batch_id=depth_id,symbols=list(missing),request_started_at=depth_at,symbols_count=len(missing),source='FYERS_DEPTH_LTT')
+   for sym in missing:
+    try:d=self.get('depth',{'symbol':'NSE:'+sym,'ohlcv_flag':'1'})
+    except RuntimeError as ex:
+     if str(ex).startswith('market_data_error_'):
+      al.note('quote_symbol_failed',outcome='failed',severity='WARN',symbol=sym,error_code=str(ex));out[sym]={'symbol':sym,'price':None,'quote_at':None,'provider_status':'error','source':'FYERS_DEPTH_LTT'};continue
+     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
+    except Exception as ex:
+     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
+    out[sym]=depth_quote(sym,d)
+   al.note('quote_batch_response',batch_id=depth_id,request_started_at=depth_at,response_received_at=now(),duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(missing))
+  elif symbols:
+   al.note('quote_batch_response',batch_id=batch_id,request_started_at=batch_at,response_received_at=now(),duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(symbols))
+  for sym in symbols:out.setdefault(sym,{'symbol':sym,'price':None,'quote_at':None,'provider_status':'missing','source':'FYERS_QUOTES' if sym in out else 'FYERS_DEPTH_LTT'})
   return out
  def history(self,symbol,start,end):
   return self.get('history',{'symbol':'NSE:'+symbol,'resolution':'1D','date_format':'1','range_from':str(start),'range_to':str(end) }).get('candles') or []

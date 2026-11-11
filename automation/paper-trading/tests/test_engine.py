@@ -350,8 +350,21 @@ class PaperTests(unittest.TestCase):
    self.assertEqual(count[0],1);self.assertEqual(req.call_count,2)
  def test_quote_batch_size(self):
   api=e.MarketData.__new__(e.MarketData);calls=[]
-  def get(route,params):calls.append((route,params['symbol'].split(',')));return {'s':'ok','d':{}}
-  api.get=get;q=api.quotes(['X'+str(i)+'-EQ' for i in range(101)]);self.assertEqual(len(calls),101);self.assertTrue(all(r=='depth' and len(x)==1 for r,x in calls));self.assertTrue(all(v['quote_at'] is None for v in q.values()))
+  def get(route,params):
+   if route=='quotes':calls.append((route,(params.get('symbols') or '').split(',')));return {'s':'ok','d':[]}
+   calls.append((route,params['symbol'].split(',')));return {'s':'ok','d':{}}
+  api.get=get;q=api.quotes(['X'+str(i)+'-EQ' for i in range(101)]);self.assertEqual(calls[0][0],'quotes');self.assertEqual(len(calls[0][1]),101)
+  self.assertEqual(len(calls),102);self.assertTrue(all(r=='depth' and len(x)==1 for r,x in calls[1:]));self.assertTrue(all(v['quote_at'] is None for v in q.values()))
+ def test_rate_limit_fail_fast_does_not_retry_inside_get(self):
+  from unittest.mock import patch
+  api=e.MarketData.__new__(e.MarketData);api.env={'FYERS_APP_ID':'fixture','FYERS_ACCESS_TOKEN':'fixture'};api.last=0;api.refreshed=False
+  class Response:
+   status_code=429
+   def json(self):return {'s':'error','code':-360}
+  sleeps=[]
+  with patch.object(e.requests,'get',return_value=Response()) as req,patch.object(e.time,'sleep',side_effect=lambda s:sleeps.append(s)):
+   with self.assertRaisesRegex(RuntimeError,'market_data_rate_limit'):api.get('quotes',{'symbols':'NSE:RELIANCE-EQ'})
+  self.assertEqual(req.call_count,1);self.assertFalse(any(s>=e.MD['rate_limit_backoff_seconds'] for s in sleeps))
  def test_real_order_routes_absent(self):
   self.assertEqual(set(e.AUTH_ROUTES),{'quotes','history','depth'});self.assertTrue(all('/data/' in u for u in e.AUTH_ROUTES.values()));self.assertTrue(e.CFG['paper_only']);self.assertEqual(e.cap.POLICY['target_notional_inr'],50000)
  def test_corporate_actions_scale_state_credit_cash_and_leave_rights(self):

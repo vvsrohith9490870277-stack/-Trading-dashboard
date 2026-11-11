@@ -93,6 +93,13 @@ class AutomationTests(unittest.TestCase):
   with patch.object(e,'monitor',side_effect=RuntimeError('market_data_transport_failed')):
    a.worker(e,self.db,sleep=delays.append,max_polls=3,api_factory=lambda:object())
   self.assertEqual(len(delays),3);self.assertTrue(all(30<d<=300 for d in delays));self.assertLess(delays[0],delays[-1])
+ def test_rate_limit_cooloff_is_not_consumed_by_cycle_elapsed(self):
+  delays=[]
+  with patch.object(e,'monitor',side_effect=RuntimeError('market_data_rate_limit')):
+   a.worker(e,self.db,sleep=delays.append,max_polls=2,api_factory=lambda:object())
+  cool=int(e.CFG['market_data'].get('rate_limit_cooloff_seconds',180))
+  self.assertEqual(len(delays),2);self.assertTrue(all(d>=cool for d in delays));self.assertGreater(delays[0],e.CFG['poll_seconds'])
+
  def test_eod_refuses_closed_day_or_before_close(self):
   self.assertFalse(a.eod(e,self.db)['snapshot_written']);e.now=lambda:datetime(2026,11,7,16,10,tzinfo=e.IST);self.assertFalse(a.eod(e,self.db)['snapshot_written']);self.assertFalse(self.db.query('SELECT * FROM paper_eod WHERE namespace=?',(e.NS,)))
  def test_eod_idempotent_daily_and_weekly_not_sum_cumulative(self):
