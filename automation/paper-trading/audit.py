@@ -6,10 +6,17 @@ from zoneinfo import ZoneInfo
 IST=ZoneInfo('Asia/Kolkata');CTX=contextvars.ContextVar('paper_audit',default=None)
 SCHEMA="""CREATE TABLE IF NOT EXISTS paper_events(namespace TEXT NOT NULL,event_id TEXT NOT NULL,run_id TEXT NOT NULL,session_day TEXT NOT NULL,source_at TEXT NOT NULL,recorded_at TEXT NOT NULL,event_type TEXT NOT NULL,severity TEXT NOT NULL,outcome TEXT NOT NULL,strategy INTEGER,symbol TEXT,bar_date TEXT,signal_id TEXT,policy_version TEXT,input_policy_version TEXT,data_json TEXT NOT NULL,persisted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),PRIMARY KEY(namespace,event_id));CREATE INDEX IF NOT EXISTS paper_events_session ON paper_events(namespace,session_day,recorded_at,event_id);CREATE INDEX IF NOT EXISTS paper_events_run ON paper_events(namespace,run_id);"""
 COLUMNS='namespace,event_id,run_id,session_day,source_at,recorded_at,event_type,severity,outcome,strategy,symbol,bar_date,signal_id,policy_version,input_policy_version,data_json'.split(',')
-FIELDS=set('snapshot_written daily_gross_paise daily_net_accrued_paise batch_id symbols provider_absent_sessions provider_rejected_sessions invalid_rows_excluded data_refresh_status fill_id estimated_cost_paise charge_policy_version parent_run_id status reason reasons duration_ms request_started_at response_received_at quote_at price accepted age_seconds quantity side fills execution_path correlation_id fresh_quotes quotes symbols_count open_positions pending_signals poll_seconds guardian_seconds heartbeat_lag_seconds missed_checks started stopped scan_status target_completed_bar signals_queued latest_qualifiers universe_symbols original_audit_universe excluded_audit_symbols screen_only prefilter_counts PASS FAIL UNAVAILABLE data_usable beta_pass beta beta_pairs return63 return20 relative63 sma50 sma200 close volume_ratio volume_expansion excluded_rows unverified_recent_dates missing_recent_sessions coverage_from coverage_through full_warmup_retained earliest_stored_history outcome strategy symbol bar_date signal_id policy_version input_policy_version checks decisions rows count total stale missing trigger threshold high_water target_defined stop_defined failed failures error_code replayed_events pending_spool_files truncated complete gross_total_paise net_total_accrued_paise closing_valuation_complete daily_baseline_known ledger_reconciled session_started session_finished'.split())
+FIELDS=set('snapshot_written daily_gross_paise daily_net_accrued_paise batch_id symbols provider_absent_sessions provider_rejected_sessions invalid_rows_excluded data_refresh_status fill_id estimated_cost_paise charge_policy_version parent_run_id status reason reasons duration_ms request_started_at response_received_at quote_at price accepted age_seconds quantity side fills execution_path correlation_id fresh_quotes quotes symbols_count open_positions pending_signals poll_seconds guardian_seconds heartbeat_lag_seconds missed_checks started stopped scan_status target_completed_bar signals_queued latest_qualifiers universe_symbols original_audit_universe excluded_audit_symbols screen_only prefilter_counts PASS FAIL UNAVAILABLE data_usable beta_pass beta beta_pairs return63 return20 relative63 sma50 sma200 close volume_ratio volume_expansion excluded_rows unverified_recent_dates missing_recent_sessions coverage_from coverage_through full_warmup_retained earliest_stored_history outcome strategy symbol bar_date signal_id policy_version input_policy_version checks decisions rows count total stale missing trigger threshold high_water target_defined stop_defined failed failures error_code replayed_events pending_spool_files truncated complete gross_total_paise net_total_accrued_paise closing_valuation_complete daily_baseline_known ledger_reconciled session_started session_finished official_close official_close_source official_close_status official_close_reason previous_snapshot_as_of audit_export_status rebuilt python_ok node_ok restored'.split())
 CHECKS=set('entry_condition beta_at_least_1_2 close_above_sma50 sma50_above_sma200 return63_at_least_10pct relative63_at_least_5pp return20_positive close_above_prior20_high prior_red current_green close_above_supertrend close_above_sma200 rsi14_below40 ema20_above_ema50 prior_ema20_at_or_below_ema50 close_at_or_below_lower_band macd_above_signal prior_macd_at_or_below_signal within10pct_high252'.split())
-REASONS=CHECKS|set('fresh nonpositive_or_missing_price market_closed_or_unverified above_stop nonpositive_or_nonfinite_price invalid_or_missing_price ok idle closed market_closed_or_calendar_unverified not_verified_weekday_scan already_bootstrapped missing_stock_or_benchmark stale_stock_or_benchmark invalid_raw_OHLC raw_return_above_50pct_requires_corporate_action_review fewer_than_200_aligned_returns nonpositive_benchmark_variance nonfinite_beta incomplete_latest_200_session_stock_history unverified_stock_session_dates original_audit_exclusion:missing original_audit_exclusion:stale NOT_EVALUATED_PREFILTER original_audit_exclusion not_pending position_guard missing_or_failed_current_prefilter_proof position_identity_guard same_bar_reentry_guard not_yet_eligible expired_entry_signal UNAFFORDABLE_ZERO_SHARES SLEEVE_SLOT_FULL ISIN_CAP INSUFFICIENT_CASH ADV_FILTER_SKIP ADV_PARTICIPATION_CAP CIRCUIT_LOCKED SERIES_TRANSITION_BE_BZ ASM_GSM_RESTRICTION LOCK_UNKNOWN STATE_SCALING CORP_ACTION_MANUAL_REVIEW CASH_CREDITED KILL_PAUSE missing_quote nonpositive_price provider_quote_error missing_exchange_timestamp stale_or_future_quote quote_outside_verified_session accepted calendar_unverified session_ended bound_reached auth_backoff audit_unavailable singleton_busy lease_identity_mismatch no_target_defined below_stop observed_stop_crossing trail_gap trail_touch completed_daily_exit paper_only pending filled blocked not_evaluated failed qualified rejected RuntimeError TimeoutError ConnectionError OSError ValueError PermissionError auth_circuit_open token_refresh_failed FYERS_QUOTES FYERS_DEPTH_LTT market_data_rate_limit market_data_transport_failed market_data_budget_exhausted market_data_budget_exhausted_second market_data_budget_exhausted_minute market_data_budget_exhausted_day market_data_budget_exhausted_reserve fyers_rate_limited fyers_budget_exhausted runtime_dependency_ok runtime_dependency_restored runtime_dependency_missing runtime_deps_restore_incomplete'.split())
+REASONS=CHECKS|set('fresh nonpositive_or_missing_price market_closed_or_unverified above_stop nonpositive_or_nonfinite_price invalid_or_missing_price ok idle closed market_closed_or_calendar_unverified not_verified_weekday_scan already_bootstrapped missing_stock_or_benchmark stale_stock_or_benchmark invalid_raw_OHLC raw_return_above_50pct_requires_corporate_action_review fewer_than_200_aligned_returns nonpositive_benchmark_variance nonfinite_beta incomplete_latest_200_session_stock_history unverified_stock_session_dates original_audit_exclusion:missing original_audit_exclusion:stale NOT_EVALUATED_PREFILTER original_audit_exclusion not_pending position_guard missing_or_failed_current_prefilter_proof position_identity_guard same_bar_reentry_guard not_yet_eligible expired_entry_signal UNAFFORDABLE_ZERO_SHARES SLEEVE_SLOT_FULL ISIN_CAP INSUFFICIENT_CASH ADV_FILTER_SKIP ADV_PARTICIPATION_CAP CIRCUIT_LOCKED SERIES_TRANSITION_BE_BZ ASM_GSM_RESTRICTION LOCK_UNKNOWN STATE_SCALING CORP_ACTION_MANUAL_REVIEW CASH_CREDITED KILL_PAUSE missing_quote nonpositive_price provider_quote_error missing_exchange_timestamp stale_or_future_quote quote_outside_verified_session accepted calendar_unverified session_ended bound_reached auth_backoff audit_unavailable singleton_busy lease_identity_mismatch no_target_defined below_stop observed_stop_crossing trail_gap trail_touch completed_daily_exit paper_only pending filled blocked not_evaluated failed qualified rejected RuntimeError TimeoutError ConnectionError OSError ValueError PermissionError auth_circuit_open token_refresh_failed FYERS_QUOTES FYERS_DEPTH_LTT market_data_rate_limit market_data_transport_failed market_data_budget_exhausted market_data_budget_exhausted_second market_data_budget_exhausted_minute market_data_budget_exhausted_day market_data_budget_exhausted_reserve fyers_rate_limited fyers_budget_exhausted runtime_dependency_ok runtime_dependency_restored runtime_dependency_missing runtime_deps_restore_incomplete Turso_operation_failed official_close_applied official_close_unavailable official_close_incomplete official_close_available official_close_disabled NSE_BHAVCOPY_UDIFF audit_export_ok audit_export_rebuilt audit_export_unavailable project_lock_held adaptive_lock_held'.split())
 SECRET=re.compile(r'(?i)(bearer|password|secret|authorization|https?://|\beyJ[A-Za-z0-9_-]+\.|[/\\].*[/\\]|\b\d{6}\b)')
+def allowed_reason(s):
+ s=str(s);return s in REASONS or bool(re.fullmatch(r'(?:SQLITE|TURSO|HTTP)_[A-Za-z0-9_]{1,45}',s))
+def classified_error(ex):
+ s=str(ex)
+ if allowed_reason(s):return s
+ name=type(ex).__name__
+ return name if allowed_reason(name) else (s if s and len(s)<90 and all(c.isalnum() or c=='_' for c in s) else name)
 def text(value):
  value=str(value)
  if SECRET.search(value):return '[redacted]'
@@ -23,7 +30,7 @@ def clean(value,key='',depth=0):
  if value is None or isinstance(value,bool):return value
  if isinstance(value,(int,float)):return value if math.isfinite(value) and abs(value)<=9007199254740991 else None
  if key in ('reason','reasons','error_code'):
-  s=str(value);return s if s in REASONS or re.fullmatch(r'(?:SQLITE|TURSO|HTTP)_[A-Z0-9_]{1,45}',s) else 'unclassified_condition'
+  s=str(value);return s if allowed_reason(s) else 'unclassified_condition'
  if key in ('quote_at','request_started_at','response_received_at'):
   try:return utc(value)
   except (ValueError,TypeError):return None
@@ -95,7 +102,7 @@ def scope(e,db,kind):
   emit(e,db,'run_started',status=kind)
   yield
  except Exception as ex:
-  emit(e,db,'run_failed',outcome='failed',severity='ERROR',status=kind,error_code=type(ex).__name__,duration_ms=round((time.monotonic()-start)*1000));raise
+  emit(e,db,'run_failed',outcome='failed',severity='ERROR',status=kind,error_code=classified_error(ex),duration_ms=round((time.monotonic()-start)*1000));raise
  else:emit(e,db,'run_completed',status=kind,duration_ms=round((time.monotonic()-start)*1000))
  finally:
   try:
@@ -146,4 +153,26 @@ def export(e,db,session,fmt='jsonl',max_events=200000):
  else:warnings.append('not_verified_weekday_session')
  report={'session':session,'path':str(path),'events':count,'complete_export':complete and pending==0,'event_types':types,'pending_spool_files':pending,'monitor_checks':len(times),'maximum_check_gap_seconds':max(gaps,default=None),'first_check':times[0].astimezone(IST).isoformat() if times else None,'last_check':times[-1].astimezone(IST).isoformat() if times else None,'warnings':warnings,'full_flow_verified':not warnings,'verified_full_universe_scans':len(verified_scans),'paper_execution_observed':bool(types.get('paper_order_executed')),'stop_crossing_observed':bool(types.get('risk_hit')),'trades_or_hits_required':False,'note':'Absent trades/hits may be legitimate; missing monitor/scan/EOD segments are not proof of completion.'};report_path=out/('audit-'+session+'-report.json');report_fd=os.open(report_path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
  with os.fdopen(report_fd,'w') as f:f.write(json.dumps(report,indent=2))
+ return report
+
+def ensure_daily_export(e,db,session=None,fmt='jsonl',force=False,max_events=200000):
+ """Write out/audit-{session}.jsonl from Turso (or the bound db). Recreate if missing.
+
+ Never invents events. If the source query fails, an unavailable marker is written
+ and no partial JSONL is published (export itself uses a temp file + os.replace).
+ """
+ session=session or e.now().date().isoformat()
+ try:date.fromisoformat(session)
+ except ValueError:return {'status':'unavailable','reason':'invalid_session','session':session,'path':None,'rebuilt':False}
+ out=e.ROOT/'out';out.mkdir(exist_ok=True);path=out/('audit-'+session+'.'+fmt)
+ if not force and path.exists():
+  return {'status':'ok','reason':'audit_export_ok','session':session,'path':str(path),'events':None,'rebuilt':False,'complete_export':True}
+ try:
+  report=export(e,db,session,fmt=fmt,max_events=max_events)
+ except Exception as ex:
+  marker=out/('audit-'+session+'-unavailable.json');fd=os.open(marker,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
+  payload={'status':'unavailable','reason':'audit_export_unavailable','session':session,'error_code':classified_error(ex),'at':datetime.now(timezone.utc).astimezone(IST).isoformat()}
+  with os.fdopen(fd,'w') as f:f.write(json.dumps(payload,indent=2));f.flush();os.fsync(f.fileno())
+  return {**payload,'path':None,'rebuilt':False,'marker':str(marker)}
+ report['status']='ok';report['reason']='audit_export_rebuilt';report['rebuilt']=True;report['session']=session
  return report

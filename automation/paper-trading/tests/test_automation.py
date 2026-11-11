@@ -14,7 +14,11 @@ class AutomationTests(unittest.TestCase):
   have={r['name'] for r in cls.db.query('PRAGMA table_info(daily_ohlcv)')}
   for name,kind in [('open','REAL'),('high','REAL'),('low','REAL'),('volume','REAL'),('turnover','REAL'),('source','TEXT'),('loaded_at','TEXT')]:
    if name not in have:cls.db.batch([(f'ALTER TABLE daily_ohlcv ADD COLUMN {name} {kind}',())])
- setUp=fixtures.PaperTests.setUp
+ def setUp(self):
+  fixtures.PaperTests.setUp(self)
+  # Existing EOD tests stay closed if bhavcopy is not injected; never hit NSE.
+  self._oc=patch.object(a.oc,'closes_for',return_value={'status':'unavailable','reason':'test_default_no_network','closes':{},'source':None})
+  self._oc.start();self.addCleanup(self._oc.stop)
  seed_adv=fixtures.PaperTests.seed_adv;signal=fixtures.PaperTests.signal
  quote=fixtures.PaperTests.quote
  def fees(self,price,side='BUY',prior=0,priorBuy=0,dp=False):return self.db.call({'action':'estimate','price':price,'quantity':1,'side':side,'prior':prior,'priorBuy':priorBuy,'dp':dp})

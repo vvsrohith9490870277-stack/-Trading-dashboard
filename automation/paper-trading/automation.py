@@ -5,6 +5,7 @@ from decimal import Decimal,ROUND_HALF_UP
 from pathlib import Path
 import audit as al
 import runtime_deps as rd
+import official_close as oc
 
 def cents(v):return int((Decimal(str(v))*100).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
 def safe_error(exc):
@@ -42,8 +43,21 @@ def plan(e,strategy,x):
  except ValueError:indicative=None
  return {'entry':'Next eligible session official open from a fresh verified quote (FEED_OPEN), else auction or first-trade fallback (tagged); modeled slippage added; never a fabricated price','reference_close':close,'reference_bar':str(x.trade_date),'fixed_target':None,'exit_rule':r.get('exit',r.get('long_exit')),'stop':f"{round((1-e.TRAIL)*100,6):g}% below completed-close high-water from actual entry; completed daily bar only" if strategy==7 else 'No added fixed stop; frozen completed-candle exit rule','indicative_reference_trail':e.trail_level(close) if strategy==7 else None,'indicative_not_order_price':True,'target_notional_inr':e.cap.POLICY['target_notional_inr'],'share_rounding':'floor_notional_over_fill_price','indicative_shares_at_reference_close':indicative,'paper_only':True}
 
-def finance(e,db):
- t=e.now();day=str(t.date());ps=db.positions();fs=db.query('SELECT * FROM paper_fills WHERE namespace=? AND strategy BETWEEN 1 AND 7',(e.NS,));cost=db.query('SELECT * FROM paper_fill_costs WHERE namespace=?',(e.NS,));coh=db.query('SELECT * FROM paper_entry_cohorts WHERE namespace=?',(e.NS,))
+
+def _marked_positions(ps, overlay=None):
+ """Return position copies, optionally overlaying official closes. Never writes back."""
+ out=[]
+ for p in ps:
+  q=dict(p)
+  if overlay and p['symbol'] in overlay:
+   item=overlay[p['symbol']];q['mark_price']=item['price'];q['mark_at']=item['at'];q['_mark_source']=item['source']
+  else:
+   q['_mark_source']='last accepted fresh FYERS_QUOTES; not official closing price'
+  out.append(q)
+ return out
+
+def finance(e,db,mark_overlay=None):
+ t=e.now();day=str(t.date());ps=_marked_positions(db.positions(),mark_overlay);fs=db.query('SELECT * FROM paper_fills WHERE namespace=? AND strategy BETWEEN 1 AND 7',(e.NS,));cost=db.query('SELECT * FROM paper_fill_costs WHERE namespace=?',(e.NS,));coh=db.query('SELECT * FROM paper_entry_cohorts WHERE namespace=?',(e.NS,))
  # Integer-paise reporting; gross legacy fields remain untouched.
  costs={r['fill_id']:r for r in cost};entrykeys={(p['strategy'],p['symbol'],p['entry_at']) for p in ps};cohorts={(r['strategy'],r['symbol'],r['entry_at']):r['cohort'] for r in coh}
  rows=[];missing=[];stale=[]
@@ -54,7 +68,8 @@ def finance(e,db):
   if p['mark_price'] is None:missing.append(p['symbol']);continue
   val=int(((Decimal(str(p['mark_price']))-Decimal(str(p['entry_price'])))*p['qty']*100).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
   rows.append({'strategy':p['strategy'],'cohort':cohorts.get((p['strategy'],p['symbol'],p['entry_at']),'unavailable'),'gross':val,'cost':0})
-  if not p['mark_at'] or (t-datetime.fromisoformat(p['mark_at'])).total_seconds()>e.CFG['quote_max_age_seconds']:stale.append(p['symbol'])
+  official=bool(str(p.get('_mark_source') or '').startswith('NSE_BHAVCOPY'));
+  if not official and (not p['mark_at'] or (t-datetime.fromisoformat(p['mark_at'])).total_seconds()>e.CFG['quote_max_age_seconds']):stale.append(p['symbol'])
  uncovered=sum(f['id'] not in costs for f in fs)
  gross_realized=sum(cents(f['realized_pnl']) for f in fs);gross=sum(r['gross'] for r in rows);accrued=sum(r['total_paise'] for r in cost)
  open_entry=sum(r['total_paise'] for r in cost if r['side']=='BUY' and (r['strategy'],r['symbol'],r['entry_at']) in entrykeys);closed_cost=accrued-open_entry
@@ -82,7 +97,7 @@ def finance(e,db):
   if dp:debited.add(isin)
  marked=sum(cents(p['mark_price'])*p['qty'] for p in ps if p['mark_price'] is not None);cashgross=sum(c['gross_cashflow_paise'] for c in cost)+marked;cashnet=sum(c['net_cashflow_paise'] for c in cost)+marked
  policy=json.loads((e.ROOT/'charge_policy.json').read_text())
- out={'namespace':e.NS,'as_of_IST':t.isoformat(),'day':day,'money_unit':'integer INR paise','estimated_not_actual_charges':True,'policy_version':policy['version'],'policy_current':policy['effective_from']<=day<=policy['valid_through'],'gross_realized_paise':gross_realized,'gross_unrealized_paise':None if missing else gross-gross_realized,'gross_total_paise':None if missing else gross,'accrued_cost_paise':accrued,'net_realized_paise':None if uncovered else gross_realized-closed_cost,'net_unrealized_accrued_paise':None if missing or uncovered else gross-gross_realized-open_entry,'net_total_accrued_paise':None if missing or uncovered else gross-accrued,'estimated_exit_cost_paise':None if projection_missing else projected,'net_after_estimated_exit_paise':None if missing or projection_missing or uncovered else gross-accrued-projected,'open_entry_cost_paise':open_entry,'charge_breakdown_paise':breakdown,'by_strategy':groups('strategy'),'by_entry_cohort':groups('cohort'),'fills_missing_cost_ledger':uncovered,'cost_coverage_complete':not uncovered,'ledger_reconciled':not(missing or uncovered) and cashgross==gross and cashnet==gross-accrued,'cashflow_net_paise':None if missing or uncovered else cashnet,'missing_marks':missing,'stale_mark_symbols':sorted(set(stale)),'valuation_is_live':active(e,t) and not(missing or stale),'funded_capital':None,'capital_return_pct':None,'mark_observations':[{'strategy':p['strategy'],'symbol':p['symbol'],'mark_at':p['mark_at'],'source':'last accepted fresh FYERS_QUOTES; not official closing price'} for p in ps]}
+ out={'namespace':e.NS,'as_of_IST':t.isoformat(),'day':day,'money_unit':'integer INR paise','estimated_not_actual_charges':True,'policy_version':policy['version'],'policy_current':policy['effective_from']<=day<=policy['valid_through'],'gross_realized_paise':gross_realized,'gross_unrealized_paise':None if missing else gross-gross_realized,'gross_total_paise':None if missing else gross,'accrued_cost_paise':accrued,'net_realized_paise':None if uncovered else gross_realized-closed_cost,'net_unrealized_accrued_paise':None if missing or uncovered else gross-gross_realized-open_entry,'net_total_accrued_paise':None if missing or uncovered else gross-accrued,'estimated_exit_cost_paise':None if projection_missing else projected,'net_after_estimated_exit_paise':None if missing or projection_missing or uncovered else gross-accrued-projected,'open_entry_cost_paise':open_entry,'charge_breakdown_paise':breakdown,'by_strategy':groups('strategy'),'by_entry_cohort':groups('cohort'),'fills_missing_cost_ledger':uncovered,'cost_coverage_complete':not uncovered,'ledger_reconciled':not(missing or uncovered) and cashgross==gross and cashnet==gross-accrued,'cashflow_net_paise':None if missing or uncovered else cashnet,'missing_marks':missing,'stale_mark_symbols':sorted(set(stale)),'valuation_is_live':active(e,t) and not(missing or stale),'funded_capital':None,'capital_return_pct':None,'mark_observations':[{'strategy':p['strategy'],'symbol':p['symbol'],'mark_at':p['mark_at'],'source':p.get('_mark_source') or 'last accepted fresh FYERS_QUOTES; not official closing price'} for p in ps]}
  out['capped_master_ledger']=capped_ledger(e,db,out,ps,cost)
  out['public_labels']=out['capped_master_ledger']['public_labels']
  return out
@@ -174,22 +189,60 @@ def funnel(e,db,bar_date=None):
   decisions[str(r['cause'])]=int(r['n'])
  return {'as_of_bar':bar,'adv_floor_inr':e.cap.POLICY['adv_floor_inr'],'adv_lookback_sessions':lookback,'adv_floor_review':e.cap.POLICY['adv_floor_review'],'stages':{'universe_evaluated':sum(pre_counts.values()),'prefilter_pass':pre_counts['PASS'],**totals},'prefilter_counts':pre_counts,'by_strategy':per_strat,'recorded_decision_causes':decisions,'overlap':ov,'public_labels':PUBLIC_LABELS}
 
+def _closing_quality(r, close, t, near_seconds, official=False):
+ quality=[]
+ for x in r['mark_observations']:
+  qt=datetime.fromisoformat(x['mark_at']) if x['mark_at'] else None
+  if official and qt:
+   quality.append({**x,'seconds_before_session_close':0,'near_close':True})
+  else:
+   distance=(close-qt).total_seconds() if qt else None;quality.append({**x,'seconds_before_session_close':distance,'near_close':bool(qt and qt.date()==t.date() and 0<=distance<=near_seconds)})
+ return quality
+
 def _eod(e,db):
  t=e.now();ss=e.session(t.date())
  if t.weekday()>=5 or not ss or t.timetz().replace(tzinfo=None)<e.COMPLETED_CUTOFF:return {'status':'not_verified_weekday_eod','snapshot_written':False}
  r=finance(e,db);prior=db.query('SELECT day,report_json FROM paper_eod WHERE namespace=? AND day<? ORDER BY day DESC LIMIT 1',(e.NS,str(t.date())))
  expected=str(e.completed_day(t.replace(hour=0,minute=0,second=0,microsecond=0)));before=db.query('SELECT COUNT(*) AS n FROM paper_fills WHERE namespace=? AND substr(filled_at,1,10)<?',(e.NS,str(t.date())))[0]['n']
  p=json.loads(prior[0]['report_json']) if prior else None
- close=datetime.combine(t.date(),ss[1],tzinfo=e.IST);quality=[]
- for x in r['mark_observations']:
-  qt=datetime.fromisoformat(x['mark_at']) if x['mark_at'] else None;distance=(close-qt).total_seconds() if qt else None;quality.append({**x,'seconds_before_session_close':distance,'near_close':bool(qt and qt.date()==t.date() and 0<=distance<=e.CFG['eod_near_close_seconds'])})
- r['closing_mark_quality']=quality;r['closing_valuation_complete']=not r['missing_marks'] and all(x['near_close'] for x in quality)
+ close=datetime.combine(t.date(),ss[1],tzinfo=e.IST)
+ quality=_closing_quality(r,close,t,e.CFG['eod_near_close_seconds']);r['closing_mark_quality']=quality
+ live_complete=not r['missing_marks'] and all(x['near_close'] for x in quality)
+ r['official_close']=False;r['official_close_source']=None;r['official_close_status']='not_needed' if live_complete else 'not_applied';r['official_close_reason']=None
+ if not live_complete:
+  symbols=sorted({pos['symbol'] for pos in db.positions()})
+  fetched=oc.closes_for(e,t.date(),symbols)
+  r['official_close_status']=fetched.get('status');r['official_close_reason']=fetched.get('reason')
+  if fetched.get('status')=='ok' and set(symbols)<=set(fetched.get('closes') or {}):
+   overlay={sym:{'price':float(px),'at':close.isoformat(),'source':fetched['source']} for sym,px in fetched['closes'].items()}
+   r=finance(e,db,mark_overlay=overlay)
+   quality=_closing_quality(r,close,t,e.CFG['eod_near_close_seconds'],official=True)
+   r['closing_mark_quality']=quality
+   r['official_close']=True;r['official_close_source']=fetched['source'];r['official_close_status']='applied';r['official_close_reason']=fetched.get('reason')
+ r['closing_valuation_complete']=not r['missing_marks'] and all(x['near_close'] for x in r['closing_mark_quality'])
  known=bool(prior and prior[0]['day']==expected and p.get('closing_valuation_complete')) or (not prior and not before)
  r['daily_baseline_day']=prior[0]['day'] if prior else None;r['daily_baseline_known']=known;r['daily_gross_paise']=None;r['daily_net_accrued_paise']=None
  if known and r['closing_valuation_complete']:
   for key,out in [('gross_total_paise','daily_gross_paise'),('net_total_accrued_paise','daily_net_accrued_paise')]:
    if r[key] is not None and (p is None or p.get(key) is not None):r[out]=r[key]-(p[key] if p else 0)
- r['official_close']=False;r['missing_eod_warning']='Last accepted in-session marks, potentially stale; never fabricated official close. Missing daily baseline means daily P&L unavailable.'
+ if r.get('official_close'):
+  r['missing_eod_warning']=None
+ else:
+  r['missing_eod_warning']='Last accepted in-session marks, potentially stale; never fabricated official close. Official NSE close used only when the UDiFF CM bhavcopy is available for every open symbol. Missing daily baseline means daily P&L unavailable.'
+ existing=db.query('SELECT as_of,report_json FROM paper_eod WHERE namespace=? AND day=?',(e.NS,str(t.date())))
+ if existing:
+  r['previous_snapshot_as_of']=existing[0]['as_of']
+  try:
+   out=e.ROOT/'out';out.mkdir(exist_ok=True)
+   stamp=existing[0]['as_of'].replace(':','').replace('/','').replace(' ','')
+   trail=out/('eod-'+str(t.date())+'-prior-'+stamp+'.json')
+   fd=os.open(trail,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+   with os.fdopen(fd,'w') as f:f.write(existing[0]['report_json']);f.flush();os.fsync(f.fileno())
+   r['previous_snapshot_path']=str(trail)
+  except FileExistsError:
+   r['previous_snapshot_path']=str(out/('eod-'+str(t.date())+'-prior-'+stamp+'.json'))
+  except Exception:
+   pass
  db.batch([('INSERT INTO paper_eod(namespace,day,as_of,report_json) VALUES(?,?,?,?) ON CONFLICT(namespace,day) DO UPDATE SET as_of=excluded.as_of,report_json=excluded.report_json',(e.NS,str(t.date()),t.isoformat(),e.js(r)))]);return r
 
 def eod(e,db):
@@ -197,7 +250,11 @@ def eod(e,db):
   al.emit(e,db,'eod_started')
   r=_eod(e,db)
   al.emit(e,db,'eod_completed',severity='INFO' if r.get('ledger_reconciled',False) else 'WARN',**{**r,'snapshot_written':r.get('snapshot_written',True),'charge_policy_version':r.get('policy_version')})
-  return r
+ try:
+  r['audit_export']=al.ensure_daily_export(e,db,str(e.now().date()),force=True)
+ except Exception as ex:
+  r['audit_export']={'status':'unavailable','reason':al.classified_error(ex)}
+ return r
 
 def weekly(e,db):
  end=e.now().date();start=end-timedelta(days=end.weekday());rs=db.query('SELECT day,report_json FROM paper_eod WHERE namespace=? AND day>=? AND day<=? ORDER BY day',(e.NS,str(start),str(end)));values=[json.loads(x['report_json']) for x in rs];expected=[];d=start
@@ -263,11 +320,13 @@ def health(e,db):
  if not deps.get('ok'):
   try:al.emit(e,db,info['event'],python_ok=deps.get('python_ok'),node_ok=deps.get('node_ok'),restored=[])
   except Exception:pass
- return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>stale_budget(e,r['status']))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14,'runtime_deps':{'ok':deps.get('ok'),'python_ok':deps.get('python_ok'),'node_ok':deps.get('node_ok'),'python_reason':deps.get('python_reason'),'node_reason':deps.get('node_reason')}}
+ return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>stale_budget(e,r['status']))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14,'runtime_deps':{'ok':deps.get('ok'),'python_ok':deps.get('python_ok'),'node_ok':deps.get('node_ok'),'python_reason':deps.get('python_reason'),'node_reason':deps.get('node_reason'),'extra_ok':deps.get('extra_ok'),'extra_projects':deps.get('extra_projects')}}
 def preflight(e,db):
  r=rd.ensure();info=rd.report_for_audit(r)
  al.emit(e,db,info['event'],python_ok=r.get('python_ok'),node_ok=r.get('node_ok'),restored=r.get('restored') or [],outcome='ok' if r.get('ok') else 'failed',severity='INFO' if r.get('ok') else 'ERROR')
- return {'paper_only':True,'status':'ok' if r.get('ok') else 'runtime_deps_restore_incomplete','runtime_deps':r,'calendar_verified':e.session(e.now().date()) is not None,'at_IST':e.now().isoformat()}
+ try:audit=al.ensure_daily_export(e,db,str(e.now().date()),force=False)
+ except Exception as ex:audit={'status':'unavailable','reason':al.classified_error(ex)}
+ return {'paper_only':True,'status':'ok' if r.get('ok') else 'runtime_deps_restore_incomplete','runtime_deps':r,'audit_export':audit,'calendar_verified':e.session(e.now().date()) is not None,'at_IST':e.now().isoformat()}
 
 def ensure_monitor(e,db,defer_stale_signal=False):
  if not active(e,e.now()):return {'status':'market_closed_or_calendar_unverified','started':False}

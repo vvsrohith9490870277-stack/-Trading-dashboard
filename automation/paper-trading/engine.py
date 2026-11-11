@@ -236,9 +236,9 @@ class MarketData:
       sym=q.get('symbol')
       if sym:out[sym]=q
    except RuntimeError as ex:
-    al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
+    al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
    except Exception as ex:
-    al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
+    al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
    al.note('quote_batch_response',batch_id=batch_id,request_started_at=batch_at,response_received_at=observed,duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(symbols),fyers_budget=(self.budget.snapshot() if hasattr(self,'budget') else None))
   depth_when=set(MD.get('depth_when') or [])
   need_depth=[]
@@ -256,9 +256,9 @@ class MarketData:
     except RuntimeError as ex:
      if str(ex).startswith('market_data_error_'):
       al.note('quote_symbol_failed',outcome='failed',severity='WARN',symbol=sym,error_code=str(ex));out[sym]={'symbol':sym,'price':None,'quote_at':None,'provider_status':'error','source':'FYERS_DEPTH_LTT'};continue
-     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
+     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
     except Exception as ex:
-     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__,duration_ms=round((time.monotonic()-clock)*1000));raise
+     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
     dq=depth_quote(sym,d);base=out.get(sym) or {};base.update({k:dq[k] for k in dq if dq.get(k) is not None or k not in base});out[sym]=base
    al.note('quote_batch_response',batch_id=depth_id,request_started_at=depth_at,response_received_at=now(),duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(need_depth),fyers_budget=(self.budget.snapshot() if hasattr(self,'budget') else None))
   for sym in symbols:out.setdefault(sym,{'symbol':sym,'price':None,'quote_at':None,'provider_status':'missing','source':'FYERS_QUOTES'})
@@ -742,6 +742,9 @@ def main():
     elif args.command=='reference-feeds':out=rf.refresh(sys.modules[__name__],db,reference_day(now()))
     log('command_completed',command=args.command,namespace=NS)
     print(js(out))
+   if args.command=='eod' and isinstance(out,dict):
+    try:al.ensure_daily_export(sys.modules[__name__],db,str(now().date()),force=True)
+    except Exception:pass
   except Exception as e:
    # Exception contents can contain remote request details; only vetted internal error labels exposed.
    reason=au.safe_error(e);log('command_failed',command=args.command,error=reason)
