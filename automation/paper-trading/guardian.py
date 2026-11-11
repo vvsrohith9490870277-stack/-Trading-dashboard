@@ -32,18 +32,23 @@ def run(e,db,sleep=time.sleep,max_checks=480):
  with (os.fdopen(int(fd),'a+') if fd else (e.ROOT/'guardian.lock').open('a+')) as lease:
   try:fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:return {'status':'already_running','checks':0}
-  initial=e.now().date();checks=0;began=time.monotonic();last=began
+  initial=e.now().date();checks=0;began=time.monotonic();last=began;last_wall=None
   while e.now().date()==initial and armable(e,e.now()) and checks<max_checks and time.monotonic()-began<e.CFG['guardian_max_session_seconds']:
    tick=time.monotonic();lag=max(0,tick-last-e.CFG['guardian_seconds']) if checks else 0;last=tick
+   # Wall-clock gap since this guardian's previous check. A gap beyond guardian_gap_grace_seconds means
+   # the guardian itself was not running (host pause or overload); the worker gets one check to refresh
+   # its heartbeat before it can be judged stale, instead of being killed on the first look back.
+   wall=e.now();gap=(wall-last_wall).total_seconds() if last_wall else 0;last_wall=wall;resumed=gap>e.CFG['guardian_gap_grace_seconds']
    try:
-    heartbeat(e,db,'checking');al.replay(e,db)
+    heartbeat(e,db,'checking');al.replay(e,db);reaped=getattr(e.au,'reap_children',lambda:0)()
     if e.au.active(e,e.now()):
      h=e.au.health(e,db);r=h.get('heartbeat');age=(e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds() if r else None
-     result={'status':'auth_backoff','started':False} if r and r['status']=='paused_auth' and age<e.CFG['guardian_auth_backoff_seconds'] else e.au.ensure_monitor(e,db)
-     al.emit(e,db,'guardian_check',status=result.get('status'),started=result.get('started'),heartbeat_lag_seconds=age,missed_checks=int(lag//e.CFG['guardian_seconds']),guardian_seconds=e.CFG['guardian_seconds'],poll_seconds=e.CFG['poll_seconds'])
+     result={'status':'auth_backoff','started':False} if r and r['status']=='paused_auth' and age<e.CFG['guardian_auth_backoff_seconds'] else (e.au.ensure_monitor(e,db,defer_stale_signal=True) if resumed else e.au.ensure_monitor(e,db))
+     al.emit(e,db,'guardian_check',status=result.get('status'),started=result.get('started'),heartbeat_lag_seconds=age,count=reaped,missed_checks=int(lag//e.CFG['guardian_seconds']),guardian_seconds=e.CFG['guardian_seconds'],poll_seconds=e.CFG['poll_seconds'])
     else:al.emit(e,db,'guardian_armed',status='waiting_for_verified_open',guardian_seconds=e.CFG['guardian_seconds'],missed_checks=int(lag//e.CFG['guardian_seconds']))
    except Exception as ex:
     al.emit(e,db,'guardian_failure',outcome='failed',severity='ERROR',error_code=type(ex).__name__,missed_checks=int(lag//e.CFG['guardian_seconds']))
    checks+=1;sleep(max(0,e.CFG['guardian_seconds']-(time.monotonic()-tick)))
+  getattr(e.au,'reap_children',lambda:0)()
   heartbeat(e,db,'stopped');al.emit(e,db,'guardian_stopped',reason='session_ended' if not armable(e,e.now()) else 'bound_reached',count=checks)
   return {'status':'session_finished','checks':checks,'guardian_seconds':e.CFG['guardian_seconds']}

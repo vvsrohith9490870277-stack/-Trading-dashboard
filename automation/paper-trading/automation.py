@@ -1,5 +1,5 @@
 """Session supervision and additive analytics. No broker order endpoints."""
-import contextlib,fcntl,json,os,signal,subprocess,sys,time
+import contextlib,fcntl,json,os,signal,subprocess,sys,threading,time
 from datetime import datetime,date,timedelta,time as walltime
 from decimal import Decimal,ROUND_HALF_UP
 from pathlib import Path
@@ -211,13 +211,49 @@ def weekly(e,db):
 def heartbeat(e,db,status,**detail):
  detail['process_start']=(Path('/proc')/str(os.getpid())/'stat').read_text().split()[21]
  db.batch([('INSERT INTO paper_monitor_health(namespace,pid,heartbeat_at,status,detail_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace) DO UPDATE SET pid=excluded.pid,heartbeat_at=excluded.heartbeat_at,status=excluded.status,detail_json=excluded.detail_json',(e.NS,os.getpid(),e.now().isoformat(),status,e.js(detail)))])
+def stale_budget(e,status):
+ """Seconds a heartbeat may age before the worker counts as stale. A cycle in progress ('polling')
+ gets its own budget sized for a slow depth batch plus rate-limit backoff, post-quote work and pnl."""
+ if status=='backoff':return e.CFG['backoff_heartbeat_stale_seconds']
+ if status=='polling':return e.CFG['worker_polling_stale_seconds']
+ return e.CFG['worker_stale_seconds']
+class CycleHeartbeat:
+ """Refreshes the 'polling' heartbeat every worker_heartbeat_interval_seconds while one cycle runs.
+ Stops refreshing after worker_cycle_max_seconds so a genuinely hung cycle still turns stale."""
+ def __init__(self,e,db,polls):
+  self.e,self.db,self.polls=e,db,polls;self.stop=threading.Event();self.began=time.monotonic();self.beats=0
+  self.thread=threading.Thread(target=self.run,name='worker-cycle-heartbeat',daemon=True)
+ def run(self):
+  interval=self.e.CFG['worker_heartbeat_interval_seconds'];limit=self.e.CFG['worker_cycle_max_seconds']
+  while not self.stop.wait(interval):
+   elapsed=time.monotonic()-self.began
+   if elapsed>limit:return
+   try:heartbeat(self.e,self.db,'polling',polls=self.polls,cycle_elapsed_seconds=round(elapsed,1));self.beats+=1
+   except Exception:pass
+ def __enter__(self):self.thread.start();return self
+ def __exit__(self,*exc):self.stop.set();self.thread.join(self.e.CFG['worker_heartbeat_interval_seconds']);return False
+_children=[]
+def reap_children():
+ """Poll workers this process launched so exited ones never linger as zombies."""
+ done=[p for p in _children if p.poll() is not None]
+ for p in done:_children.remove(p)
+ return len(done)
+def _wait_for_lease(lock,seconds,interval=0.5):
+ end=time.monotonic()+seconds
+ while True:
+  try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB);return True
+  except BlockingIOError:
+   if time.monotonic()>=end:return False
+   time.sleep(interval)
 def health(e,db):
  rows=db.query('SELECT * FROM paper_monitor_health WHERE namespace=?',(e.NS,));r=rows[0] if rows else None
- return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>(e.CFG['backoff_heartbeat_stale_seconds'] if r['status']=='backoff' else e.CFG.get('worker_stale_seconds',120)))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14}
+ return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>stale_budget(e,r['status']))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14}
 
-def ensure_monitor(e,db):
+def ensure_monitor(e,db,defer_stale_signal=False):
  if not active(e,e.now()):return {'status':'market_closed_or_calendar_unverified','started':False}
+ reap_children()
  with (e.ROOT/'monitor.lock').open('a+') as lock:
+  replaced=None
   try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:
    h=health(e,db);r=h.get('heartbeat');detail=json.loads(r['detail_json']) if r else {};pid=r['pid'] if r else 0
@@ -225,12 +261,18 @@ def ensure_monitor(e,db):
     try:
      proc=Path('/proc')/str(pid);cmd=(proc/'cmdline').read_bytes().split(b'\0');start=(proc/'stat').read_text().split()[21]
      owned=start==detail['process_start'] and str(e.ROOT/'engine.py').encode() in cmd and b'worker' in cmd and (proc/'cwd').resolve()==e.ROOT
-     if owned:os.kill(pid,signal.SIGTERM);return {'status':'stale_owned_worker_signalled','started':False,'restart':'next supervisor invocation','pid':pid}
+     if owned and defer_stale_signal:return {'status':'stale_signal_deferred_after_supervisor_gap','started':False,'pid':pid}
+     if owned:
+      os.kill(pid,signal.SIGTERM)
+      if not _wait_for_lease(lock,e.CFG['worker_stop_wait_seconds']):return {'status':'stale_owned_worker_signalled','started':False,'restart':'next supervisor invocation','pid':pid}
+      replaced=pid
     except (OSError,ValueError,IndexError):pass
-   return {'status':'unhealthy_worker_needs_attention' if h['heartbeat_stale'] else 'already_running','started':False,**h}
+   if replaced is None:return {'status':'unhealthy_worker_needs_attention' if h['heartbeat_stale'] else 'already_running','started':False,**h}
   # Lock is an OS lease; a stale PID alone never causes process termination or prevents restart.
   with (e.ROOT/'logs/monitor-worker.log').open('a') as out:
    p=subprocess.Popen([sys.executable,str(e.ROOT/'engine.py'),'worker'],stdin=subprocess.DEVNULL,stdout=out,stderr=out,start_new_session=True,cwd=e.ROOT,pass_fds=(lock.fileno(),),env={**os.environ,'PAPER_MONITOR_LOCK_FD':str(lock.fileno())})
+  if callable(getattr(p,'poll',None)):_children.append(p)
+  if replaced is not None:return {'status':'stale_owned_worker_replaced','started':True,'pid':p.pid,'replaced_pid':replaced,'singleton_enforced_by_child':True}
   return {'status':'starting','started':True,'pid':p.pid,'singleton_enforced_by_child':True}
 
 def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
@@ -241,23 +283,35 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
   try:fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:return {'status':'already_running','polls':0}
   failures=0;polls=0;last_pnl=-1000;api=None;paused=False;factory=api_factory or e.MarketData
+  state={'in_cycle':False,'stop':False}
+  def on_term(signum,frame):
+   # Between cycles exit at once; mid-cycle finish the cycle (fills stay atomic) and exit after it.
+   # A second SIGTERM falls back to the default action, so a hung cycle can still be terminated.
+   state['stop']=True;signal.signal(signal.SIGTERM,signal.SIG_DFL)
+   if not state['in_cycle']:raise SystemExit(0)
+  previous=signal.signal(signal.SIGTERM,on_term) if threading.current_thread() is threading.main_thread() else None
   try:
-   while active(e,e.now()) and (max_polls is None or polls<max_polls):
+   while active(e,e.now()) and (max_polls is None or polls<max_polls) and not state['stop']:
     start=time.monotonic();delay=e.CFG['poll_seconds']
     with (e.ROOT/'engine.lock').open('a+') as lock:
      try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
      except BlockingIOError:
       heartbeat(e,db,'waiting_for_engine_lock');al.emit(e,db,'worker_waiting',reason='singleton_busy',poll_seconds=delay);sleep(delay);continue
      try:
-      heartbeat(e,db,'polling');api=api or factory();r=e.monitor(db,api);polls+=1;failures=0
-      if time.monotonic()-last_pnl>=e.CFG['pnl_snapshot_seconds']:e.pnl(db);last_pnl=time.monotonic()
+      state['in_cycle']=True;heartbeat(e,db,'polling',polls=polls)
+      with CycleHeartbeat(e,db,polls):
+       api=api or factory();r=e.monitor(db,api);polls+=1;failures=0
+       if time.monotonic()-last_pnl>=e.CFG['pnl_snapshot_seconds']:e.pnl(db);last_pnl=time.monotonic()
       heartbeat(e,db,'healthy',polls=polls,last_result=r)
       al.emit(e,db,'worker_check',duration_ms=round((time.monotonic()-start)*1000),poll_seconds=delay,missed_checks=max(0,int((time.monotonic()-start)//delay)-1),status=r.get('status'))
      except Exception as ex:
       reason=safe_error(ex);failures+=1;polls+=1;al.emit(e,db,'worker_failure',outcome='failed',severity='ERROR',error_code=reason,failures=failures);heartbeat(e,db,'backoff',error=reason,failures=failures)
       if 'auth' in reason.lower() or 'token_refresh' in reason.lower():paused=True;heartbeat(e,db,'paused_auth',error=reason);return {'status':'paused_auth','polls':polls}
       delay=min(300,30*2**min(failures,4))
+     finally:state['in_cycle']=False
+    if state['stop']:break
     sleep(max(0,delay-(time.monotonic()-start)))
   finally:
-   if not paused:heartbeat(e,db,'stopped',polls=polls)
-  return {'status':'session_finished','polls':polls}
+   if previous is not None and not state['stop']:signal.signal(signal.SIGTERM,previous)
+   if not paused:heartbeat(e,db,'stopped',polls=polls,terminated=state['stop'])
+  return {'status':'terminated' if state['stop'] else 'session_finished','polls':polls}
