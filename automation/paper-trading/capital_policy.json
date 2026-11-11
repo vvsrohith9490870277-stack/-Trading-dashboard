@@ -1,5 +1,5 @@
 {
-  "version": "freeze_capital_v1",
+  "version": "freeze_capital_v2",
   "effective_from": "2026-11-09",
   "valid_through": "2026-12-31",
   "currency": "INR",
@@ -15,11 +15,11 @@
   "isin_cap_cause": "ISIN_CAP",
   "sleeve_cash_cause": "INSUFFICIENT_CASH",
   "slot_order_seed": "freeze_capital_v1",
-  "adv_floor_inr": 100000000,
+  "adv_floor_inr": 200000000,
   "adv_lookback_sessions": 20,
   "adv_lag_sessions": 1,
   "adv_filter_cause": "ADV_FILTER_SKIP",
-  "adv_floor_review": "pending_funnel_report",
+  "adv_floor_review": "reviewed",
   "participation_rate": 0.005,
   "participation_cause": "ADV_PARTICIPATION_CAP",
   "slippage_base_bps_through_20cr": 8,
@@ -85,9 +85,11 @@
       "circuit_lock_haircut_pct_per_extra_day": "plan says a multi-day circuit-lock haircut must be available but gives no rate; 1% of the locked price per locked session after the first",
       "slot_order_seed": "fixed seed for hash(date, symbol, seed) ordering"
     },
-    "pending_user_decision": {
-      "adv_floor_inr": "freeze only after the funnel report is reviewed (adv_floor_review=pending_funnel_report)",
-      "hysteresis_shadow_trades": "plan names N new shadow trades for strategy reinstatement but never sets N; null keeps reinstatement manual-only"
+    "pending_user_decision": {},
+    "user_decided": {
+      "adv_floor_inr": "User chose \u20b920 crore on 2026-11-11 (checklist O-01 / card t126s629). adv_floor_review=reviewed. Applies to new entries only; existing holdings are not force-sold.",
+      "hysteresis_good_sessions": "User asked for automatic strategy reinstatement after N good days and left N to research (O-02 / t126s629). N=5 is one NSE cash week of consecutive non-negative shadow-sleeve equity sessions after the pause, config-driven. hysteresis_shadow_trades stays null (the freeze named N shadow trades but never set N; days were requested instead)."
     }
-  }
+  },
+  "hysteresis_good_sessions": 5
 }

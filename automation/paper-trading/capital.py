@@ -11,7 +11,7 @@ LOCKED_FILES = ('capital_policy.json', 'charge_policy.json', 'charge_rates.json'
 # Cause codes are protocol identifiers named by the freeze plan (B1), not tunable numbers.
 CAUSES = {'zero_share_cause': 'UNAFFORDABLE_ZERO_SHARES', 'sleeve_slot_cause': 'SLEEVE_SLOT_FULL', 'isin_cap_cause': 'ISIN_CAP', 'sleeve_cash_cause': 'INSUFFICIENT_CASH', 'adv_filter_cause': 'ADV_FILTER_SKIP', 'participation_cause': 'ADV_PARTICIPATION_CAP', 'strategy_pause_cause': 'KILL_PAUSE'}
 REQUIRED_ENFORCED = ('integer_share_rounding', 'sleeve_slot_limit', 'isin_cap', 'sleeve_cash', 'shadow_ledger', 'adv_filter_placeholder', 'adv_participation_cap', 'tiered_slippage', 'execution_path', 'microstructure_guards', 'corporate_actions', 'kill_pause')
-POSITIVE_INTS = ('master_capital_inr', 'sleeve_capital_inr', 'strategy_count', 'target_notional_inr', 'max_positions_per_sleeve', 'max_strategies_per_isin', 'adv_floor_inr', 'adv_lookback_sessions', 'adv_lag_sessions', 'ucb_closed_trades', 'slippage_base_bps_through_20cr', 'slippage_base_bps_above_20cr', 'slippage_tier_threshold_inr')
+POSITIVE_INTS = ('master_capital_inr', 'sleeve_capital_inr', 'strategy_count', 'target_notional_inr', 'max_positions_per_sleeve', 'max_strategies_per_isin', 'adv_floor_inr', 'adv_lookback_sessions', 'adv_lag_sessions', 'ucb_closed_trades', 'slippage_base_bps_through_20cr', 'slippage_base_bps_above_20cr', 'slippage_tier_threshold_inr', 'hysteresis_good_sessions')
 UNIT_FRACTIONS = ('participation_rate', 'sleeve_pause_drawdown', 'system_pause_drawdown', 'system_reinstatement_gap')
 ADV_REVIEW_STATES = ('pending_funnel_report', 'reviewed')
 

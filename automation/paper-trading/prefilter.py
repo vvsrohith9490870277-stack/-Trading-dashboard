@@ -14,8 +14,9 @@ def evaluate(stock,index,target):
  r={'policy_version':POLICY['version'],'benchmark':POLICY['benchmark'],'bar_date':str(target),'status':'UNAVAILABLE','reasons':[],'checks':{},'volume_expansion':None,'volume_ratio':None,'beta':None,'beta_pairs':0,'raw_prices_unadjusted':True}
  def unavailable(reason):r['reasons'].append(reason);return r
  if stock.empty or index.empty:return unavailable('missing_stock_or_benchmark')
- if 'trade_date' in stock.columns and str(target) not in MUHURAT_INDICATOR_EXCLUDED:stock=stock[~stock.trade_date.astype(str).isin(MUHURAT_INDICATOR_EXCLUDED)]
- if 'trade_date' in index.columns and str(target) not in MUHURAT_INDICATOR_EXCLUDED:index=index[~index.trade_date.astype(str).isin(MUHURAT_INDICATOR_EXCLUDED)]
+ if str(target) in MUHURAT_INDICATOR_EXCLUDED:return unavailable('indicator_excluded_session')
+ if 'trade_date' in stock.columns:stock=stock[~stock.trade_date.astype(str).isin(MUHURAT_INDICATOR_EXCLUDED)]
+ if 'trade_date' in index.columns:index=index[~index.trade_date.astype(str).isin(MUHURAT_INDICATOR_EXCLUDED)]
  if stock.empty or index.empty:return unavailable('missing_stock_or_benchmark')
  # Benchmark sessions define every return interval. Never forward-fill or pair unlike intervals.
  b=index[index.trade_date<=str(target)].sort_values('trade_date').drop_duplicates('trade_date',keep=False).tail(POLICY['beta_intervals']+1).copy()

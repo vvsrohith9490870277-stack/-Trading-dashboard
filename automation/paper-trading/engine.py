@@ -30,6 +30,8 @@ REGULAR_SESSION=tuple(dt_time.fromisoformat(x) for x in CFG['regular_session']);
 # Strategy 07 trail: the fraction is config, but it must equal the frozen rule text (".9*H" for 0.9), so a config edit cannot silently change the frozen formula.
 TRAIL=float(CFG['strategy_07_trail_fraction'])
 if not 0<TRAIL<1 or (('%g'%TRAIL).lstrip('0')+'*H') not in RULES['7']['trailing_update']:raise SystemExit('STRATEGY_07_TRAIL_CONFIG_DISAGREES_WITH_FROZEN_RULE')
+STOP_FILL=CFG['strategy_07_stop_fill']
+if STOP_FILL!='intraday_cross_fixed_prior_close_level' or 'trail_touch' not in RULES['7']['execution_priority'] or 'trail_gap' not in RULES['7']['execution_priority']:raise SystemExit('STRATEGY_07_STOP_FILL_CONFIG_DISAGREES_WITH_FROZEN_RULE')
 def trail_level(high_water):return round(TRAIL*high_water,2)
 def now():return datetime.now(IST)
 def js(v):return json.dumps(v,default=str,allow_nan=False)

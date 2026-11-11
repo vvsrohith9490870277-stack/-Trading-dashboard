@@ -1,10 +1,10 @@
 {
   "note": "Digest lock for the freeze policy files. Every policy number lives in those JSON files, never in engine code. To change a number: edit the JSON (bump its version), run `python3 capital.py --print-lock`, paste the digests here, and commit both together. A mismatch makes the engine and db.mjs refuse to start (fail closed).",
-  "locked_on_IST": "2026-11-09",
+  "locked_on_IST": "2026-11-11",
   "files": {
-    "capital_policy.json": "7453a928d2e84d277876fff14201c10128838536c9c8e295934c77aa30b0e603",
+    "capital_policy.json": "dea4ef3b9a48191a3f94249466f232656671cd772c3fb04eb0d59e4b8cb82732",
     "charge_policy.json": "9a8c3955edd4091cbc8e025afe9b3996fd5c41262a03dd89ab322155f3445fea",
     "charge_rates.json": "40c6b5a812670307ad7a0f7be9394fc81e24057aa12327e14d7f1a74159b1baa"
   },
-  "capital_policy_version": "freeze_capital_v1"
+  "capital_policy_version": "freeze_capital_v2"
 }

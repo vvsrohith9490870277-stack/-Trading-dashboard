@@ -6,6 +6,7 @@ from pathlib import Path
 import audit as al
 import runtime_deps as rd
 import official_close as oc
+import capital as cap
 
 def cents(v):return int((Decimal(str(v))*100).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
 def safe_error(exc):
@@ -109,7 +110,7 @@ PUBLIC_LABELS={
  'historical_disclaimer':'Historical backtest figures are gross of transaction costs, survivorship-biased on the present-day universe, and not jointly tested across strategies.',
  'headline_pnl_source':'capped_master_ledger',
  'shadow_book_diagnostic_only':True,
- 'adv_floor_review':'pending_funnel_report',
+ 'adv_floor_review':cap.POLICY['adv_floor_review'],
 }
 
 def capped_ledger(e,db,fin=None,ps=None,cost=None):

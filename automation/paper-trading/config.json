@@ -39,10 +39,12 @@
   "completed_bar_cutoff": "16:00",
   "completed_bar_cutoff_note": "A session's daily bar counts as completed (for scans, EOD and weekly expected sessions) only at or after this IST time.",
   "indicator_excluded_sessions": {
-    "2026-11-08": "Muhurat special session: explicit calendar entry (freeze plan A9); excluded from indicators, entry/exit conditions and the ADV window. Still listed in special_sessions for live trading hours."
+    "2026-11-08": "Muhurat special session: explicit calendar entry (freeze plan A9); excluded from Stage 1 (prefilter), indicators, entry/exit conditions and the ADV window. Still listed in special_sessions for live trading hours."
   },
   "strategy_07_trail_fraction": 0.9,
   "strategy_07_trail_source": "Copied from strategy_rules.json 7.trailing_update ('next-session stop=.9*H'); engine refuses to start if the two disagree.",
+  "strategy_07_stop_fill": "intraday_cross_fixed_prior_close_level",
+  "strategy_07_stop_fill_source": "Copied from strategy_rules.json 7.execution_priority (trail_gap at the open, else trail_touch at the fixed prior-close stop). Close-only exits were measured on the 7 Nov 2026 research history and not adopted; the engine refuses to start if this token disagrees with the frozen rule.",
   "history_sync_lookback_days": 364,
   "eod_near_close_seconds": 300,
   "pnl_snapshot_seconds": 300,

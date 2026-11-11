@@ -57,5 +57,51 @@ class PauseTests(unittest.TestCase):
         self.assertEqual(back[0]['baseline_day'], '2026-11-12')
         self.assertEqual(back_notes[0]['rule'], 'system_recovered_within_3pct_of_pre_pause_peak')
 
+
+    def test_good_session_hysteresis_reinstates_after_configured_streak(self):
+        self.assertIsNone(cap.POLICY['hysteresis_shadow_trades'])
+        n = cap.POLICY['hysteresis_good_sessions']
+        self.assertGreaterEqual(n, 1)
+        state = {'scope': 'strategy', 'strategy': 1, 'paused': 1, 'cause': 'sleeve_drawdown_exceeds_10pct', 'baseline_day': '', 'paused_at': '2026-11-09T10:00:00', 'pre_pause_peak_paise': 50000000}
+        pause_close = {'book': 'shadow', 'strategy': 1, 'day': '2026-11-09', 'equity_paise': 44000000}
+
+        def shadow_days(start, count, start_equity, step):
+            rows = [pause_close]
+            equity = start_equity
+            # dates after the pause, skipping the 10 Nov holiday by using explicit ISO days
+            days = ['2026-11-11', '2026-11-12', '2026-11-13', '2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19']
+            for i in range(count):
+                equity = equity + step
+                rows.append({'book': 'shadow', 'strategy': 1, 'day': days[i], 'equity_paise': equity})
+            return rows, days[count - 1]
+
+        short, day = shadow_days(0, n - 1, 44000000, 100000)
+        stayed, _ = pz.plan(short, [], [state], [], day, day + 'T10:00:00')
+        self.assertFalse(any(w['scope'] == 'strategy' and w['strategy'] == 1 and w['paused'] == 0 for w in stayed))
+
+        done, notes = pz.plan(shadow_days(0, n, 44000000, 100000)[0], [], [state], [], shadow_days(0, n, 44000000, 100000)[1], 'later')
+        self.assertEqual(done[0]['paused'], 0)
+        self.assertEqual(done[0]['baseline_day'], shadow_days(0, n, 44000000, 100000)[1])
+        self.assertEqual(notes[0]['rule'], f'shadow_equity_non_negative_for_{n}_sessions')
+
+        # A down day resets the streak: n-1 up, one down, then n-1 up is still paused; n up after the down reinstates.
+        days = ['2026-11-11', '2026-11-12', '2026-11-13', '2026-11-16', '2026-11-17', '2026-11-18', '2026-11-19', '2026-11-20', '2026-11-23', '2026-11-24', '2026-11-25']
+        equity = 44000000
+        rows = [pause_close]
+        # n-1 good, one bad
+        for i in range(n - 1):
+            equity += 100000
+            rows.append({'book': 'shadow', 'strategy': 1, 'day': days[i], 'equity_paise': equity})
+        equity -= 200000
+        rows.append({'book': 'shadow', 'strategy': 1, 'day': days[n - 1], 'equity_paise': equity})
+        reset, _ = pz.plan(rows, [], [state], [], days[n - 1], 'reset')
+        self.assertFalse(any(w['scope'] == 'strategy' and w['strategy'] == 1 and w['paused'] == 0 for w in reset))
+        for i in range(n):
+            equity += 100000
+            rows.append({'book': 'shadow', 'strategy': 1, 'day': days[n + i], 'equity_paise': equity})
+        back, back_notes = pz.plan(rows, [], [state], [], days[n + n - 1], 'back')
+        self.assertEqual(back[0]['paused'], 0)
+        self.assertEqual(back_notes[0]['rule'], f'shadow_equity_non_negative_for_{n}_sessions')
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)

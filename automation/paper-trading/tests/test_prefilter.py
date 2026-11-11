@@ -52,6 +52,29 @@ class CalculationTests(unittest.TestCase):
   with self.assertRaisesRegex(RuntimeError,'missing_verified_exchange_session'):p.benchmark(e,GapDB(),date(2026,11,6))
  def test_strict_trend_not_equal(self):
   s,b=frames();s[['open','close']]=100;s.high=101;s.low=99;r=p.evaluate(s,b,'2026-11-06');self.assertFalse(r['checks']['close_above_sma50']);self.assertFalse(r['checks']['sma50_above_sma200']);self.assertFalse(r['checks']['return20_positive'])
+
+ def test_stage1_skips_indicator_excluded_target_bar(self):
+  excluded=sorted(p.MUHURAT_INDICATOR_EXCLUDED)
+  self.assertTrue(excluded)
+  target=excluded[0]
+  s,b=frames()
+  # A later regular session still evaluates after the excluded bar is present in the frame.
+  later='2026-11-09'
+  last=s.iloc[-1].copy(); last.trade_date=later; last.close=float(last.close)*1.01; last.open=last.close; last.high=last.close+1; last.low=last.close-1
+  excluded_row=s.iloc[-1].copy(); excluded_row.trade_date=target; excluded_row.close=float(excluded_row.close)*2; excluded_row.open=excluded_row.close; excluded_row.high=excluded_row.close+1; excluded_row.low=excluded_row.close-1
+  # Target on the excluded session is skipped even if that row would otherwise be usable.
+  with_bar=pd.concat([s, pd.DataFrame([excluded_row])], ignore_index=True)
+  skipped=p.evaluate(with_bar, pd.concat([b, pd.DataFrame([excluded_row])], ignore_index=True), target)
+  self.assertEqual(skipped['status'],'UNAVAILABLE')
+  self.assertIn('indicator_excluded_session', skipped['reasons'])
+  # Same frames, later regular target: lookback drops the excluded bar, so a doubled Muhurat close cannot leak into returns.
+  s2=pd.concat([s, pd.DataFrame([excluded_row, last])], ignore_index=True)
+  b2=pd.concat([b, pd.DataFrame([excluded_row, last])], ignore_index=True)
+  s3=pd.concat([s, pd.DataFrame([last])], ignore_index=True)
+  b3=pd.concat([b, pd.DataFrame([last])], ignore_index=True)
+  self.assertEqual(p.evaluate(s2,b2,later)['status'], p.evaluate(s3,b3,later)['status'])
+  self.assertEqual(p.evaluate(s2,b2,later).get('close'), p.evaluate(s3,b3,later).get('close'))
+
 class EntryGuardTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):fixtures.PaperTests.setUpClass.__func__(cls)

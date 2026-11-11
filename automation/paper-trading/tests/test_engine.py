@@ -114,9 +114,9 @@ class PaperTests(unittest.TestCase):
   self.assertEqual(self.db.query('SELECT status FROM paper_signals WHERE namespace=? AND id=?',(e.NS,thin['id']))[0]['status'],'pending')
   self.assertFalse(self.db.query('SELECT * FROM paper_fills WHERE namespace=? AND signal_id=?',(e.NS,thin['id'])))
   decision=self.db.query('SELECT cause,rule,payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,thin['id']))[0]
-  self.assertEqual(decision['cause'],'ADV_FILTER_SKIP');self.assertEqual(decision['rule'],'median_20d_traded_value_vs_placeholder_floor')
-  self.assertEqual(json.loads(decision['payload_json'])['adv_floor_review'],'pending_funnel_report')
-  exact=self.signal(strategy=2);self.seed_adv('RELIANCE-EQ',100000000)
+  self.assertEqual(decision['cause'],'ADV_FILTER_SKIP');self.assertEqual(decision['rule'],'median_20d_traded_value_vs_reviewed_floor')
+  self.assertEqual(json.loads(decision['payload_json'])['adv_floor_review'],'reviewed')
+  exact=self.signal(strategy=2);self.seed_adv('RELIANCE-EQ',e.cap.POLICY['adv_floor_inr'])
   self.assertTrue(e.fill(self.db,exact,self.quote(),T)['filled'])
   short=self.signal(strategy=3);self.seed_adv('RELIANCE-EQ',500000000,sessions=19)
   missed=e.fill(self.db,short,self.quote(),T)
@@ -128,27 +128,30 @@ class PaperTests(unittest.TestCase):
   # Stored Fyers turnover equals close*volume; NULL turnover rows use the same derivation instead of failing as history-short.
   ok=self.signal();short=self.signal(strategy=2)
   self.db.batch([('DELETE FROM daily_ohlcv WHERE symbol=?',('RELIANCE-EQ',))])
-  self.db.batch([('INSERT INTO daily_ohlcv(symbol,trade_date,close,volume,turnover) VALUES(?,?,?,?,?)',('RELIANCE-EQ',(T.date()-timedelta(days=i)).isoformat(),100,1500000,None)) for i in range(2,22)])
+  # close × volume must clear the reviewed ADV floor; Muhurat's tiny turnover must not enter the median.
+  self.db.batch([('INSERT INTO daily_ohlcv(symbol,trade_date,close,volume,turnover) VALUES(?,?,?,?,?)',('RELIANCE-EQ',(T.date()-timedelta(days=i)).isoformat(),100,2500000,None)) for i in range(2,22)])
   self.db.batch([('INSERT INTO daily_ohlcv(symbol,trade_date,close,volume,turnover) VALUES(?,?,?,?,?)',('RELIANCE-EQ','2026-11-08',100,10,1000))])
   r=e.fill(self.db,ok,self.quote(),T)
   self.assertTrue(r['filled'])
   payload=json.loads(self.db.query('SELECT payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=? ORDER BY seq DESC LIMIT 1',(e.NS,ok['id']))[0]['payload_json'])
-  self.assertEqual(payload['adv_median_inr'],150000000)
+  self.assertEqual(payload['adv_median_inr'],250000000)
   # Zero-volume, NULL-turnover rows are not evidence: still history-short, never a fabricated value.
   self.db.batch([('UPDATE daily_ohlcv SET volume=0 WHERE symbol=? AND trade_date<?',('RELIANCE-EQ','2026-10-25'))])
   m=e.fill(self.db,short,self.quote(),T)
   self.assertEqual(m['reason'],'ADV_FILTER_SKIP');self.assertEqual(m['adv_rule'],'lagged_adv_history_short')
  def test_participation_cap_skips_without_scaling_and_still_exits(self):
-  # ₹10 crore ADV. 0.005 × ADV = ₹5,00,000. Price 100 buys exactly ₹50,000.
+  # Participation cap is rate × lagged ADV. Price 100 buys exactly the target notional.
   version=json.loads((e.ROOT/'charge_policy.json').read_text())['version']
-  s=self.signal(strategy=2);self.seed_adv('RELIANCE-EQ',100000000)
-  self.db.batch([('INSERT INTO paper_fill_costs(namespace,fill_id,day,strategy,symbol,isin,side,turnover_paise,policy_version,components_json,total_paise,entry_at,gross_cashflow_paise,net_cashflow_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(e.NS,900002,T.date().isoformat(),1,'RELIANCE-EQ','INE002A01018','BUY',46000000,version,'{}',0,T.isoformat(),-46000000,0))])
+  floor=e.cap.POLICY['adv_floor_inr']; rate=e.cap.POLICY['participation_rate']; notional=e.cap.POLICY['target_notional_inr']
+  cap_paise=int(floor*rate*100); order_paise=notional*100
+  s=self.signal(strategy=2);self.seed_adv('RELIANCE-EQ',floor)
+  self.db.batch([('INSERT INTO paper_fill_costs(namespace,fill_id,day,strategy,symbol,isin,side,turnover_paise,policy_version,components_json,total_paise,entry_at,gross_cashflow_paise,net_cashflow_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(e.NS,900002,T.date().isoformat(),1,'RELIANCE-EQ','INE002A01018','BUY',cap_paise-order_paise+10000,version,'{}',0,T.isoformat(),-(cap_paise-order_paise+10000),0))])
   blocked=e.fill(self.db,s,self.quote(),T)
   self.assertEqual(blocked['reason'],'ADV_PARTICIPATION_CAP');self.assertEqual(blocked['quantity'],0)
   self.assertEqual(self.db.query('SELECT status FROM paper_signals WHERE namespace=? AND id=?',(e.NS,s['id']))[0]['status'],'pending')
   self.assertFalse(self.db.query('SELECT * FROM paper_fills WHERE namespace=? AND signal_id=?',(e.NS,s['id'])))
   self.assertEqual(self.db.query('SELECT cause FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,s['id']))[0]['cause'],'ADV_PARTICIPATION_CAP')
-  self.db.batch([('UPDATE paper_fill_costs SET turnover_paise=? WHERE namespace=? AND fill_id=?',(45000000,e.NS,900002))])
+  self.db.batch([('UPDATE paper_fill_costs SET turnover_paise=? WHERE namespace=? AND fill_id=?',(cap_paise-order_paise,e.NS,900002))])
   filled=e.fill(self.db,s,self.quote(),T);self.assertTrue(filled['filled']);self.assertEqual(filled['qty'],500)
   held=self.signal(symbol='TCS-EQ');self.assertTrue(e.fill(self.db,held,self.quote(),T)['filled'])
   self.db.batch([('INSERT INTO paper_fill_costs(namespace,fill_id,day,strategy,symbol,isin,side,turnover_paise,policy_version,components_json,total_paise,entry_at,gross_cashflow_paise,net_cashflow_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(e.NS,900003,T.date().isoformat(),2,'TCS-EQ','INE467B01029','BUY',9000000000,version,'{}',0,T.isoformat(),0,0))])
@@ -487,7 +490,7 @@ class PaperTests(unittest.TestCase):
   self.assertEqual(ov['bucket_counts'],{'single':0,'exactly_2':1,'exactly_3':0,'4_plus':1})
   self.assertEqual(ov['matrix']['1']['2'],2);self.assertEqual(ov['matrix']['1']['4'],1);self.assertEqual(ov['isin_cap_impact_symbols'],['RELIANCE-EQ'])
   fn=e.au.funnel(e,self.db,bar)
-  self.assertEqual(fn['adv_floor_review'],'pending_funnel_report');self.assertEqual(e.cap.POLICY['adv_floor_review'],'pending_funnel_report')
+  self.assertEqual(fn['adv_floor_review'],'reviewed');self.assertEqual(e.cap.POLICY['adv_floor_review'],'reviewed')
   self.assertEqual(fn['stages']['strategy_qualified'],6);self.assertEqual(fn['stages']['adv_floor_pass'],4);self.assertEqual(fn['stages']['adv_floor_skipped'],2)
   self.assertEqual(fn['stages']['isin_cap_pass'],3);self.assertEqual(fn['stages']['isin_cap_skipped'],1);self.assertEqual(fn['stages']['sleeve_slot_pass'],3)
   self.assertTrue(e.fill(self.db,self.signal(symbol='RELIANCE-EQ',strategy=1),self.quote(100),T)['filled'])

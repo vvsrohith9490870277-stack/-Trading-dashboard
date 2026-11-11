@@ -1,9 +1,10 @@
 """Strategy and system pause rules.
 
 Strategy pause uses the shadow book. System pause uses the capped book.
-A strategy stays paused until a manual override. The freeze names hysteresis as
-N new shadow trades and does not give N (capital_policy hysteresis_shadow_trades=null), so that path is not invented.
-System reinstatement is recovery to within system_reinstatement_gap of the pre-pause peak, or a manual override.
+A strategy stays paused until a manual override, or until hysteresis_good_sessions
+consecutive non-negative shadow-sleeve equity sessions after the pause (a flat day counts).
+hysteresis_shadow_trades stays unused (null). System reinstatement is recovery to within
+system_reinstatement_gap of the pre-pause peak, or a manual override.
 All thresholds come from capital_policy.json; rule labels are generated from them.
 Peak resets on reinstatement.
 """
@@ -67,6 +68,36 @@ def _override(overrides, scope, strategy, paused_at):
     return any(o['scope'] == scope and int(o['strategy']) == strategy and o['action'] == 'reinstate' and str(o['recorded_at']) > paused_at for o in overrides)
 
 
+
+def _pause_day(paused_at):
+    """YYYY-MM-DD prefix of paused_at, or None if it is not a timestamp."""
+    text = str(paused_at or '')
+    if len(text) >= 10 and text[4] == '-' and text[7] == '-':
+        return text[:10]
+    return None
+
+
+def good_session_streak(closes, strategy, pause_day):
+    """Consecutive non-negative shadow-equity sessions strictly after pause_day."""
+    if not pause_day:
+        return 0
+    rows = sorted((r for r in closes if r['book'] == 'shadow' and int(r['strategy']) == strategy), key=lambda r: str(r['day']))
+    prior = [r for r in rows if str(r['day']) <= pause_day]
+    after = [r for r in rows if str(r['day']) > pause_day]
+    if not after or not prior:
+        return 0
+    last = int(prior[-1]['equity_paise'])
+    streak = 0
+    for r in after:
+        equity = int(r['equity_paise'])
+        if equity >= last:
+            streak += 1
+        else:
+            streak = 0
+        last = equity
+    return streak
+
+
 def plan(closes, trades, states, overrides, day, now):
     """Return pause-row writes and decision notes. Does not touch the database."""
     policy = cap.POLICY
@@ -90,7 +121,12 @@ def plan(closes, trades, states, overrides, day, now):
             peak = values[-1] if values else SLEEVE
             emit('strategy', strategy, False, None, peak, None, day, None, 'manual_override_reinstates_strategy')
             continue
+        n_good = policy['hysteresis_good_sessions']
         if paused:
+            streak = good_session_streak(closes, strategy, _pause_day(state.get('paused_at')))
+            if streak >= n_good:
+                peak = values[-1] if values else SLEEVE
+                emit('strategy', strategy, False, None, peak, None, day, None, f'shadow_equity_non_negative_for_{n_good}_sessions')
             continue
         hit = breaches(values, policy['sleeve_pause_drawdown'])
         if hit is not None:
@@ -180,6 +216,6 @@ def evaluate(e, db, day, force=False):
     if writes:
         db.batch([('INSERT INTO paper_pause_state(namespace,scope,strategy,paused,cause,peak_paise,pre_pause_peak_paise,baseline_day,paused_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(namespace,scope,strategy) DO UPDATE SET paused=excluded.paused,cause=excluded.cause,peak_paise=excluded.peak_paise,pre_pause_peak_paise=excluded.pre_pause_peak_paise,baseline_day=excluded.baseline_day,paused_at=excluded.paused_at,updated_at=excluded.updated_at', (e.NS, w['scope'], w['strategy'], w['paused'], w['cause'], w['peak_paise'], w['pre_pause_peak_paise'], w['baseline_day'], w['paused_at'], w['updated_at'])) for w in writes])
     for note in notes:
-        e.decide(db, {'id': e.stable_id('pause', e.NS, note['scope'], note['strategy'], day, note['rule']), 'strategy': note['strategy'] or None, 'symbol': None}, e.now(), 'HOLD', note['cause'], note['rule'], {'ex_date': day, 'scope': note['scope'], 'strategy': note['strategy'], 'paused': note['paused'], 'hysteresis_shadow_trades': cap.POLICY['hysteresis_shadow_trades']})
+        e.decide(db, {'id': e.stable_id('pause', e.NS, note['scope'], note['strategy'], day, note['rule']), 'strategy': note['strategy'] or None, 'symbol': None}, e.now(), 'HOLD', note['cause'], note['rule'], {'ex_date': day, 'scope': note['scope'], 'strategy': note['strategy'], 'paused': note['paused'], 'hysteresis_shadow_trades': cap.POLICY['hysteresis_shadow_trades'], 'hysteresis_good_sessions': cap.POLICY['hysteresis_good_sessions']})
     db.batch([('INSERT INTO paper_meta(namespace,key,value) VALUES(?,?,?) ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value', (e.NS, 'pause_day', day))])
     return {'status': 'evaluated', 'changes': len(writes)}
