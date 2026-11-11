@@ -4,6 +4,7 @@ from datetime import datetime,date,timedelta,time as walltime
 from decimal import Decimal,ROUND_HALF_UP
 from pathlib import Path
 import audit as al
+import runtime_deps as rd
 
 def cents(v):return int((Decimal(str(v))*100).quantize(Decimal('1'),rounding=ROUND_HALF_UP))
 def safe_error(exc):
@@ -258,7 +259,15 @@ def _wait_for_lease(lock,seconds,interval=0.5):
    time.sleep(interval)
 def health(e,db):
  rows=db.query('SELECT * FROM paper_monitor_health WHERE namespace=?',(e.NS,));r=rows[0] if rows else None
- return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>stale_budget(e,r['status']))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14}
+ deps=rd.check();info=rd.report_for_audit({**deps,'healed':False,'restored':[]})
+ if not deps.get('ok'):
+  try:al.emit(e,db,info['event'],python_ok=deps.get('python_ok'),node_ok=deps.get('node_ok'),restored=[])
+  except Exception:pass
+ return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>stale_budget(e,r['status']))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14,'runtime_deps':{'ok':deps.get('ok'),'python_ok':deps.get('python_ok'),'node_ok':deps.get('node_ok'),'python_reason':deps.get('python_reason'),'node_reason':deps.get('node_reason')}}
+def preflight(e,db):
+ r=rd.ensure();info=rd.report_for_audit(r)
+ al.emit(e,db,info['event'],python_ok=r.get('python_ok'),node_ok=r.get('node_ok'),restored=r.get('restored') or [],outcome='ok' if r.get('ok') else 'failed',severity='INFO' if r.get('ok') else 'ERROR')
+ return {'paper_only':True,'status':'ok' if r.get('ok') else 'runtime_deps_restore_incomplete','runtime_deps':r,'calendar_verified':e.session(e.now().date()) is not None,'at_IST':e.now().isoformat()}
 
 def ensure_monitor(e,db,defer_stale_signal=False):
  if not active(e,e.now()):return {'status':'market_closed_or_calendar_unverified','started':False}

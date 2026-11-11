@@ -412,15 +412,23 @@ def indicator(strategy,g):
  return getattr(strategy_indicators,'strategy_'+str(strategy))(g)
 def universe():
  return sorted(pd.read_csv(ROOT/'universe.csv').db_symbol.tolist())
-def sync(db,api,target,symbols):
- cv={x['symbol']:x['dmax'] for x in db.query('SELECT symbol,MAX(trade_date) AS dmax FROM daily_ohlcv GROUP BY symbol')};n=0;invalid=[];pending_sync=[]
+def sync(db,api,target,symbols,max_requests=None):
+ """Fetch only symbols still missing the target bar. max_requests caps calls (morning fallback). Stops on Fyers budget or rate limit."""
+ cv={x['symbol']:x['dmax'] for x in db.query('SELECT symbol,MAX(trade_date) AS dmax FROM daily_ohlcv GROUP BY symbol')};n=0;invalid=[];pending_sync=[];requests=0;deferred=[];stopped=None
+ missing=[sym for sym in symbols if cv.get(sym,'')<str(target)]
  for sym in symbols:
   if cv.get(sym,'')>=str(target):continue
   if not cv.get(sym):invalid.append({'symbol':sym,'reason':'no_existing_history_unverified_identity'});continue
+  if (max_requests is not None and requests>=max_requests) or stopped:
+   deferred.append(sym);continue
   start=max(date.fromisoformat(cv[sym])+timedelta(days=1),target-timedelta(days=CFG['history_sync_lookback_days']))
-  try:candles=api.history(sym,start,target)
+  try:
+   candles=api.history(sym,start,target);requests+=1
   except RuntimeError as e:
-   if str(e).startswith('market_data_error_') and '300' in str(e):invalid.append({'symbol':sym,'reason':'invalid_symbol'});continue
+   err=str(e)
+   if err.startswith('market_data_error_') and '300' in err:invalid.append({'symbol':sym,'reason':'invalid_symbol'});requests+=1;continue
+   if 'budget_exhausted' in err or err=='market_data_rate_limit':
+    stopped=err;deferred.append(sym);continue
    raise
   st=[]
   for c in candles:
@@ -434,7 +442,24 @@ def sync(db,api,target,symbols):
   pending_sync.extend(st)
   if len(pending_sync)>=150:db.batch(pending_sync);pending_sync=[]
  db.batch(pending_sync)
- log('history_sync',candidate_candles=n,unavailable=invalid);return {'candidate_candles':n,'unavailable':invalid}
+ budget=api.budget_snapshot() if hasattr(api,'budget_snapshot') else None
+ log('history_sync',candidate_candles=n,unavailable=invalid,requests=requests,deferred=len(deferred),stopped=stopped,fyers_budget=budget)
+ return {'candidate_candles':n,'unavailable':invalid,'requests':requests,'missing_before':len(missing),'deferred':len(deferred),'stopped':stopped,'fyers_budget':budget}
+
+def sync_history(db,api=None):
+ """Evening job: sync completed bars for the universe (and the benchmark) under the shared Fyers budget."""
+ e=sys.modules[__name__];api=api or MarketData();t=now()
+ if session(t.date()) is None:return {'status':'calendar_unverified','requests':0}
+ target=completed_day(t);syms=sorted(set(universe())|{p['symbol'] for p in db.positions()})
+ al.emit(e,db,'sync_started',target_completed_bar=str(target),symbols_count=len(syms),job='sync-history')
+ stock=sync(db,api,target,syms)
+ try:benchmark=pf.benchmark(e,db,target,api,True);benchmark_error=None
+ except RuntimeError:benchmark=__import__('pandas').DataFrame();benchmark_error='benchmark_sync_unavailable'
+ repair=hr.repair(e,db,api,target) if len(benchmark)>0 else None
+ budget=api.budget_snapshot() if hasattr(api,'budget_snapshot') else None
+ report={'status':'partial' if stock.get('deferred') or stock.get('stopped') or benchmark_error else 'ok','target_completed_bar':str(target),'sync':stock,'benchmark_sync_error':benchmark_error,'history_repair':repair,'fyers_budget':budget,'universe_symbols':len(syms)}
+ al.emit(e,db,'sync_completed',target_completed_bar=str(target),symbols_count=len(syms),job='sync-history',requests=stock.get('requests'),deferred=stock.get('deferred'),stopped=stock.get('stopped'),fyers_budget=budget)
+ log('sync_history',**{k:report[k] for k in report if k!='history_repair'});db.run('sync-history',report['status'],**{k:v for k,v in report.items() if k!='history_repair'});return report
 def read_history(db,symbols,target):
  rows=[]
  for i in range(0,len(symbols),25):
@@ -446,8 +471,8 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  target=completed_day(t);positions=db.positions();syms=sorted(set(universe())|{p['symbol'] for p in positions})
  existing=db.query('SELECT strategy,symbol,bar_date FROM paper_watermarks WHERE namespace=?',(NS,))
  if bootstrap and existing and not snapshot_only:return {'status':'already_bootstrapped','signals_queued':0,'no_backlog_fills':True}
- if do_sync:al.emit(sys.modules[__name__],db,'sync_started',target_completed_bar=str(target),symbols_count=len(syms))
- sync_report=sync(db,api,target,syms) if do_sync else None
+ if do_sync:al.emit(sys.modules[__name__],db,'sync_started',target_completed_bar=str(target),symbols_count=len(syms),job='scan-fallback')
+ sync_report=sync(db,api,target,syms,max_requests=int(CFG.get('history_sync_scan_max_requests') or 0) or None) if do_sync else None
  try:benchmark=pf.benchmark(sys.modules[__name__],db,target,api,do_sync);benchmark_error=None
  except RuntimeError:benchmark=pd.DataFrame();benchmark_error="benchmark_sync_unavailable"
  repair_report=hr.repair(sys.modules[__name__],db,api,target) if do_sync and len(benchmark)>0 else None
@@ -656,9 +681,9 @@ def migrate(db):
   db.batch([('ALTER TABLE paper_positions ADD COLUMN pending_exit INTEGER NOT NULL DEFAULT 0',()),('ALTER TABLE paper_positions ADD COLUMN pending_exit_since TEXT',())])
 def main():
  parser=argparse.ArgumentParser(description='Paper-only Fyers-data/Turso-ledger engine; never broker orders.')
- parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);args=parser.parse_args()
+ parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);args=parser.parse_args()
  if not 1<=args.max_history_requests<=1100 or not 1<=args.max_history_seconds<=1080:parser.error('historical repair budget outside safe bounds')
- if args.command in ['worker','ensure-monitor','health','ensure-session','guardian','replay-audit','export-logs','support']:
+ if args.command in ['worker','ensure-monitor','health','preflight','ensure-session','guardian','replay-audit','export-logs','support']:
   # Supervision must remain reachable even while a worker/scan holds engine.lock.
   try:
    db=DB();e=sys.modules[__name__]
@@ -671,7 +696,7 @@ def main():
    elif args.command=='support':
     print(js(sa.run_cli(e,db,args.session)))
    else:
-    fn={'worker':au.worker,'ensure-monitor':au.ensure_monitor,'health':au.health,'ensure-session':gd.ensure,'guardian':gd.run}[args.command]
+    fn={'worker':au.worker,'ensure-monitor':au.ensure_monitor,'health':au.health,'preflight':au.preflight,'ensure-session':gd.ensure,'guardian':gd.run}[args.command]
     with al.scope(e,db,args.command):print(js(fn(e,db)))
   except Exception as ex:
    print(js({'status':'failed','error':au.safe_error(ex),'paper_only':True}));sys.exit(1)
@@ -697,6 +722,7 @@ def main():
       db.run('probe',status,**out)
     elif args.command=='repair-history':out=hr.repair(sys.modules[__name__],db,MarketData(),completed_day(now()),budget=args.max_history_requests,deadline_seconds=args.max_history_seconds,progress=str(ROOT/'out/history-repair-progress.json'))
     elif args.command in ['bootstrap','scan','screen-only']:out=scan(db,MarketData(),args.sync,args.command=='bootstrap',args.command=='screen-only')
+    elif args.command=='sync-history':out=sync_history(db,MarketData())
     elif args.command=='monitor-once':
      out=monitor(db,MarketData())
      if au.active(sys.modules[__name__],now()):out['pnl']=pnl(db)
