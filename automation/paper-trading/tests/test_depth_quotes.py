@@ -5,10 +5,15 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]));import engine as e
 T=datetime(2026,11,9,12,32,tzinfo=e.IST)
 MIDNIGHT_TT=1794182400  # 2026-11-09 00:00 UTC == 05:30 IST: what /data/quotes returns as `tt`
 class DepthQuoteFreshness(unittest.TestCase):
- def api(self,payloads):
+ def api(self,payloads,quotes_rows=None,quotes_error=None):
   api=e.MarketData.__new__(e.MarketData);calls=[]
   def get(route,params):
-   calls.append((route,params));item=payloads[params['symbol']]
+   calls.append((route,params))
+   if route=='quotes':
+    if quotes_error:raise quotes_error
+    if quotes_rows is not None:return {'s':'ok','d':quotes_rows}
+    return {'s':'ok','d':[]}
+   item=payloads[params['symbol']]
    if isinstance(item,Exception):raise item
    return {'s':'ok','d':{params['symbol']:item}}
   api.get=get;api.calls=calls;return api
@@ -36,7 +41,7 @@ class DepthQuoteFreshness(unittest.TestCase):
    with self.assertRaisesRegex(RuntimeError,err):self.api({'NSE:A-EQ':RuntimeError(err)}).quotes(['A-EQ'])
  def test_one_symbol_per_depth_request(self):
   api=self.api({'NSE:A-EQ':{'ltp':1,'ltt':1},'NSE:B-EQ':{'ltp':2,'ltt':2}});api.quotes(['A-EQ','B-EQ'])
-  self.assertEqual([(r,p['symbol']) for r,p in api.calls],[('depth','NSE:A-EQ'),('depth','NSE:B-EQ')])
+  self.assertEqual([(r,p.get('symbol') or p.get('symbols')) for r,p in api.calls],[('quotes','NSE:A-EQ,NSE:B-EQ'),('depth','NSE:A-EQ'),('depth','NSE:B-EQ')])
  def test_exit_path_uses_same_gate(self):
   # Strategy-7 stop and all SELL fills call valid_quote on the same quote dict, so stale exits are blocked too.
   stale=self.q(MIDNIGHT_TT);self.assertFalse(e.valid_quote(stale,T)[0])
@@ -57,6 +62,19 @@ class DepthQuoteFreshness(unittest.TestCase):
   q=self.api({'NSE:A-EQ':{'ltp':50.0,'ltt':int(T.timestamp()),'o':0,'bids':[],'upper_ckt':0}}).quotes(['A-EQ'])['A-EQ']
   self.assertIsNone(q['open']);self.assertIsNone(q['bid']);self.assertIsNone(q['ask']);self.assertNotIn('upper_band',q)
   self.assertEqual(e.execution_reference(q),(50.0,'LTP_LEGACY'))
- def test_live_quotes_never_use_quotes_route(self):
-  api=self.api({'NSE:A-EQ':{'ltp':1,'ltt':1}});api.quotes(['A-EQ']);self.assertNotIn('quotes',[r for r,_ in api.calls])
+ def test_quotes_batch_with_ltt_skips_depth(self):
+  stamp=int((T-timedelta(seconds=5)).timestamp())
+  rows=[{'n':'NSE:RELIANCE-EQ','s':'ok','v':{'lp':1307.7,'ltt':stamp,'open_price':1300,'high_price':1310,'low_price':1290,'ask':1307.8,'bid':1307.6,'tt':MIDNIGHT_TT}}]
+  api=self.api({},quotes_rows=rows);q=api.quotes(['RELIANCE-EQ'])['RELIANCE-EQ']
+  self.assertEqual([r for r,_ in api.calls],['quotes']);self.assertEqual(q['source'],'FYERS_QUOTES');self.assertEqual(q['price'],1307.7);self.assertTrue(e.valid_quote(q,T)[0])
+ def test_quotes_midnight_tt_is_not_used_as_trade_time(self):
+  rows=[{'n':'NSE:RELIANCE-EQ','s':'ok','v':{'lp':1307.7,'tt':MIDNIGHT_TT,'open_price':1300}}]
+  self.assertIsNone(e.quote_trade_stamp(rows[0]['v']))
+  api=self.api({'NSE:RELIANCE-EQ':{'ltp':1307.7,'ltt':int((T-timedelta(seconds=5)).timestamp())}},quotes_rows=rows)
+  q=api.quotes(['RELIANCE-EQ'])['RELIANCE-EQ']
+  self.assertEqual([r for r,_ in api.calls],['quotes','depth']);self.assertEqual(q['source'],'FYERS_DEPTH_LTT');self.assertTrue(e.valid_quote(q,T)[0])
+ def test_quotes_rate_limit_does_not_start_depth_batch(self):
+  api=self.api({'NSE:A-EQ':{'ltp':1,'ltt':1}},quotes_error=RuntimeError('market_data_rate_limit'))
+  with self.assertRaisesRegex(RuntimeError,'market_data_rate_limit'):api.quotes(['A-EQ'])
+  self.assertEqual([r for r,_ in api.calls],['quotes'])
 if __name__=='__main__':unittest.main(verbosity=2)

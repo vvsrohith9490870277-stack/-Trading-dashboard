@@ -303,7 +303,7 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
   previous=signal.signal(signal.SIGTERM,on_term) if threading.current_thread() is threading.main_thread() else None
   try:
    while active(e,e.now()) and (max_polls is None or polls<max_polls) and not state['stop']:
-    start=time.monotonic();delay=e.CFG['poll_seconds']
+    start=time.monotonic();delay=e.CFG['poll_seconds'];full_cooloff=False
     with (e.ROOT/'engine.lock').open('a+') as lock:
      try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
      except BlockingIOError:
@@ -318,10 +318,13 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
      except Exception as ex:
       reason=safe_error(ex);failures+=1;polls+=1;al.emit(e,db,'worker_failure',outcome='failed',severity='ERROR',error_code=reason,failures=failures);heartbeat(e,db,'backoff',error=reason,failures=failures)
       if 'auth' in reason.lower() or 'token_refresh' in reason.lower():paused=True;heartbeat(e,db,'paused_auth',error=reason);return {'status':'paused_auth','polls':polls}
-      delay=min(300,30*2**min(failures,4))
+      if 'rate_limit' in reason:
+       delay=max(int(e.CFG['market_data'].get('rate_limit_cooloff_seconds',180)),min(300,30*2**min(failures,4)));full_cooloff=True
+      else:
+       delay=min(300,30*2**min(failures,4))
      finally:state['in_cycle']=False
     if state['stop']:break
-    sleep(max(0,delay-(time.monotonic()-start)))
+    sleep(delay if full_cooloff else max(0,delay-(time.monotonic()-start)))
   finally:
    if previous is not None and not state['stop']:signal.signal(signal.SIGTERM,previous)
    if not paused:heartbeat(e,db,'stopped',polls=polls,terminated=state['stop'],db_helper=db.helper_stats() if hasattr(db,'helper_stats') else None)
