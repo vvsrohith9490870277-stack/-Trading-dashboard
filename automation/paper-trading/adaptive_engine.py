@@ -990,10 +990,10 @@ def simulate_track_window(
             if bar is None:
                 continue
             band = bands_by_date_symbol.get((day, sym), {})
-            circuit = str(band.get('circuit') or 'NONE').upper()
+            circuit = str(band.get('circuit') or 'UNKNOWN').upper()
             pit_ser = str(pit.get_pit_series(db, sym, day, as_of_date=day) or band.get('series') or 'UNKNOWN').upper()
             pos = positions[sym]
-            if circuit == 'LOWER':
+            if circuit in ('LOWER', 'BOTH'):
                 pos['pending_exit'] = True
                 pos['locked_days'] = int(pos.get('locked_days', 0)) + 1
                 continue
@@ -1033,9 +1033,9 @@ def simulate_track_window(
             if bar is None:
                 continue
             band = bands_by_date_symbol.get((day, sym), {})
-            circuit = str(band.get('circuit') or 'NONE').upper()
+            circuit = str(band.get('circuit') or 'UNKNOWN').upper()
             pit_ser = str(pit.get_pit_series(db, sym, day, as_of_date=day) or band.get('series') or 'UNKNOWN').upper()
-            if circuit == 'UPPER':
+            if circuit in ('UPPER', 'BOTH'):
                 skips.append({'day': day, 'symbol': sym, 'cause': 'UPPER_CIRCUIT_BUY_BLOCK'})
                 continue
             if pit_ser != 'EQ':

@@ -21,6 +21,7 @@ import adaptive_observation as aobs    # noqa: E402
 import adaptive_policy as apol         # noqa: E402
 import pit_archive as pit              # noqa: E402
 import prefilter as pf                 # noqa: E402
+import circuit_bands as cb             # noqa: E402
 
 IST = ZoneInfo('Asia/Kolkata')
 CFG = json.loads((HERE / 'adaptive_live_config.json').read_text())
@@ -52,7 +53,7 @@ def open_adaptive_db():
         # Only the adaptive / PIT-archive tables; never create Track A (paper_*) or support tables here.
         if s.upper().startswith('CREATE') and 'paper_' not in s and 'support_' not in s:
             db.batch([(s.replace('CREATE TABLE ', 'CREATE TABLE IF NOT EXISTS ', 1) if 'IF NOT EXISTS' not in s else s, ())])
-    pit.init(db); alog.init(db); aobs.init(db)
+    pit.init(db); alog.init(db); aobs.init(db); cb.init(db)
     db.batch([('CREATE TABLE IF NOT EXISTS adaptive_live_track_a_equity(namespace TEXT NOT NULL,trade_date TEXT NOT NULL,strategy INTEGER NOT NULL,'
                'equity_paise INTEGER NOT NULL,cash_paise INTEGER NOT NULL,market_value_paise INTEGER NOT NULL,open_positions INTEGER NOT NULL,'
                'basis TEXT NOT NULL,source_hash TEXT NOT NULL,recorded_at TEXT NOT NULL,PRIMARY KEY(namespace,trade_date,strategy))', ())])
@@ -113,6 +114,7 @@ def main():
     if leaked:
         raise RuntimeError('adaptive_env_not_scrubbed')
     db = open_adaptive_db()
+    cb.init(db)
     stamp = datetime.now(IST).isoformat()
     eod = json.loads(Path(a.eod_json).read_text())
     report = {'session_day': day, 'namespace': NS, 'started_at_ist': stamp, 'observation_only': bool(ENGINE_CFG.get('adaptive_observation_only', True)),
@@ -134,6 +136,9 @@ def main():
     latest_bar = sessions[-1] if sessions else None
     report['latest_completed_bar_in_snapshot'] = latest_bar
     report['excluded_sessions_skipped'] = sorted(EXCLUDED & set(stock['trade_date'].astype(str).unique()))
+    # Official NSE sec_list already on disk (state/circuit_bands); never fetch Fyers; never invent bands.
+    raw_cir = HERE.parent / (CFG.get('circuit_bands') or {}).get('raw_dir', 'state/circuit_bands')
+    report['circuit_ingest'] = cb.ingest_raw_dir(db, raw_cir, as_of=day)
 
     # 3. Spawns: Track A replica arm + up to max_track_b_challengers Track B challengers per strategy (idempotent).
     spawns = {}
@@ -185,7 +190,8 @@ def main():
         # 5. Forward-only evaluation: warm-start ends at the spawn's warm_start_end; eval = sessions after it, up to latest_bar.
         closes = idx.set_index(idx['trade_date'].astype(str))['close'].astype(float)
         r_idx = (closes / closes.shift(1) - 1.0).to_dict()   # benchmark daily return for Gate 4 / residualized d_t
-        bands = {(str(r['trade_date']), str(r['symbol'])): {'series': r.get('series'), 'circuit': r.get('circuit')} for r in bands_df.to_dict('records')}
+        bands = cb.build_bands_by_date_symbol(db, stock, sessions, as_of=day)
+        report['circuit_bands'] = cb.summarize_bands(bands)
         for s, info in spawns.items():
             if 'warm_start' not in info:
                 continue

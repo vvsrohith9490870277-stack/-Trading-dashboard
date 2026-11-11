@@ -25,6 +25,7 @@ LIB = HERE.parent / 'automation' / 'paper-trading'
 sys.path.insert(0, str(LIB)); sys.path.insert(0, str(HERE))
 import adaptive_guard as ag, adaptive_policy as apol, pit_archive as pit   # noqa: E402
 import adaptive_daily as ad                                                # noqa: E402
+import circuit_bands as cb                                                 # noqa: E402
 
 IST = ZoneInfo('Asia/Kolkata')
 CFG = json.loads((HERE / 'adaptive_live_config.json').read_text()); BF = CFG['backfill']; AP = apol.POLICY
@@ -295,6 +296,15 @@ def main(argv=None):
             res = pit.ingest_bhavcopy_series(db, rows, trade_date=d, source=BF['source_label'])
             rec['status'] = 'ingested'
             rec['ingested'] = res['ingested']
+        # Official price-band file for the same session. Missing/dynamic stays unknown; never invent.
+        cir_dir = Path(a.scratch_dir) if a.scratch_dir else (
+            Path(a.offline_dir) if a.offline_dir else HERE.parent / (json.loads((HERE / 'adaptive_live_config.json').read_text()).get('circuit_bands') or {}).get('raw_dir', 'state/circuit_bands')
+        )
+        rec['circuit'] = cb.process_session_file(
+            d, cir_dir, db=None if a.no_ingest else db,
+            fetch=not bool(a.offline_dir),
+            timeout=BF['request_timeout_seconds'], retries=retries, gap=gap,
+        )
         out.append(rec)
 
     ingested = [x for x in out if x.get('status') in ('ingested', 'parsed')]
