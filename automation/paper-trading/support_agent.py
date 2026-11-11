@@ -1006,6 +1006,51 @@ def run_detectors(db, namespace, session_day, observation_only=True, stale_thres
     }
 
 
+
+def reference_feed_403_hits(event):
+    """Extract HTTP 403 feed failures from reference_feed_error or reference_feeds payloads.
+
+    The live engine often logs kind=reference_feeds on the engine.jsonl spool (sources.<feed>.error
+    like 'http_403') rather than a paper_events row typed reference_feed_error. Both shapes count.
+    """
+    et = str(event.get('event_type') or '')
+    try:
+        data = json.loads(event.get('data_json') or '{}') if not isinstance(event.get('data_json'), dict) else event['data_json']
+    except Exception:
+        data = event.get('data') or {}
+    if not isinstance(data, dict):
+        data = {}
+    hits = []
+
+    def is_403(info):
+        if not isinstance(info, dict):
+            return '403' in str(info)
+        err = str(info.get('error') or '')
+        status = info.get('http_status')
+        return status == 403 or '403' in err or str(info.get('status') or '') in ('http_403',)
+
+    if et == 'reference_feed_error' or (data.get('http_status') == 403 or '403' in str(data.get('error', '')) and et.startswith('reference_feed')):
+        if is_403(data) or data.get('http_status') == 403 or '403' in str(data.get('error', '')):
+            hits.append({
+                'feed': data.get('feed') or data.get('name') or 'nse',
+                'error': data.get('error'),
+                'http_status': data.get('http_status') or 403,
+            })
+    sources = data.get('sources') if isinstance(data.get('sources'), dict) else {}
+    if et in ('reference_feeds', 'reference_feed') or sources:
+        for feed, info in sources.items():
+            if is_403(info):
+                err = info.get('error') if isinstance(info, dict) else info
+                hits.append({'feed': feed, 'error': err, 'http_status': 403, 'status': (info or {}).get('status') if isinstance(info, dict) else None})
+    # de-dupe by feed
+    out, seen = [], set()
+    for h in hits:
+        k = str(h.get('feed') or 'nse')
+        if k not in seen:
+            seen.add(k); out.append(h)
+    return out
+
+
 def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading_db=None, observation_only=True, check_policy_hygiene=False, box_metrics=None, dashboard_probe=None, recorded_at=None):
     """Run the full Production Action Plan v3 detector suite (SEV1-SEV4 + expectation ledger + episodes)."""
     assert_support_policy_lock()
@@ -1160,12 +1205,23 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                     first_ev['source_at'], recovery_details=recovery, recorded_at=stamp,
                 )
                 results.append({**ep, 'detector': 'worker_down'})
+            gap_samples = []
+            for a, b in zip(in_session, in_session[1:]):
+                gap_s = (b - a).total_seconds()
+                if gap_s > stale_s:
+                    gap_samples.append({
+                        'from_ist': a.strftime('%H:%M:%S'),
+                        'to_ist': b.strftime('%H:%M:%S'),
+                        'gap_seconds': gap_s,
+                    })
             if initial_gap > float(w_exp['grace_seconds']) or max_gap > stale_s or late_last:
                 ms_details = {
                     'first_check': first_check_dt.strftime('%H:%M:%S'),
                     'initial_gap_seconds': initial_gap,
                     'max_check_gap_seconds': max_gap,
                     'threshold_seconds': stale_s,
+                    'gap_count': len(gap_samples),
+                    'gaps': gap_samples,
                 }
                 if now_ist >= session_end:
                     # last check vs close is only final after the close (avoids one evidence row per pass).
@@ -1406,10 +1462,10 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
 
     # 12. Reference feeds HTTP 403 -> feed_http_403 (SEV3)
     for ev in events:
-        if ev['event_type'] == 'reference_feed_error':
-            data = json.loads(ev.get('data_json') or '{}')
-            if data.get('http_status') == 403 or '403' in str(data.get('error', '')):
-                emit('feed_http_403', f"feed_http_403:{session_day}:{data.get('feed', 'nse')}", ev['source_at'], 'SEV3', data)
+        if ev['event_type'] in ('reference_feed_error', 'reference_feeds', 'reference_feed') or '403' in str(ev.get('data_json') or ''):
+            hits = reference_feed_403_hits(ev)
+            for hit in hits:
+                emit('feed_http_403', f"feed_http_403:{session_day}:{hit.get('feed', 'nse')}", ev['source_at'], 'SEV3', hit)
 
     # 13. Install pipeline events -> install_aborted_process_active, install_rolled_back (SEV2)
     for ev in events:
