@@ -271,11 +271,21 @@ def heartbeat(e,db,status,**detail):
  detail['process_start']=(Path('/proc')/str(os.getpid())/'stat').read_text().split()[21]
  db.batch([('INSERT INTO paper_monitor_health(namespace,pid,heartbeat_at,status,detail_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace) DO UPDATE SET pid=excluded.pid,heartbeat_at=excluded.heartbeat_at,status=excluded.status,detail_json=excluded.detail_json',(e.NS,os.getpid(),e.now().isoformat(),status,e.js(detail)))])
 def stale_budget(e,status):
- """Seconds a heartbeat may age before the worker counts as stale. A cycle in progress ('polling')
- gets its own budget sized for a slow depth batch plus rate-limit backoff, post-quote work and pnl."""
+ """Seconds a heartbeat may age before the worker counts as stale."""
  if status=='backoff':return e.CFG['backoff_heartbeat_stale_seconds']
  if status=='polling':return e.CFG['worker_polling_stale_seconds']
  return e.CFG['worker_stale_seconds']
+def heartbeat_is_stale(e,r,now=None):
+ """True when the stored heartbeat is older than the status budget, or a polling cycle has already run past that budget."""
+ if not r:return True
+ now=now or e.now()
+ age=(now-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()
+ if age>stale_budget(e,r['status']):return True
+ if r.get('status')=='polling':
+  try:elapsed=json.loads(r.get('detail_json') or '{}').get('cycle_elapsed_seconds')
+  except (TypeError,ValueError,AttributeError):elapsed=None
+  if elapsed is not None and elapsed>e.CFG['worker_polling_stale_seconds']:return True
+ return False
 class CycleHeartbeat:
  """Refreshes the 'polling' heartbeat every worker_heartbeat_interval_seconds while one cycle runs.
  Stops refreshing after worker_cycle_max_seconds so a genuinely hung cycle still turns stale.
@@ -336,7 +346,7 @@ def health(e,db):
   try:al.emit(e,db,info['event'],python_ok=deps.get('python_ok'),node_ok=deps.get('node_ok'),restored=[])
   except Exception:pass
  inst=_install_report(e)
- return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>stale_budget(e,r['status']))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14,'runtime_deps':{'ok':deps.get('ok'),'python_ok':deps.get('python_ok'),'node_ok':deps.get('node_ok'),'python_reason':deps.get('python_reason'),'node_reason':deps.get('node_reason'),'extra_ok':deps.get('extra_ok'),'extra_projects':deps.get('extra_projects')},'install':inst,'install_ok':bool(inst.get('ok'))}
+ return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or heartbeat_is_stale(e,r))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14,'runtime_deps':{'ok':deps.get('ok'),'python_ok':deps.get('python_ok'),'node_ok':deps.get('node_ok'),'python_reason':deps.get('python_reason'),'node_reason':deps.get('node_reason'),'extra_ok':deps.get('extra_ok'),'extra_projects':deps.get('extra_projects')},'install':inst,'install_ok':bool(inst.get('ok'))}
 def preflight(e,db):
  r=rd.ensure();info=rd.report_for_audit(r)
  al.emit(e,db,info['event'],python_ok=r.get('python_ok'),node_ok=r.get('node_ok'),restored=r.get('restored') or [],outcome='ok' if r.get('ok') else 'failed',severity='INFO' if r.get('ok') else 'ERROR')

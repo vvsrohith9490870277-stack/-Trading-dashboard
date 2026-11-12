@@ -138,4 +138,21 @@ class HelperTests(unittest.TestCase):
   self.assertEqual(r['polls'],1);h=seen['h'];self.assertIsNotNone(h);self.assertIsNone(self.db.helper);self.assertTrue(h.closed)
   self.assertGreater(h.stats['helper_ok'],0)
   hb=a.health(e,self.db)['heartbeat'];self.assertEqual(hb['status'],'stopped');self.assertIn('db_helper',json.loads(hb['detail_json']))
+ def test_hung_per_call_raises_helper_timeout_within_budget(self):
+  """A hung db.mjs path must fail closed as HELPER_TIMEOUT inside the configured per-call timeout."""
+  import audit as al
+  seen=[];real_run=__import__('subprocess').run
+  def fake_run(args,*a,**k):
+   seen.append(k.get('timeout'))
+   return real_run([sys.executable,'-c','import time; time.sleep(5)'],timeout=k.get('timeout'),capture_output=True,text=True)
+  db=e.DB()
+  with patch.dict(e.CFG['db_helper'],per_call_timeout_seconds=0.4),patch.object(e.subprocess,'run',side_effect=fake_run):
+   t0=time.monotonic()
+   with self.assertRaises(RuntimeError) as ctx:
+    db._call_per_process({'action':'query','sql':'SELECT 1','args':[]})
+   self.assertEqual(str(ctx.exception),'HELPER_TIMEOUT')
+   self.assertLess(time.monotonic()-t0,2)
+  self.assertEqual(seen,[0.4])
+  self.assertEqual(al.classified_error(ctx.exception),'HELPER_TIMEOUT')
 if __name__=='__main__':unittest.main()
+

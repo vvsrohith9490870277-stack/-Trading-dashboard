@@ -24,14 +24,14 @@
   ],
   "special_session_note": "Conservative stop at15:15 before CAS; no CAS/postclose fills. Explicit validity window; unverified future calendars fail closed.",
   "guardian_seconds": 60,
-  "worker_stale_seconds": 120,
-  "worker_polling_stale_seconds": 300,
+  "worker_stale_seconds": 90,
+  "worker_polling_stale_seconds": 90,
   "worker_heartbeat_interval_seconds": 30,
-  "worker_cycle_max_seconds": 600,
+  "worker_cycle_max_seconds": 90,
   "worker_stop_wait_seconds": 20,
   "worker_backoff_max_seconds": 30,
   "guardian_gap_grace_seconds": 150,
-  "worker_supervision_note": "Idle heartbeat budget stays worker_stale_seconds. A cycle in progress refreshes its polling heartbeat every worker_heartbeat_interval_seconds up to worker_cycle_max_seconds; polling may then age worker_polling_stale_seconds (12-symbol depth batch ~15s + two 65s rate-limit backoffs + ~90s worst observed post-quote work + pnl). Failure and rate-limit sleep is capped at worker_backoff_max_seconds so a failed cycle cannot stay dark past worker_stale_seconds. After signalling a stale worker the supervisor waits up to worker_stop_wait_seconds for the lease and starts the replacement in the same call. A guardian whose own checks were more than guardian_gap_grace_seconds apart defers killing for one check.",
+  "worker_supervision_note": "Idle and in-cycle heartbeats go stale after worker_stale_seconds / worker_polling_stale_seconds (~90s). A cycle in progress refreshes its polling heartbeat every worker_heartbeat_interval_seconds up to worker_cycle_max_seconds; a cycle whose elapsed time already exceeds worker_polling_stale_seconds is also stale even if the beat is fresh. Every Turso helper and per-call db.mjs path has a hard timeout (db_helper query/batch/per_call). Failure and rate-limit sleep is capped at worker_backoff_max_seconds. After signalling a stale worker the supervisor waits up to worker_stop_wait_seconds for the lease and starts the replacement in the same call. A guardian whose own checks were more than guardian_gap_grace_seconds apart defers killing for one check. Before the official open the guardian sleeps until the open instead of a full guardian_seconds tick.",
   "support_observation_only": true,
   "adaptive_observation_only": true,
   "regular_session": [
@@ -53,7 +53,7 @@
   "db_helper": {
     "enabled": true,
     "query_timeout_seconds": 30,
-    "batch_timeout_seconds": 120,
+    "batch_timeout_seconds": 30,
     "start_timeout_seconds": 20,
     "read_retries": 2,
     "write_connect_retries": 2,
@@ -62,10 +62,11 @@
     "max_restarts": 5,
     "restart_window_seconds": 600,
     "shutdown_timeout_seconds": 5,
-    "note": "Worker-only persistent Turso connection for query/batch (db_helper.mjs). Reads retry on transient/helper failures then fall back to per-call db.mjs; writes are re-sent only when they never reached Turso. enabled=false restores the per-call path everywhere."
+    "note": "Worker-only persistent Turso connection for query/batch (db_helper.mjs). Every query, batch, and per-call db.mjs path has a hard timeout so a hung Turso call cannot stall a monitor cycle past the coverage budget. Reads retry on transient/helper failures then fall back to per-call db.mjs; writes are re-sent only when they never reached Turso. enabled=false restores the per-call path everywhere.",
+    "per_call_timeout_seconds": 30
   },
   "pnl_prior_close_query_chunk": 50,
-  "backoff_heartbeat_stale_seconds": 600,
+  "backoff_heartbeat_stale_seconds": 90,
   "market_data": {
     "routes": {
       "quotes": "https://api-t1.fyers.in/data/quotes",

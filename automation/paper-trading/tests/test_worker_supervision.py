@@ -31,8 +31,14 @@ class WorkerSupervisionTests(unittest.TestCase):
   self.db.batch([('INSERT INTO paper_monitor_health(namespace,pid,heartbeat_at,status,detail_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace) DO UPDATE SET pid=excluded.pid,heartbeat_at=excluded.heartbeat_at,status=excluded.status,detail_json=excluded.detail_json',(e.NS,pid,(T-timedelta(seconds=age)).isoformat(),status,json.dumps({'process_start':'42'})))])
  def test_config_keys_present_and_polling_budget_above_idle(self):
   for k in ['worker_polling_stale_seconds','worker_heartbeat_interval_seconds','worker_cycle_max_seconds','worker_stop_wait_seconds','guardian_gap_grace_seconds']:self.assertIn(k,e.CFG)
-  self.assertGreater(e.CFG['worker_polling_stale_seconds'],e.CFG['worker_stale_seconds'])
-  self.assertGreater(e.CFG['worker_polling_stale_seconds'],e.CFG['market_data']['rate_limit_backoff_seconds']*2)
+  self.assertGreaterEqual(e.CFG['worker_polling_stale_seconds'],e.CFG['worker_stale_seconds'])
+  self.assertLessEqual(e.CFG['worker_stale_seconds'],90)
+  self.assertLessEqual(e.CFG['worker_polling_stale_seconds'],90)
+  # Backoff is capped at worker_backoff_max_seconds (not two 65s rate-limit sleeps), so 90s is enough.
+  self.assertGreater(e.CFG['worker_polling_stale_seconds'],e.CFG['worker_backoff_max_seconds'])
+  h=e.CFG['db_helper']
+  for k in ('query_timeout_seconds','batch_timeout_seconds','per_call_timeout_seconds'):
+   self.assertIn(k,h);self.assertLessEqual(h[k],e.CFG['worker_polling_stale_seconds'])
   self.assertLess(e.CFG['worker_heartbeat_interval_seconds'],e.CFG['worker_stale_seconds'])
  def test_stale_budget_by_status(self):
   self.assertEqual(a.stale_budget(e,'polling'),e.CFG['worker_polling_stale_seconds'])
@@ -40,9 +46,15 @@ class WorkerSupervisionTests(unittest.TestCase):
   self.assertEqual(a.stale_budget(e,'backoff'),e.CFG['backoff_heartbeat_stale_seconds'])
  def test_polling_heartbeat_uses_polling_budget(self):
   idle=e.CFG['worker_stale_seconds'];busy=e.CFG['worker_polling_stale_seconds']
-  self.set_heartbeat('polling',idle+10);self.assertFalse(a.health(e,self.db)['heartbeat_stale'])
+  self.set_heartbeat('polling',max(1,busy-10));self.assertFalse(a.health(e,self.db)['heartbeat_stale'])
   self.set_heartbeat('polling',busy+10);self.assertTrue(a.health(e,self.db)['heartbeat_stale'])
   self.set_heartbeat('healthy',idle+10);self.assertTrue(a.health(e,self.db)['heartbeat_stale'])
+ def test_long_cycle_elapsed_is_stale_even_if_heartbeat_is_fresh(self):
+  busy=e.CFG['worker_polling_stale_seconds']
+  self.db.batch([('INSERT INTO paper_monitor_health(namespace,pid,heartbeat_at,status,detail_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace) DO UPDATE SET pid=excluded.pid,heartbeat_at=excluded.heartbeat_at,status=excluded.status,detail_json=excluded.detail_json',(e.NS,123456789,T.isoformat(),'polling',json.dumps({'process_start':'42','cycle_elapsed_seconds':busy+1})))])
+  self.assertTrue(a.health(e,self.db)['heartbeat_stale'])
+  self.db.batch([('INSERT INTO paper_monitor_health(namespace,pid,heartbeat_at,status,detail_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace) DO UPDATE SET pid=excluded.pid,heartbeat_at=excluded.heartbeat_at,status=excluded.status,detail_json=excluded.detail_json',(e.NS,123456789,T.isoformat(),'polling',json.dumps({'process_start':'42','cycle_elapsed_seconds':busy-10})))])
+  self.assertFalse(a.health(e,self.db)['heartbeat_stale'])
  def test_cycle_heartbeat_refreshes_during_slow_cycle(self):
   beats=[]
   with patch.dict(e.CFG,{'worker_heartbeat_interval_seconds':0.02,'worker_cycle_max_seconds':60}),patch.object(a,'heartbeat',side_effect=lambda e_,db,status,**d:beats.append((status,d))):
@@ -144,4 +156,13 @@ class GuardianGapTests(unittest.TestCase):
  def test_guardian_gap_defers_signal_for_one_check(self):
   calls,_=self.run_with_gaps([60,self.e.CFG['guardian_gap_grace_seconds']+120,60])
   self.assertEqual(calls,[{},{},{'defer_stale_signal':True},{}])
+ def test_preopen_sleep_wakes_at_official_open(self):
+  self.t=datetime(2026,11,12,9,14,30,tzinfo=e.IST)
+  wait=g.next_sleep(self.e,time.monotonic())
+  self.assertGreater(wait,0)
+  self.assertLessEqual(wait,30)
+  self.assertLess(wait,self.e.CFG['guardian_seconds'])
+  self.t=datetime(2026,11,12,10,0,tzinfo=e.IST)
+  mid=g.next_sleep(self.e,time.monotonic())
+  self.assertGreater(mid,50)
 if __name__=='__main__':unittest.main()

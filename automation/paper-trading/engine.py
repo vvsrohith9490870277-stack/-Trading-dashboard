@@ -53,9 +53,13 @@ class DB:
  def call(self,a):
   if self.helper is not None and a.get('action') in ('query','batch'):return self.helper.call(a)
   return self._call_per_process(a)
+ def _call_timeout(self):
+  h=CFG.get('db_helper') or {}
+  return float(h.get('per_call_timeout_seconds') or h.get('batch_timeout_seconds') or 30)
  def _call_per_process(self,a):
   if self.test_database:a={**a,'test_database':self.test_database}
-  r=subprocess.run(['node',str(ROOT/'db.mjs')],input=js(a),text=True,capture_output=True,timeout=120)
+  try:r=subprocess.run(['node',str(ROOT/'db.mjs')],input=js(a),text=True,capture_output=True,timeout=self._call_timeout())
+  except subprocess.TimeoutExpired as ex:raise RuntimeError('HELPER_TIMEOUT') from ex
   if r.returncode:
    try:code=json.loads(r.stderr).get('code','Turso_operation_failed')
    except (ValueError,AttributeError):code='Turso_operation_failed'

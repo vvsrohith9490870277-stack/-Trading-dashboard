@@ -7,6 +7,14 @@ SCHEMA='CREATE TABLE IF NOT EXISTS paper_guardian_health(namespace TEXT PRIMARY 
 def armable(e,t):
  s=e.session(t.date())
  return bool(s and t.weekday()<5 and walltime(8,30)<=t.time().replace(tzinfo=None)<min(s[1],walltime(15,30)))
+def next_sleep(e,tick,clock=time.monotonic):
+ """After a check, sleep the remaining guardian interval — unless the session is not yet open, in which case wake at the official open instead of waiting a full minute past 09:15."""
+ remaining=max(0,e.CFG['guardian_seconds']-(clock()-tick))
+ now=e.now();s=e.session(now.date()) if armable(e,now) else None
+ if s and now.timetz().replace(tzinfo=None)<s[0]:
+  open_at=datetime.combine(now.date(),s[0],tzinfo=now.tzinfo)
+  return max(0,min(remaining or e.CFG['guardian_seconds'],(open_at-now).total_seconds()))
+ return remaining
 def identity(pid,root,command,start):
  try:
   p=Path('/proc')/str(pid);return p.joinpath('stat').read_text().split()[21]==str(start) and str(root/'engine.py').encode() in p.joinpath('cmdline').read_bytes().split(b'\0') and command.encode() in p.joinpath('cmdline').read_bytes().split(b'\0') and p.joinpath('cwd').resolve()==root
@@ -48,7 +56,7 @@ def run(e,db,sleep=time.sleep,max_checks=480):
     else:al.emit(e,db,'guardian_armed',status='waiting_for_verified_open',guardian_seconds=e.CFG['guardian_seconds'],missed_checks=int(lag//e.CFG['guardian_seconds']))
    except Exception as ex:
     al.emit(e,db,'guardian_failure',outcome='failed',severity='ERROR',error_code=type(ex).__name__,missed_checks=int(lag//e.CFG['guardian_seconds']))
-   checks+=1;sleep(max(0,e.CFG['guardian_seconds']-(time.monotonic()-tick)))
+   checks+=1;sleep(next_sleep(e,tick))
   getattr(e.au,'reap_children',lambda:0)()
   heartbeat(e,db,'stopped');al.emit(e,db,'guardian_stopped',reason='session_ended' if not armable(e,e.now()) else 'bound_reached',count=checks)
   return {'status':'session_finished','checks':checks,'guardian_seconds':e.CFG['guardian_seconds']}
