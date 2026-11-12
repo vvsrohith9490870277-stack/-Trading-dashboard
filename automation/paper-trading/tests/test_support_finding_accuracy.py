@@ -237,6 +237,94 @@ class FindingAccuracy(unittest.TestCase):
         self.run_det('2026-11-11T16:45:00+05:30')
         self.assertEqual(len(self.findings('exit_path_unexercised')), 1)
 
+    def test_exit_selftest_survives_cleanup_when_only_payload_namespace_remains(self):
+        # Production shape after --cleanup-only: Turso paper_exit_test_* rows are gone,
+        # and engine.jsonl rows were merged under paper_v1 with the real namespace
+        # and command only inside data_json.
+        self.fill('2026-11-11T09:16:00+05:30', side='BUY', symbol='ENGINERSIN-EQ', price=310.16)
+        self.ev(
+            '2026-11-11T10:47:29+05:30',
+            'command_completed',
+            ns='paper_v1',
+            extra={
+                'at_IST': '2026-11-11T10:47:29+05:30',
+                'namespace': 'paper_exit_test_v1',
+                'kind': 'command_completed',
+                'command': 'exit-selftest',
+                'status': 'ok',
+            },
+        )
+        self.ev(
+            '2026-11-11T10:46:49+05:30',
+            'paper_fill_attempt',
+            ns='paper_v1',
+            extra={
+                'namespace': 'paper_exit_test_v1',
+                'kind': 'paper_fill_attempt',
+                'symbol': 'RELIANCE-EQ',
+                'result': {'filled': True, 'side': 'SELL', 'symbol': 'RELIANCE-EQ', 'rule': 'trail_touch'},
+            },
+        )
+        self.run_det('2026-11-11T16:45:00+05:30')
+        self.assertEqual(self.findings('exit_path_unexercised'), [])
+
+    def test_exit_selftest_durable_record_survives_missing_events(self):
+        import os, tempfile
+        from pathlib import Path as P
+        import support_exit_evidence as evd
+        self.fill('2026-11-11T09:16:00+05:30', side='BUY', symbol='TANLA-EQ', price=695.36)
+        with tempfile.TemporaryDirectory() as td:
+            path = P(td) / 'exit-selftest-evidence.json'
+            evd.write_durable_evidence(path, {
+                'session_day': DAY,
+                'exercised': True,
+                'sells': 4,
+                'stop_or_target_hits': 2,
+                'exit_selftest_commands': 2,
+                'samples': [{'at': '2026-11-11T10:47:29+05:30', 'namespace': 'paper_exit_test_v1', 'command': 'exit-selftest'}],
+                'source': 'test',
+            }, session_day=DAY)
+            old = os.environ.get('SUPPORT_EXIT_SELFTEST_EVIDENCE')
+            os.environ['SUPPORT_EXIT_SELFTEST_EVIDENCE'] = str(path)
+            try:
+                self.run_det('2026-11-11T16:45:00+05:30')
+            finally:
+                if old is None:
+                    os.environ.pop('SUPPORT_EXIT_SELFTEST_EVIDENCE', None)
+                else:
+                    os.environ['SUPPORT_EXIT_SELFTEST_EVIDENCE'] = old
+        self.assertEqual(self.findings('exit_path_unexercised'), [])
+
+    def test_prior_exit_path_finding_is_resolved_when_selftest_evidence_appears(self):
+        self.fill('2026-11-11T09:16:00+05:30', side='BUY', symbol='DELTACORP-EQ', price=83.55)
+        self.run_det('2026-11-11T16:45:00+05:30')
+        open_rows = [f for f in self.findings('exit_path_unexercised') if f['status'] == 'OPEN']
+        self.assertEqual(len(open_rows), 1)
+        self.ev(
+            '2026-11-11T11:22:35+05:30',
+            'command_completed',
+            ns='paper_v1',
+            extra={'namespace': 'paper_exit_test_v1', 'kind': 'command_completed', 'command': 'exit-selftest', 'status': 'ok'},
+        )
+        self.run_det('2026-11-11T16:46:00+05:30')
+        rows = self.findings('exit_path_unexercised')
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]['status'], 'RESOLVED')
+
+    def test_session_ledger_fills_use_paper_fills_price_not_order_event_quote(self):
+        self.fill('2026-11-11T09:16:00+05:30', side='BUY', symbol='ENGINERSIN-EQ', price=310.16, qty=161)
+        self.fill('2026-11-11T09:16:11+05:30', side='BUY', symbol='TANLA-EQ', price=695.36, qty=71)
+        self.ev('2026-11-11T09:16:00+05:30', 'paper_order_executed',
+                data={'side': 'BUY', 'quantity': 161, 'price': 310.0}, symbol='ENGINERSIN-EQ')
+        self.ev('2026-11-11T09:16:11+05:30', 'paper_order_executed',
+                data={'side': 'BUY', 'quantity': 71, 'price': 695.0}, symbol='TANLA-EQ')
+        fills = sa.session_ledger_fills(self.tdb, NS, DAY)
+        by_sym = {f['symbol']: f['fill_price'] for f in fills}
+        self.assertEqual(by_sym['ENGINERSIN-EQ'], 310.16)
+        self.assertEqual(by_sym['TANLA-EQ'], 695.36)
+        self.assertNotIn(310.0, by_sym.values())
+        self.assertNotIn(695.0, by_sym.values())
+
 
 if __name__ == '__main__':
     unittest.main()

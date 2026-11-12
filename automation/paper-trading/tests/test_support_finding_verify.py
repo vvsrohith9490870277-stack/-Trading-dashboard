@@ -281,6 +281,65 @@ class FindingVerifiers(unittest.TestCase):
         self.assertEqual(rec['status'], 'rejected')
         self.assertEqual([v['verdict'] for v in rec['verifiers']], ['REJECT', 'REJECT'])
 
+    def test_exit_path_rejected_when_selftest_only_in_remapped_payload(self):
+        # Cleanup deleted paper_exit_test_* rows. Snapshot only has paper_v1 engine-log
+        # merges whose data_json still carries the real namespace and command.
+        payload = json.dumps({
+            'at_IST': f'{DAY}T10:47:29+05:30',
+            'namespace': 'paper_exit_test_v1',
+            'kind': 'command_completed',
+            'command': 'exit-selftest',
+            'status': 'ok',
+        })
+        snap = _snap([
+            {'namespace': NS, 'event_type': 'command_completed', 'source_at': f'{DAY}T10:47:29+05:30',
+             'data_json': payload},
+        ], fills=[{'symbol': 'ENGINERSIN-EQ', 'side': 'BUY', 'price': 310.16, 'qty': 161,
+                   'filled_at': f'{DAY}T09:16:00+05:30'}])
+        tmp = Path(tempfile.mkdtemp())
+        engine, audit = _logs(tmp, engine_rows=[
+            {'kind': 'command_completed', 'command': 'exit-selftest', 'status': 'ok',
+             'at_IST': f'{DAY}T10:47:29+05:30', 'namespace': 'paper_exit_test_v1'},
+        ])
+        rec = sfv.verify_findings([_finding('exit_path_unexercised', severity='SEV4')], snapshot_path=snap,
+                                  engine_path=engine, audit_path=audit, namespace=NS, session_day=DAY,
+                                  now_ist=_now('16:45'))['findings'][0]
+        self.assertEqual(rec['status'], 'rejected')
+        self.assertEqual([v['verdict'] for v in rec['verifiers']], ['REJECT', 'REJECT'])
+
+    def test_exit_path_events_sql_rejects_from_durable_record_alone(self):
+        import os
+        import support_exit_evidence as evd
+        snap = _snap([], fills=[{'symbol': 'TANLA-EQ', 'side': 'BUY', 'price': 695.36, 'qty': 71,
+                                 'filled_at': f'{DAY}T09:16:11+05:30'}])
+        tmp = Path(tempfile.mkdtemp())
+        # No useful engine/audit lines — only the durable record.
+        engine, audit = _logs(tmp, engine_rows=[{'kind': 'heartbeat', 'at_IST': f'{DAY}T09:20:00+05:30', 'namespace': NS}])
+        path = tmp / 'exit-selftest-evidence.json'
+        evd.write_durable_evidence(path, {
+            'session_day': DAY,
+            'exercised': True,
+            'sells': 4,
+            'stop_or_target_hits': 1,
+            'exit_selftest_commands': 2,
+            'samples': [{'at': f'{DAY}T10:47:29+05:30', 'namespace': 'paper_exit_test_v1', 'command': 'exit-selftest'}],
+        }, session_day=DAY)
+        old = os.environ.get('SUPPORT_EXIT_SELFTEST_EVIDENCE')
+        os.environ['SUPPORT_EXIT_SELFTEST_EVIDENCE'] = str(path)
+        try:
+            rec = sfv.verify_findings([_finding('exit_path_unexercised', severity='SEV4')], snapshot_path=snap,
+                                      engine_path=engine, audit_path=audit, namespace=NS, session_day=DAY,
+                                      now_ist=_now('16:45'))['findings'][0]
+        finally:
+            if old is None:
+                os.environ.pop('SUPPORT_EXIT_SELFTEST_EVIDENCE', None)
+            else:
+                os.environ['SUPPORT_EXIT_SELFTEST_EVIDENCE'] = old
+        vmap = {v['verifier_id']: v['verdict'] for v in rec['verifiers']}
+        self.assertEqual(vmap['events_sql'], 'REJECT')
+        self.assertEqual(vmap['log_files'], 'REJECT')
+        self.assertEqual(rec['status'], 'rejected')
+
 
 if __name__ == '__main__':
     unittest.main()

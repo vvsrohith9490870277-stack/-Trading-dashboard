@@ -121,7 +121,10 @@ def derived_counts(root=None):
     }
 
 
-from support_exit_evidence import EXIT_SELFTEST_NS_PREFIX, exit_selftest_evidence, is_exit_selftest_namespace  # noqa: E402
+from support_exit_evidence import (  # noqa: E402
+    EXIT_SELFTEST_NS_PREFIX, combine_selftest_evidence, exit_selftest_evidence,
+    is_exit_selftest_namespace, load_durable_evidence,
+)
 
 def ist_now():
     """Return current timezone-aware timestamp in Asia/Kolkata."""
@@ -1667,13 +1670,32 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                     selftest_rows.append({**f, 'event_type': 'paper_fill', 'source_at': f['filled_at']})
         except Exception:
             pass
-        selftest = exit_selftest_evidence(selftest_rows, session_day, now_ist)
+        selftest = combine_selftest_evidence(
+            exit_selftest_evidence(selftest_rows, session_day, now_ist),
+            load_durable_evidence(session_day),
+        )
         if not sell_fills and not stop_events and not selftest['exercised']:
             emit('exit_path_unexercised', f'exit_path_unexercised:{session_day}', session_end.isoformat(), 'SEV4', {
                 'sell_fills': 0,
                 'stop_or_target_hits': 0,
                 'exit_selftest': selftest,
             })
+        elif selftest['exercised'] or sell_fills or stop_events:
+            existing = [
+                f for f in current_findings(db, namespace, session_day)
+                if f['detector'] == 'exit_path_unexercised' and f['status'] == 'OPEN'
+            ]
+            for f in existing:
+                transition_finding(
+                    db, namespace, f['finding_id'], 'RESOLVED',
+                    note='exit_selftest_evidence',
+                    recorded_at=stamp,
+                    extra_details={
+                        'sell_fills': len(sell_fills),
+                        'stop_or_target_hits': len(stop_events),
+                        'exit_selftest': selftest,
+                    },
+                )
 
     # 10. EOD expectation (16:15 + 20m grace = 16:35 IST) -> eod_missed (SEV1)
     eod_exp = exp['eod_reconciliation']
@@ -1852,6 +1874,50 @@ def run_virtual_clock_replay(support_db, trading_db, namespace='paper_v1', sessi
         'not_evaluable': last_out['not_evaluable'] if last_out else {},
         'chain_failures': verify_findings_chain(support_db, namespace),
     }
+
+
+
+def session_ledger_fills(reader, namespace, session_day, now_ist=None):
+    """Today's paper_fills rows with the ledger fill price (paper_fills.price).
+
+    Never falls back to paper_order_executed / quote prices, which can differ
+    from the slippage-adjusted ledger price. Missing fills are omitted, not invented.
+    """
+    session_day = ist_session_day(session_day)
+    try:
+        rows = reader.query(
+            'SELECT symbol, strategy, side, qty, price, filled_at, execution_path, signal_id '
+            'FROM paper_fills WHERE namespace=? ORDER BY filled_at',
+            (namespace,),
+        ) or []
+    except Exception:
+        return []
+    out = []
+    for f in rows:
+        at = f.get('filled_at')
+        if not at:
+            continue
+        try:
+            if ist_session_day(at) != session_day:
+                continue
+            if now_ist is not None and parse_ist(at) > parse_ist(now_ist):
+                continue
+        except Exception:
+            continue
+        price = f.get('price')
+        if price is None:
+            continue
+        out.append({
+            'symbol': f.get('symbol'),
+            'strategy': f.get('strategy'),
+            'side': f.get('side'),
+            'qty': f.get('qty'),
+            'fill_price': price,
+            'filled_at': at,
+            'execution_path': f.get('execution_path'),
+            'signal_id': f.get('signal_id'),
+        })
+    return out
 
 
 def session_report(db, namespace, session_day, out_dir=None, write_markdown=False):

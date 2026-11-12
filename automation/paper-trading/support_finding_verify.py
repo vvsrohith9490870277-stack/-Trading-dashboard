@@ -582,9 +582,11 @@ def check_exit_events(snap, finding, namespace, session_day, now_ist):
     stops = query_events(snap, namespace, session_day, types=('stop_hit', 'target_hit', 'trail_stop_filled'))
     selftest_rows = []
     try:
+        # Include paper_v1 snapshot rows: engine-log merges may have remapped
+        # paper_exit_test_* onto paper_v1, with the real namespace in data_json.
         selftest_rows.extend(snap.query(
-            "SELECT * FROM paper_events WHERE namespace LIKE ? AND session_day=?",
-            ('paper_exit_test%', session_day),
+            "SELECT * FROM paper_events WHERE session_day=?",
+            (session_day,),
         ) or [])
     except Exception:
         pass
@@ -594,8 +596,11 @@ def check_exit_events(snap, finding, namespace, session_day, now_ist):
                 selftest_rows.append({**f, 'event_type': 'paper_fill', 'source_at': f['filled_at']})
     except Exception:
         pass
-    from support_exit_evidence import exit_selftest_evidence
-    selftest = exit_selftest_evidence(selftest_rows, session_day, now_ist)
+    from support_exit_evidence import combine_selftest_evidence, exit_selftest_evidence, load_durable_evidence
+    selftest = combine_selftest_evidence(
+        exit_selftest_evidence(selftest_rows, session_day, now_ist),
+        load_durable_evidence(session_day),
+    )
     ev = {'sell_fills': len(sells), 'stop_or_target_hits': len(stops), 'exit_selftest': selftest}
     warranted = len(sells) == 0 and len(stops) == 0 and not selftest['exercised']
     return _verdict(warranted, reject_reason='sell_or_stop_present' if (sells or stops) else 'exit_selftest_exercised', evidence=ev)
@@ -622,8 +627,11 @@ def check_exit_logs(logs, finding, session_day, now_ist):
             stops.append(k)
     if not logs:
         return _verdict(False, not_verifiable='log_files_missing_or_empty')
-    from support_exit_evidence import exit_selftest_evidence
-    selftest = exit_selftest_evidence(logs, session_day, now_ist)
+    from support_exit_evidence import combine_selftest_evidence, exit_selftest_evidence, load_durable_evidence
+    selftest = combine_selftest_evidence(
+        exit_selftest_evidence(logs, session_day, now_ist),
+        load_durable_evidence(session_day),
+    )
     ev = {'sell_like': len(sells), 'stop_like': len(stops), 'exit_selftest': selftest}
     warranted = len(sells) == 0 and len(stops) == 0 and not selftest['exercised']
     return _verdict(warranted, reject_reason='sell_or_stop_present_in_logs' if (sells or stops) else 'exit_selftest_exercised', evidence=ev)

@@ -67,8 +67,8 @@ def engine_log_events(path, session_day, namespace):
                        if not any(s in k.lower() for s in ('token', 'secret', 'password', 'authorization', 'cookie', 'api_key'))}
             event_type = 'reference_feeds' if kind == 'reference_feeds' else kind
             out.append({
-                'namespace': namespace,
-                'event_id': _safe_event_id(kind, at, str(ev.get('trade_day') or ev.get('command') or '')),
+                'namespace': ev_ns or namespace,
+                'event_id': _safe_event_id(kind, at, str(ev.get('trade_day') or ev.get('command') or ev_ns or '')),
                 'run_id': str(ev.get('run_id') or ev.get('batch_id') or 'engine.jsonl'),
                 'session_day': session_day,
                 'source_at': at,
@@ -97,11 +97,12 @@ def merge_engine_events(snap_path, events):
     added = 0
     for ev in events:
         try:
-            c.execute(
+            cur = c.execute(
                 f'INSERT OR IGNORE INTO paper_events({",".join(cols)}) VALUES({",".join("?" * len(cols))})',
                 tuple(ev[k] for k in cols),
             )
-            added += c.rowcount
+            if cur.rowcount and cur.rowcount > 0:
+                added += int(cur.rowcount)
         except Exception:
             continue
     c.commit(); c.close()
@@ -140,6 +141,24 @@ def main(argv=None):
     findings_path = Path(os.environ.get('SUPPORT_FINDINGS_DB') or (STATE / 'support' / 'findings.sqlite'))
     store = sa.SupportStore(findings_path)
 
+    # Durable sanitized exit-selftest evidence (survives Turso --cleanup-only and log rotation).
+    import support_exit_evidence as evd
+    ev_rows = list(engine_events)
+    try:
+        ev_rows.extend(trading.query('SELECT * FROM paper_events WHERE session_day=?', (day,)) or [])
+        for f in (trading.query("SELECT * FROM paper_fills WHERE namespace LIKE ?", ('paper_exit_test%',)) or []):
+            if f.get('filled_at'):
+                ev_rows.append({**f, 'event_type': 'paper_fill', 'source_at': f['filled_at']})
+    except Exception:
+        pass
+    now_for_ev = a.now if a.now else datetime.now(IST)
+    evidence = evd.exit_selftest_evidence(ev_rows, day, now_for_ev)
+    evidence['session_day'] = day
+    evidence['source'] = 'engine.jsonl+snapshot'
+    if evidence.get('exercised'):
+        evd.write_durable_evidence(out_dir / 'exit-selftest-evidence.json', evidence, session_day=day)
+        evd.write_durable_evidence(STATE / 'support' / f'exit-selftest-evidence-{day}.json', evidence, session_day=day)
+
     ticks = None
     if a.now:
         ticks = [a.now]
@@ -174,12 +193,21 @@ def main(argv=None):
         'audit_parity': parity, 'disk_free_pct': round(100.0 * du.free / du.total, 1),
         'actions_taken': 'none (no patch, no install, no notification, no orders)',
         'engine_log': str(engine_path), 'engine_log_exists': engine_path.exists(),
+        'session_fills': sa.session_ledger_fills(trading, ns, day),
     }
     (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2, default=str))
     md = [f'# Support Agent findings — {day} (read-only)', '',
           f"Findings: **{summary['findings_total']}** — " + ', '.join(f'{k}: {v}' for k, v in summary['by_severity'].items()), '',
           '| Severity | Detector | Count |', '|---|---|---|']
     md += [f"| {x['severity']} | {x['detector']} | {x['count']} |" for x in summary['by_detector']]
+    fills = summary.get('session_fills') or []
+    if fills:
+        md += ['', '## Session fills (ledger `paper_fills.price`, not the raw quote)', '',
+               '| Symbol | Side | Qty | Fill price | Filled at (IST) | Path |', '|---|---|---|---|---|---|']
+        for f in fills:
+            md.append(
+                f"| {f.get('symbol')} | {f.get('side')} | {f.get('qty')} | {f.get('fill_price')} | {f.get('filled_at')} | {f.get('execution_path') or ''} |"
+            )
     md += ['', f"Not evaluable: {json.dumps(summary['not_evaluable'], default=str)}",
            f"Audit spool vs Turso paper_events: {json.dumps({k: v for k, v in parity.items() if k != 'top_event_types'})}",
            f"Hash-chain failures: {len(summary['chain_failures'])}",

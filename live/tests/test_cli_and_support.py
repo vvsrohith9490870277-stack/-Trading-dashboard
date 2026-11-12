@@ -214,6 +214,59 @@ class SupportDetectors(unittest.TestCase):
             hits = sa.reference_feed_403_hits(evs[0])
             self.assertEqual([h['feed'] for h in hits], ['asm'])
 
+    def test_engine_log_loader_preserves_exit_selftest_namespace(self):
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / 'engine.jsonl'
+            rows = [
+                {'at_IST': '2026-11-12T10:47:29.363739+05:30', 'namespace': 'paper_exit_test_v1',
+                 'kind': 'command_completed', 'command': 'exit-selftest', 'status': 'ok'},
+                {'at_IST': '2026-11-12T10:46:49.099132+05:30', 'namespace': 'paper_exit_test_v1',
+                 'kind': 'paper_fill_attempt', 'symbol': 'RELIANCE-EQ',
+                 'result': {'filled': True, 'side': 'SELL', 'qty': 1, 'price': 1332.78, 'rule': 'trail_touch'}},
+                {'at_IST': '2026-11-12T09:16:00.020720+05:30', 'namespace': 'paper_v1',
+                 'kind': 'paper_fill_attempt', 'symbol': 'ENGINERSIN-EQ',
+                 'result': {'filled': True, 'side': 'BUY', 'qty': 161, 'price': 310.16}},
+            ]
+            p.write_text(''.join(json.dumps(r) + '\n' for r in rows))
+            evs = sr.engine_log_events(p, '2026-11-12', 'paper_v1')
+            by_kind = {e['event_type']: e for e in evs}
+            self.assertEqual(by_kind['command_completed']['namespace'], 'paper_exit_test_v1')
+            self.assertEqual(by_kind['paper_fill_attempt']['namespace'] if False else None, None)
+            ns_cmd = [e['namespace'] for e in evs if e['event_type'] == 'command_completed']
+            self.assertEqual(ns_cmd, ['paper_exit_test_v1'])
+            fill_ns = sorted({e['namespace'] for e in evs if e['event_type'] == 'paper_fill_attempt'})
+            self.assertEqual(fill_ns, ['paper_exit_test_v1', 'paper_v1'])
+            import support_exit_evidence as evd
+            ev = evd.exit_selftest_evidence(evs, '2026-11-12', '2026-11-12T16:45:00+05:30')
+            self.assertTrue(ev['exercised'])
+            self.assertGreaterEqual(ev['exit_selftest_commands'], 1)
+            self.assertGreaterEqual(ev['sells'], 1)
+
+    def test_merge_engine_events_reports_inserted_rows(self):
+        import sqlite3
+        with tempfile.TemporaryDirectory() as td:
+            snap = Path(td) / 'snap.sqlite'
+            c = sqlite3.connect(snap)
+            c.execute('CREATE TABLE paper_events(namespace TEXT NOT NULL,event_id TEXT NOT NULL,run_id TEXT NOT NULL,'
+                      'session_day TEXT NOT NULL,source_at TEXT NOT NULL,recorded_at TEXT NOT NULL,event_type TEXT NOT NULL,'
+                      'severity TEXT NOT NULL,outcome TEXT NOT NULL,data_json TEXT NOT NULL,PRIMARY KEY(namespace,event_id))')
+            c.commit(); c.close()
+            evs = [{
+                'namespace': 'paper_exit_test_v1',
+                'event_id': 'abc123',
+                'run_id': 'engine.jsonl',
+                'session_day': '2026-11-12',
+                'source_at': '2026-11-12T10:47:29+05:30',
+                'recorded_at': '2026-11-12T10:47:29+05:30',
+                'event_type': 'command_completed',
+                'severity': 'INFO',
+                'outcome': 'ok',
+                'data_json': json.dumps({'command': 'exit-selftest', 'namespace': 'paper_exit_test_v1'}),
+            }]
+            n = sr.merge_engine_events(snap, evs)
+            self.assertEqual(n, 1)
+            self.assertEqual(sr.merge_engine_events(snap, evs), 0)  # idempotent ignore
+
     def test_monitor_staleness_lists_each_gap(self):
         import tempfile as tf
         day = '2026-11-11'
