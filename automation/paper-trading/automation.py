@@ -323,19 +323,28 @@ def _wait_for_lease(lock,seconds,interval=0.5):
   except BlockingIOError:
    if time.monotonic()>=end:return False
    time.sleep(interval)
+def _install_report(e):
+ try:
+  import install_check as ic
+  return ic.check(e.ROOT,smoke_imports=False)
+ except Exception as ex:
+  return {'ok':False,'missing':[],'lock_errors':[safe_error(ex)],'locks':{'ok':False},'error':safe_error(ex)}
 def health(e,db):
  rows=db.query('SELECT * FROM paper_monitor_health WHERE namespace=?',(e.NS,));r=rows[0] if rows else None
  deps=rd.check();info=rd.report_for_audit({**deps,'healed':False,'restored':[]})
  if not deps.get('ok'):
   try:al.emit(e,db,info['event'],python_ok=deps.get('python_ok'),node_ok=deps.get('node_ok'),restored=[])
   except Exception:pass
- return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>stale_budget(e,r['status']))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14,'runtime_deps':{'ok':deps.get('ok'),'python_ok':deps.get('python_ok'),'node_ok':deps.get('node_ok'),'python_reason':deps.get('python_reason'),'node_reason':deps.get('node_reason'),'extra_ok':deps.get('extra_ok'),'extra_projects':deps.get('extra_projects')}}
+ inst=_install_report(e)
+ return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or (e.now()-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()>stale_budget(e,r['status']))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14,'runtime_deps':{'ok':deps.get('ok'),'python_ok':deps.get('python_ok'),'node_ok':deps.get('node_ok'),'python_reason':deps.get('python_reason'),'node_reason':deps.get('node_reason'),'extra_ok':deps.get('extra_ok'),'extra_projects':deps.get('extra_projects')},'install':inst,'install_ok':bool(inst.get('ok'))}
 def preflight(e,db):
  r=rd.ensure();info=rd.report_for_audit(r)
  al.emit(e,db,info['event'],python_ok=r.get('python_ok'),node_ok=r.get('node_ok'),restored=r.get('restored') or [],outcome='ok' if r.get('ok') else 'failed',severity='INFO' if r.get('ok') else 'ERROR')
  try:audit=al.ensure_daily_export(e,db,str(e.now().date()),force=False)
  except Exception as ex:audit={'status':'unavailable','reason':al.classified_error(ex)}
- return {'paper_only':True,'status':'ok' if r.get('ok') else 'runtime_deps_restore_incomplete','runtime_deps':r,'audit_export':audit,'calendar_verified':e.session(e.now().date()) is not None,'at_IST':e.now().isoformat()}
+ inst=_install_report(e)
+ status='ok' if r.get('ok') and inst.get('ok') else ('runtime_deps_restore_incomplete' if not r.get('ok') else 'install_incomplete')
+ return {'paper_only':True,'status':status,'runtime_deps':r,'audit_export':audit,'calendar_verified':e.session(e.now().date()) is not None,'at_IST':e.now().isoformat(),'install':inst,'install_ok':bool(inst.get('ok'))}
 
 def ensure_monitor(e,db,defer_stale_signal=False):
  if not active(e,e.now()):return {'status':'market_closed_or_calendar_unverified','started':False}
