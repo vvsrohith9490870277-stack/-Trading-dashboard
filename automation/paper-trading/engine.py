@@ -18,6 +18,7 @@ import corporate_actions as ca
 import pauses as pz
 import support_agent as sa
 import reference_feeds as rf
+import exit_selftest as xst
 import db_helper as dbh
 ROOT=Path(__file__).resolve().parent; LEGACY=Path('/workspace/sahil-fyers-turso'); IST=ZoneInfo('Asia/Kolkata'); CFG=json.loads((ROOT/'config.json').read_text()); PY=sys.executable
 RULES=json.loads((ROOT/'strategy_rules.json').read_text());ISINS={r['db_symbol']:r['ISIN Code'] for r in csv.DictReader((ROOT/'universe.csv').open())}
@@ -685,12 +686,12 @@ SUPERVISION_COMMANDS = ('worker', 'ensure-monitor', 'health', 'preflight', 'ensu
 READ_ONLY_COMMANDS = ('trades-today', 'status', 'positions', 'pnl', 'charges', 'finance', 'overlap', 'funnel')
 
 def uses_engine_lock(command):
-    """Exclusive engine.lock is for mutating market/session work only. Read-only reports and the reference-feed refresh do not take it (the refresh uses reference_feeds.lock so it cannot delay the 08:45 scan)."""
-    return command not in SUPERVISION_COMMANDS and command not in READ_ONLY_COMMANDS and command != 'reference-feeds'
+    """Exclusive engine.lock is for mutating market/session work only. Read-only reports, reference-feeds (its own lock), and exit-selftest (its own lock and namespace) do not take it."""
+    return command not in SUPERVISION_COMMANDS and command not in READ_ONLY_COMMANDS and command not in ('reference-feeds', 'exit-selftest')
 
 def main():
  parser=argparse.ArgumentParser(description='Paper-only Fyers-data/Turso-ledger engine; never broker orders.')
- parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);args=parser.parse_args()
+ parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history','exit-selftest']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);parser.add_argument('--cleanup-only',action='store_true');parser.add_argument('--keep',action='store_true');parser.add_argument('--max-seconds',type=int,default=1200);parser.add_argument('--max-quotes',type=int,default=40);args=parser.parse_args()
  if not 1<=args.max_history_requests<=1100 or not 1<=args.max_history_seconds<=1080:parser.error('historical repair budget outside safe bounds')
  if args.command in SUPERVISION_COMMANDS:
   # Supervision must remain reachable even while a worker/scan holds engine.lock.
@@ -717,6 +718,9 @@ def main():
    if args.command=='reference-feeds':
     with al.scope(e,db,args.command):
      out=rf.refresh(e,db,reference_day(now()));log('command_completed',command=args.command,namespace=NS);print(js(out))
+   elif args.command=='exit-selftest':
+    if not 1<=args.max_seconds<=1800 or not 1<=args.max_quotes<=80:raise ValueError('exit_selftest_bounds')
+    out=xst.cli(e,db,args);log('command_completed',command=args.command,namespace=xst.TEST_NS);print(js(out))
    else:
     if args.command=='positions':out=db.positions()
     elif args.command=='trades-today':out=[x for x in db.query('SELECT * FROM paper_fills WHERE namespace=? ORDER BY id',(NS,)) if datetime.fromisoformat(x['filled_at']).astimezone(IST).date()==now().date()]

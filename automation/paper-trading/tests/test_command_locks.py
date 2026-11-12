@@ -11,6 +11,7 @@ class CommandLockTests(unittest.TestCase):
 
     def test_reference_feeds_skips_engine_lock(self):
         self.assertFalse(e.uses_engine_lock('reference-feeds'))
+        self.assertFalse(e.uses_engine_lock('exit-selftest'))
 
     def test_scan_and_other_writers_still_take_engine_lock(self):
         for cmd in ('scan', 'monitor-once', 'probe', 'eod', 'sync-history', 'bootstrap', 'screen-only'):
