@@ -161,10 +161,6 @@ class NseFetcher:
             if r.status_code != 200:
                 raise RuntimeError('http_' + str(r.status_code))
 
-    def _on_nse(self, url):
-        host = url.split('/')[2].split(':')[0].lower() if '://' in url else ''
-        return host == self.cfg['nse_session_host'] or host.endswith('.nseindia.com') or host == 'nseindia.com'
-
     def __call__(self, url, as_json=True):
         last = 'request_failed'
         for attempt in range(self.cfg['max_attempts']):
@@ -172,7 +168,7 @@ class NseFetcher:
                 self.sleep(min(self.cfg['backoff_seconds'] * 2 ** (attempt - 1), self.cfg['backoff_max_seconds']))
             self.attempts += 1
             try:
-                if self._on_nse(url):
+                if self.cfg['nse_session_host'] in url:
                     if self.session is None:
                         self._new_session()
                     r = self.session.get(url, headers=self._headers(url), timeout=self.cfg['timeout_seconds'])

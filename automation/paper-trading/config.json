@@ -133,7 +133,7 @@
     "max_attempts": 6,
     "backoff_seconds": 2,
     "backoff_max_seconds": 15,
-    "fetch_note": "NSE refuses non-browser user agents and refuses whole sessions at random (403). Each refused session is replaced after exponential backoff (backoff_seconds doubling, capped at backoff_max_seconds) for up to max_attempts; HTML pages are never parsed as data. ASM and GSM fall back to the nsearchives CSVs only when every listed file loads. nsearchives fetches reuse the warmed NSE session.",
+    "fetch_note": "NSE refuses non-browser user agents and refuses whole sessions at random (403). Each refused session is replaced after exponential backoff (backoff_seconds doubling, capped at backoff_max_seconds) for up to max_attempts; HTML pages are never parsed as data. ASM and GSM fall back to the nsearchives CSVs only when every listed file loads.",
     "corporate_action_lookahead_days": 7
   },
   "runtime_deps": {
