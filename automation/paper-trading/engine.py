@@ -606,15 +606,18 @@ def _monitor(db,api):
   if ok and (triggered or carried):
    actions.append({'id':stable_id(p['strategy'],p['symbol'],p['entry_at'],'pending' if carried else stop_rule),'strategy':p['strategy'],'symbol':p['symbol'],'side':'SELL','bar_date':t.date().isoformat(),'eligible_date':t.date().isoformat(),'reason':'pending_exit_carry' if carried else stop_rule,'rule':None if carried else stop_rule,'expected_entry_at':p['entry_at'],'stop':True,'pending_exit':carried,'stop_level':level})
  for i in range(0,len(position_rows),50):al.emit(sys.modules[__name__],db,'position_checks',rows=position_rows[i:i+50],count=len(position_rows[i:i+50]))
- actions+=signals;day=t.date().isoformat();actions.sort(key=lambda s:entry_priority(day,s))
+ actions+=signals;day=t.date().isoformat();actions.sort(key=lambda s:entry_priority(day,s));full_sleeves=set()
  for s in actions:
   key=(s['strategy'],s['symbol'])
   if key in used:continue
+  if s.get('side')!='SELL' and s.get('strategy') in full_sleeves:continue
   q=quotes.get(s['symbol'])
   if s.get('stop') and not s.get('pending_exit') and q:
    al.emit(sys.modules[__name__],db,'risk_hit',strategy=7,symbol=s['symbol'],price=q.get('open') if s.get('rule')=='trail_gap' else s.get('stop_level'),quote_at=q.get('quote_at'),threshold=s.get('stop_level'),reason=s.get('rule') or 'observed_stop_crossing',target_defined=False)
-  r=fill(db,s,q,now())
+  # Use the post-quotes batch clock for every fill so intra-cycle work cannot age a still-fresh quote past quote_max_age_seconds.
+  r=fill(db,s,q,t)
   if r['filled']:fills+=1;used.add(key)
+  elif r.get('reason')=='SLEEVE_SLOT_FULL':full_sleeves.add(s.get('strategy'))
  # Entry-day stop cannot be hit by the exact same entry LTP; it is checked on subsequent fresh polls.
  # Positions change only through fill(); with no fill attempted this cycle the post-gate snapshot is current.
  # The price band feeds market_guard only for a carried exit's lower-circuit haircut, so it is read only then.
@@ -633,8 +636,13 @@ def monitor(db,api):
  e=sys.modules[__name__];start=time.monotonic()
  with al.scope(e,db,'monitor'):
   al.emit(e,db,'monitor_started',poll_seconds=CFG['poll_seconds'])
+  try:log('monitor_started',poll_seconds=CFG['poll_seconds'])
+  except Exception:pass
   r=_monitor(db,api)
-  al.emit(e,db,'monitor_completed',status=r.get('status'),fills=r.get('fills',0),fresh_quotes=r.get('fresh_quotes',0),duration_ms=round((time.monotonic()-start)*1000),poll_seconds=CFG['poll_seconds'])
+  duration_ms=round((time.monotonic()-start)*1000)
+  al.emit(e,db,'monitor_completed',status=r.get('status'),fills=r.get('fills',0),fresh_quotes=r.get('fresh_quotes',0),duration_ms=duration_ms,poll_seconds=CFG['poll_seconds'])
+  try:log('monitor_completed',status=r.get('status'),fills=r.get('fills',0),fresh_quotes=r.get('fresh_quotes',0),duration_ms=duration_ms,poll_seconds=CFG['poll_seconds'])
+  except Exception:pass
   return r
 
 def prior_closes(db,symbols,day,chunk=None):

@@ -96,13 +96,45 @@ class AutomationTests(unittest.TestCase):
   delays=[]
   with patch.object(e,'monitor',side_effect=RuntimeError('market_data_transport_failed')):
    a.worker(e,self.db,sleep=delays.append,max_polls=3,api_factory=lambda:object())
-  self.assertEqual(len(delays),3);self.assertTrue(all(30<d<=300 for d in delays));self.assertLess(delays[0],delays[-1])
+  cap=int(e.CFG['worker_backoff_max_seconds'])
+  self.assertEqual(len(delays),3);self.assertTrue(all(0<d<=cap for d in delays));self.assertLessEqual(cap,e.CFG['worker_stale_seconds'])
  def test_rate_limit_cooloff_is_not_consumed_by_cycle_elapsed(self):
   delays=[]
   with patch.object(e,'monitor',side_effect=RuntimeError('market_data_rate_limit')):
    a.worker(e,self.db,sleep=delays.append,max_polls=2,api_factory=lambda:object())
-  cool=int(e.CFG['market_data'].get('rate_limit_cooloff_seconds',180))
-  self.assertEqual(len(delays),2);self.assertTrue(all(d>=cool for d in delays));self.assertGreater(delays[0],e.CFG['poll_seconds'])
+  cap=int(e.CFG['worker_backoff_max_seconds'])
+  self.assertEqual(len(delays),2);self.assertTrue(all(d==cap for d in delays));self.assertLessEqual(cap,e.CFG['worker_stale_seconds'])
+ def test_worker_failure_classifies_server_and_unknown_tokens(self):
+  with patch.object(e,'monitor',side_effect=RuntimeError('SERVER_ERROR')):
+   a.worker(e,self.db,sleep=lambda _:None,max_polls=1,api_factory=lambda:object())
+  payload=json.loads(self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='worker_failure'",(e.NS,))[0]['data_json'])
+  self.assertEqual(payload['error_code'],'SERVER_ERROR')
+  e.NS='test_'+__import__('uuid').uuid4().hex
+  with patch.object(e,'monitor',side_effect=RuntimeError('weird_token_not_allowlisted')):
+   a.worker(e,self.db,sleep=lambda _:None,max_polls=1,api_factory=lambda:object())
+  payload=json.loads(self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='worker_failure'",(e.NS,))[0]['data_json'])
+  self.assertEqual(payload['error_code'],'RuntimeError')
+  self.assertNotEqual(payload['error_code'],'unclassified_condition')
+ def test_monitor_and_worker_log_ticks_for_the_log_files_verifier(self):
+  logged=[]
+  orig=e.log
+  def spy(kind,**data):
+   logged.append(kind);return orig(kind,**data)
+  e.log=spy
+  try:
+   class Feed:
+    def quotes(_,requested):return {}
+   e.monitor(self.db,Feed())
+   self.assertIn('monitor_started',logged)
+   self.assertIn('monitor_completed',logged)
+   logged.clear()
+   with patch.object(e,'monitor',side_effect=RuntimeError('HELPER_TIMEOUT')):
+    a.worker(e,self.db,sleep=lambda _:None,max_polls=1,api_factory=lambda:object())
+   self.assertIn('monitor_check',logged)
+   payload=json.loads(self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='worker_failure'",(e.NS,))[-1]['data_json'])
+   self.assertEqual(payload['error_code'],'HELPER_TIMEOUT')
+  finally:
+   e.log=orig
 
  def test_eod_refuses_closed_day_or_before_close(self):
   self.assertFalse(a.eod(e,self.db)['snapshot_written']);e.now=lambda:datetime(2026,11,7,16,10,tzinfo=e.IST);self.assertFalse(a.eod(e,self.db)['snapshot_written']);self.assertFalse(self.db.query('SELECT * FROM paper_eod WHERE namespace=?',(e.NS,)))

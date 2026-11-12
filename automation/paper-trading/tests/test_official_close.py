@@ -163,7 +163,16 @@ class TaxonomyTests(unittest.TestCase):
         self.assertEqual(al.classified_error(RuntimeError('market_data_rate_limit')), 'market_data_rate_limit')
         self.assertEqual(al.classified_error(RuntimeError('Turso_operation_failed')), 'Turso_operation_failed')
         self.assertEqual(al.classified_error(RuntimeError('TURSO_OPERATION_FAILED')), 'TURSO_OPERATION_FAILED')
+        self.assertEqual(al.classified_error(RuntimeError('auth_circuit_open_30min')), 'auth_circuit_open_30min')
+        self.assertEqual(al.classified_error(RuntimeError('SERVER_ERROR')), 'SERVER_ERROR')
+        self.assertEqual(al.classified_error(RuntimeError('HELPER_TIMEOUT')), 'HELPER_TIMEOUT')
+        self.assertEqual(al.classified_error(RuntimeError('database_operation_failed')), 'database_operation_failed')
+        self.assertEqual(al.classified_error(RuntimeError('market_data_error_SERVER_ERROR')), 'market_data_error_SERVER_ERROR')
+        self.assertEqual(al.classified_error(RuntimeError('weird_token_not_allowlisted')), 'RuntimeError')
         self.assertEqual(al.clean('Turso_operation_failed', 'error_code'), 'Turso_operation_failed')
+        self.assertEqual(al.clean('SERVER_ERROR', 'error_code'), 'SERVER_ERROR')
+        self.assertEqual(al.clean('HELPER_TIMEOUT', 'error_code'), 'HELPER_TIMEOUT')
+        self.assertEqual(al.clean('weird_token_not_allowlisted', 'error_code'), 'unclassified_condition')
         self.assertEqual(al.clean('a mystery with spaces', 'error_code'), 'unclassified_condition')
 
 class _Mem:

@@ -504,4 +504,41 @@ class PaperTests(unittest.TestCase):
   self.assertEqual(p['headline_net_pnl_paise'],p['estimated_finance']['net_total_accrued_paise'])
   self.assertFalse(p['capped_master_ledger']['shadow_diagnostic']['headline'])
   self.assertTrue(p['public_labels']['historical_figures_gross']);self.assertTrue(p['public_labels']['survivorship_biased']);self.assertTrue(p['public_labels']['not_jointly_tested'])
+
+ def test_monitor_uses_the_quote_batch_clock_for_every_fill(self):
+  # UNIONBANK was skipped stale after siblings filled because fill() re-read now() and the shared quote aged past 60s mid-cycle.
+  for sym in ('RELIANCE-EQ','TCS-EQ'):self.signal(symbol=sym,strategy=1)
+  clock={'t':T};e.now=lambda:clock['t']
+  orig=e.fill
+  def ticking(db,s,q,t):
+   try:return orig(db,s,q,t)
+   finally:clock['t']=clock['t']+timedelta(seconds=70)
+  e.fill=ticking
+  try:
+   class Feed:
+    def quotes(_,requested):return {sym:{'symbol':sym,'price':100,'quote_at':T.isoformat(),'provider_status':'ok'} for sym in requested}
+   report=e.monitor(self.db,Feed())
+  finally:
+   e.fill=orig;e.now=lambda:T
+  self.assertEqual(report['fills'],2)
+  held={p['symbol'] for p in self.db.positions()}
+  self.assertEqual(held,{'RELIANCE-EQ','TCS-EQ'})
+ def test_monitor_does_not_retry_a_full_sleeve_in_the_same_cycle(self):
+  symbols=['360ONE-EQ','3MINDIA-EQ','ABB-EQ','ACC-EQ','AGI-EQ','AIAENG-EQ','APLAPOLLO-EQ','ASKAUTOLTD-EQ','AUBANK-EQ']
+  for sym in symbols:self.assertTrue(e.fill(self.db,self.signal(symbol=sym,strategy=1),self.quote(),T)['filled'])
+  for sym in ('AARTIDRUGS-EQ','AARTIIND-EQ','BAJAJ-AUTO-EQ'):self.signal(symbol=sym,strategy=1)
+  calls=[];orig=e.fill
+  def wrapped(db,s,q,t):
+   r=orig(db,s,q,t);calls.append((s.get('side'),s['symbol'],r.get('reason'),bool(r.get('filled'))));return r
+  e.fill=wrapped
+  try:
+   class Feed:
+    def quotes(_,requested):return {sym:{'symbol':sym,'price':100,'quote_at':T.isoformat(),'provider_status':'ok'} for sym in requested}
+   e.monitor(self.db,Feed())
+  finally:e.fill=orig
+  buys=[c for c in calls if c[0]!='SELL']
+  self.assertEqual(len(buys),1)
+  self.assertEqual(buys[0][2],'SLEEVE_SLOT_FULL')
+  self.assertFalse(buys[0][3])
+  self.assertEqual(len([p for p in self.db.positions() if p['strategy']==1]),9)
 if __name__=='__main__':unittest.main(verbosity=2)

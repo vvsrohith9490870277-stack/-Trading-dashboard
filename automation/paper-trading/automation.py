@@ -278,21 +278,29 @@ def stale_budget(e,status):
  return e.CFG['worker_stale_seconds']
 class CycleHeartbeat:
  """Refreshes the 'polling' heartbeat every worker_heartbeat_interval_seconds while one cycle runs.
- Stops refreshing after worker_cycle_max_seconds so a genuinely hung cycle still turns stale."""
+ Stops refreshing after worker_cycle_max_seconds so a genuinely hung cycle still turns stale.
+ A tick is always written to engine.jsonl first so a slow Turso heartbeat cannot stall the log_files verifier."""
  def __init__(self,e,db,polls):
-  self.e,self.db,self.polls=e,db,polls;self.stop=threading.Event();self.began=time.monotonic();self.beats=0;self.failures=0
+  self.e,self.db,self.polls=e,db,polls;self.stop=threading.Event();self.began=time.monotonic();self.beats=0;self.failures=0;self._writing=False
   self.thread=threading.Thread(target=self.run,name='worker-cycle-heartbeat',daemon=True)
  def run(self):
   interval=self.e.CFG['worker_heartbeat_interval_seconds'];limit=self.e.CFG['worker_cycle_max_seconds']
   while not self.stop.wait(interval):
    elapsed=time.monotonic()-self.began
    if elapsed>limit:return
-   began=time.monotonic()
-   try:heartbeat(self.e,self.db,'polling',polls=self.polls,cycle_elapsed_seconds=round(elapsed,1));self.beats+=1
-   except Exception as ex:self.report('worker_heartbeat_failed','failed','WARN',error_code=safe_error(ex),duration_ms=round((time.monotonic()-began)*1000))
-   else:
-    took=time.monotonic()-began
-    if took>interval:self.report('worker_heartbeat_slow','ok','WARN',duration_ms=round(took*1000),poll_seconds=interval)
+   try:self.e.log('worker_heartbeat',polls=self.polls,cycle_elapsed_seconds=round(elapsed,1))
+   except Exception:pass
+   if self._writing:continue
+   self._writing=True
+   threading.Thread(target=self._write,args=(elapsed,),name='worker-cycle-heartbeat-write',daemon=True).start()
+ def _write(self,elapsed):
+  began=time.monotonic();interval=self.e.CFG['worker_heartbeat_interval_seconds']
+  try:heartbeat(self.e,self.db,'polling',polls=self.polls,cycle_elapsed_seconds=round(elapsed,1));self.beats+=1
+  except Exception as ex:self.report('worker_heartbeat_failed','failed','WARN',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-began)*1000))
+  else:
+   took=time.monotonic()-began
+   if took>interval:self.report('worker_heartbeat_slow','ok','WARN',duration_ms=round(took*1000),poll_seconds=interval)
+  finally:self._writing=False
  def report(self,kind,outcome,severity,**data):
   # Never silent: a durable audit event (falls back to the fsynced spool when Turso is down) plus the local engine log.
   self.failures+=kind=='worker_heartbeat_failed'
@@ -385,12 +393,19 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
       heartbeat(e,db,'healthy',polls=polls,last_result=r,db_helper=db.helper_stats() if hasattr(db,'helper_stats') else None)
       al.emit(e,db,'worker_check',duration_ms=round((time.monotonic()-start)*1000),poll_seconds=delay,missed_checks=max(0,int((time.monotonic()-start)//delay)-1),status=r.get('status'))
      except Exception as ex:
-      reason=safe_error(ex);failures+=1;polls+=1;al.emit(e,db,'worker_failure',outcome='failed',severity='ERROR',error_code=reason,failures=failures);heartbeat(e,db,'backoff',error=reason,failures=failures)
+      reason=al.classified_error(ex);failures+=1;polls+=1
+      try:e.log('monitor_check',status='failed',error_code=reason,failures=failures)
+      except Exception:pass
+      al.emit(e,db,'worker_failure',outcome='failed',severity='ERROR',error_code=reason,failures=failures)
+      try:al.emit(e,db,'monitor_check',outcome='failed',severity='WARN',error_code=reason,failures=failures,poll_seconds=delay)
+      except Exception:pass
+      heartbeat(e,db,'backoff',error=reason,failures=failures)
       if 'auth' in reason.lower() or 'token_refresh' in reason.lower():paused=True;heartbeat(e,db,'paused_auth',error=reason);return {'status':'paused_auth','polls':polls}
+      backoff_max=int(e.CFG.get('worker_backoff_max_seconds',30))
       if 'rate_limit' in reason:
-       delay=max(int(e.CFG['market_data'].get('rate_limit_cooloff_seconds',180)),min(300,30*2**min(failures,4)));full_cooloff=True
+       delay=min(backoff_max,max(int(e.CFG['market_data'].get('rate_limit_cooloff_seconds',180)),min(300,30*2**min(failures,4))));full_cooloff=True
       else:
-       delay=min(300,30*2**min(failures,4))
+       delay=min(backoff_max,min(300,30*2**min(failures,4)))
      finally:state['in_cycle']=False
     if state['stop']:break
     sleep(delay if full_cooloff else max(0,delay-(time.monotonic()-start)))
