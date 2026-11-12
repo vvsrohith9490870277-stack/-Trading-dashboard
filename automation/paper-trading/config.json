@@ -120,6 +120,7 @@
       "reportASM": "https://www.nseindia.com/reports/asm",
       "reportGSM": "https://www.nseindia.com/reports/gsm",
       "invest/content/GSM.csv": "https://www.nseindia.com/reports/gsm",
+      "archives/equities/bhavcopy/pr": "https://www.nseindia.com/all-reports",
       "nsearchives.nseindia.com": "https://www.nseindia.com/reports/asm"
     },
     "nse_corporate_actions_range_url": "https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date={from_date}&to_date={to_date}",
@@ -133,8 +134,10 @@
     "max_attempts": 6,
     "backoff_seconds": 2,
     "backoff_max_seconds": 15,
-    "fetch_note": "NSE refuses non-browser user agents and refuses whole sessions at random (403). Each refused session is replaced after exponential backoff (backoff_seconds doubling, capped at backoff_max_seconds) for up to max_attempts; HTML pages are never parsed as data. ASM and GSM fall back to the nsearchives CSVs only when every listed file loads. Corporate actions fall back to the same range API fetched with curl --http2 and a cookie warmup; a failure never deletes retained rows. The reference-feed refresh uses reference_feeds.lock, not engine.lock.",
-    "corporate_action_lookahead_days": 7
+    "fetch_note": "NSE refuses non-browser user agents and refuses whole sessions at random (403). Each refused session is replaced after exponential backoff (backoff_seconds doubling, capped at backoff_max_seconds) for up to max_attempts; HTML pages are never parsed as data. ASM and GSM fall back to the nsearchives CSVs only when every listed file loads. Corporate actions fall back first to the same range API fetched with curl --http2 and a cookie warmup, then to the Bc*.csv corporate-action file inside the latest completed-session NSE PR zip on nsearchives; a failure never deletes retained rows. The reference-feed refresh uses reference_feeds.lock, not engine.lock.",
+    "corporate_action_lookahead_days": 7,
+    "nse_pr_zip_url_template": "https://nsearchives.nseindia.com/archives/equities/bhavcopy/pr/PR{ddmmyy}.zip",
+    "nse_pr_ca_lookback_sessions": 3
   },
   "runtime_deps": {
     "venv_path": "/workspace/sahil-fyers-turso/.venv",

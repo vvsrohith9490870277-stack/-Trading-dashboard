@@ -130,6 +130,52 @@ class ExitSelftestTests(unittest.TestCase):
         self.assertEqual(self.db.query('SELECT qty FROM paper_positions WHERE namespace=? AND symbol=?', (NS_V1, 'TCS-EQ'))[0]['qty'], 3)
         self.assertTrue(any(c['name'] == 'no_duplicate_exit' and c['passed'] for c in r['cases']), r['cases'])
 
+    def _q(self, symbol, price, open_, low, high=None):
+        return {'symbol': symbol, 'price': price, 'open': open_, 'low': low, 'high': high if high is not None else max(price, open_),
+                'quote_at': T.isoformat(), 'provider_status': 'ok', 'source': 'FYERS_QUOTES'}
+
+    def test_no_sleeve_defines_a_time_or_max_hold_exit(self):
+        self.assertEqual(xst.frozen_time_exits(e.RULES), [])
+        self.assertFalse(xst.holding_period_report(e)['defined'])
+
+    def test_s7_trail_gap_fills_official_open(self):
+        quotes = {
+            'RELIANCE-EQ': self._q('RELIANCE-EQ', 110, 110, 109),
+            'HDFCBANK-EQ': self._q('HDFCBANK-EQ', 105, 100, 99),
+            'INFY-EQ': self._q('INFY-EQ', 101, 100, 99),
+        }
+        api = FakeAPI(quotes)
+        r = xst.run(e, self.db, api, max_seconds=1, max_quotes=5, poll_seconds=0, cleanup_after=False, live=False, quotes_seed=quotes)
+        case = {c['name']: c for c in r['cases']}
+        self.assertTrue(case['s7_trail_gap']['passed'], case['s7_trail_gap'])
+        self.assertEqual(case['s7_trail_gap']['rule'], 'trail_gap')
+        self.assertEqual(case['s7_trail_gap']['execution_path'], 'FEED_OPEN')
+        self.assertEqual(case['s7_trail_gap']['reference_price'], 100)
+        self.assertFalse(r['holding_period_exit']['defined'])
+
+    def test_ca_adjusted_stop_uses_scaled_level_not_unadjusted(self):
+        quotes = {
+            'RELIANCE-EQ': self._q('RELIANCE-EQ', 110, 110, 109),
+            'HDFCBANK-EQ': self._q('HDFCBANK-EQ', 105, 100, 99),
+            'TCS-EQ': self._q('TCS-EQ', 100, 100, 85, 101),
+        }
+        api = FakeAPI(quotes)
+        r = xst.run(e, self.db, api, max_seconds=1, max_quotes=5, poll_seconds=0, cleanup_after=False, live=False, quotes_seed=quotes)
+        case = {c['name']: c for c in r['cases']}
+        self.assertTrue(case['ca_adjusted_stop']['passed'], case['ca_adjusted_stop'])
+        self.assertTrue(case['ca_adjusted_stop']['scaled'])
+        self.assertEqual(case['ca_adjusted_stop']['new_qty'], 2)
+        self.assertEqual(case['ca_adjusted_stop']['rule'], 'trail_touch')
+        # Unadjusted stop would be roughly twice the post-split level and would have filled as trail_gap at the open.
+        self.assertGreater(case['ca_adjusted_stop']['unadjusted_level'], 100)
+        self.assertLess(case['ca_adjusted_stop']['reference_price'], 100)
+        # Shared CA row must not change the protected paper_v1 TCS position.
+        self.assertEqual(self.db.query('SELECT qty FROM paper_positions WHERE namespace=? AND symbol=?', (NS_V1, 'TCS-EQ'))[0]['qty'], 3)
+        # Cleanup drops only the tagged test CA row.
+        xst.cleanup(e, self.db, self.ns)
+        self.assertFalse(self.db.query('SELECT 1 FROM paper_corporate_actions WHERE source=?', (xst.CA_SOURCE,)))
+        self.assertEqual(self.db.query('SELECT qty FROM paper_positions WHERE namespace=? AND symbol=?', (NS_V1, 'TCS-EQ'))[0]['qty'], 3)
+
     def test_refuses_to_run_if_budget_too_tight(self):
         q = {'symbol': 'RELIANCE-EQ', 'price': 100, 'open': 100, 'low': 99, 'quote_at': T.isoformat(), 'provider_status': 'ok'}
         api = FakeAPI({'RELIANCE-EQ': q, 'HDFCBANK-EQ': dict(q, symbol='HDFCBANK-EQ')})

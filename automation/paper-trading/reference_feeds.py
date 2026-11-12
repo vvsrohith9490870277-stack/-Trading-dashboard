@@ -17,6 +17,7 @@ import requests
 
 SOURCE_CA = 'NSE_CORPORATE_ACTIONS_API'
 SOURCE_CA_HTTP2 = 'NSE_CORPORATE_ACTIONS_HTTP2'
+SOURCE_CA_PR_ARCHIVE = 'NSE_PR_BC_ARCHIVE'
 SOURCE_ASM = 'NSE_ASM_REPORT'
 SOURCE_GSM = 'NSE_GSM_REPORT'
 SOURCE_MASTER = 'FYERS_SYMBOL_MASTER'
@@ -25,10 +26,13 @@ _RS = r'(?:rs\.?|re\.?|inr|₹)\s*([0-9]+(?:\.[0-9]+)?)'
 
 
 def nse_day(text):
-    try:
-        return datetime.strptime(str(text).strip(), '%d-%b-%Y').date().isoformat()
-    except (TypeError, ValueError):
-        return None
+    text = str(text or '').strip()
+    for fmt in ('%d-%b-%Y', '%Y-%m-%d', '%d-%m-%Y'):
+        try:
+            return datetime.strptime(text, fmt).date().isoformat()
+        except ValueError:
+            continue
+    return None
 
 
 def classify(subject):
@@ -90,6 +94,148 @@ def corporate_action_rows(rows, symbols, isins, start, end, now_iso, source=SOUR
             else:
                 merged[key] = [sym, day, kind, num, den, cash, source + ':' + str(r.get('subject'))[:160], now_iso]
     return [tuple(v) for v in merged.values()], skipped
+
+
+def pr_purpose_subject(purpose):
+    """Rewrite an NSE PR Bc PURPOSE code into a subject line the API classifier already understands."""
+    raw = str(purpose or '').strip()
+    compact = re.sub(r'\s+', ' ', raw).upper()
+    if re.search(r'\bRIGHTS?\b', compact):
+        return raw
+    if 'BUY BACK' in compact or 'BUYBACK' in compact:
+        return raw
+    if 'BONUS' in compact:
+        return raw
+    if re.search(r'\bSPLIT\b|SUB-?DIVISION', compact):
+        return raw
+    if re.search(r'SPL\s*DIV|SPLDIV|\bSPECIAL\b', compact):
+        return 'Special Dividend - ' + raw
+    amounts = re.findall(r'(?:RS\.?|RE\.?)\s*([0-9]+(?:\.[0-9]+)?)\s*PER\s*SH', compact)
+    if not amounts:
+        amounts = re.findall(r'(?:RS\.?|RE\.?)\s*([0-9]+(?:\.[0-9]+)?)PERSH', compact)
+    label = 'Final Dividend' if re.search(r'FIN(?:AL)?\s*DIV|FNDIV', compact) else 'Interim Dividend'
+    if amounts and re.search(r'INT\s*DIV|INTDIV|NTDIV|FIN(?:AL)?\s*DIV|FNDIV|\bDIV\b', compact):
+        return ' / '.join(label + ' - Rs ' + a + ' Per Share' for a in amounts)
+    return raw
+
+
+def ca_from_pr_zip(blob):
+    """Bytes of an NSE PR zip (or a raw Bc*.csv) -> list of dicts in the API row shape."""
+    if blob is None:
+        raise RuntimeError('corporate_actions_pr_archive_unexpected_format')
+    data = blob if isinstance(blob, (bytes, bytearray)) else str(blob).encode('utf-8')
+    text = None
+    if len(data) >= 2 and data[:2] == b'PK':
+        import zipfile
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(data))
+        except zipfile.BadZipFile:
+            raise RuntimeError('corporate_actions_pr_archive_unexpected_format')
+        names = [n for n in zf.namelist() if re.match(r'(?i)(?:.*/)?bc\d+\.csv$', n)]
+        if not names:
+            raise RuntimeError('corporate_actions_pr_archive_unexpected_format')
+        raw = zf.read(names[0])
+        text = raw.decode('utf-8-sig')
+    else:
+        if data.lstrip()[:1] in (b'<',):
+            raise RuntimeError('html_instead_of_data')
+        try:
+            text = data.decode('utf-8-sig')
+        except UnicodeDecodeError:
+            raise RuntimeError('corporate_actions_pr_archive_unexpected_format')
+    if not text or '<html' in text[:200].lower():
+        raise RuntimeError('html_instead_of_data')
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames or 'PURPOSE' not in {f.upper() for f in reader.fieldnames}:
+        raise RuntimeError('corporate_actions_pr_archive_unexpected_format')
+    def cell(row, *names):
+        lower = {str(k).strip().upper(): v for k, v in row.items()}
+        for n in names:
+            if n.upper() in lower:
+                return lower[n.upper()]
+        return None
+    out = []
+    for row in reader:
+        purpose = cell(row, 'PURPOSE')
+        symbol = str(cell(row, 'SYMBOL') or '').strip().upper()
+        series = str(cell(row, 'SERIES') or '').strip().upper()
+        ex = nse_day(cell(row, 'EX_DT', 'EXDATE', 'EX-DATE'))
+        if not symbol or not ex:
+            continue
+        # nse_day already returns ISO; API mapper expects %d-%b-%Y via nse_day, so pass ISO (now accepted).
+        out.append({'symbol': symbol, 'series': series or None, 'isin': None, 'exDate': ex, 'subject': pr_purpose_subject(purpose)})
+    # The PR file lists EQ and BE rows for the same action; keep one so cash is not summed twice.
+    rank = {'EQ': 0, 'BE': 1, 'BZ': 2}
+    best = {}
+    for row in out:
+        key = (row['symbol'], row['exDate'], row['subject'])
+        prev = best.get(key)
+        if prev is None or rank.get(row['series'] or '', 9) < rank.get(prev['series'] or '', 9):
+            best[key] = row
+    out = list(best.values())
+    if not out:
+        raise RuntimeError('corporate_actions_pr_archive_unexpected_format')
+    return out
+
+
+def pr_session_dates(e, trade_day, n=3):
+    """Latest completed sessions at or before trade_day, newest first, for PR zip lookback."""
+    from datetime import time as dt_time
+    n = max(1, int(n))
+    cap = datetime.combine(date.fromisoformat(str(trade_day)), dt_time(23, 59, 59), tzinfo=e.IST)
+    try:
+        start = e.completed_day(min(e.now(), cap))
+    except Exception:
+        start = date.fromisoformat(str(trade_day))
+    out, d = [], start
+    for _ in range(40):
+        s = e.session(d)
+        if s is None:
+            break
+        if s and d not in out:
+            out.append(d)
+            if len(out) >= n:
+                break
+        d -= timedelta(days=1)
+    return out
+
+
+def pr_zip_url(cfg, session_day):
+    template = cfg.get('nse_pr_zip_url_template') or 'https://nsearchives.nseindia.com/archives/equities/bhavcopy/pr/PR{ddmmyy}.zip'
+    return template.format(ddmmyy=session_day.strftime('%d%m%y'), ddmmyyyy=session_day.strftime('%d%m%Y'))
+
+
+def pr_zip_get(cfg, url):
+    """Bare GET of a PR zip. nsearchives must not use the www NSE warmup session."""
+    timeout = cfg.get('timeout_seconds') or 20
+    ua = cfg.get('user_agent') or 'Mozilla/5.0'
+    headers = {'User-Agent': ua, 'Accept': 'application/zip,application/octet-stream,*/*'}
+    refs = cfg.get('nse_referers') or {}
+    ref = next((r for prefix, r in refs.items() if prefix in url), cfg.get('nse_default_referer'))
+    if ref:
+        headers['Referer'] = ref
+    r = requests.get(url, headers=headers, timeout=timeout)
+    if r.status_code != 200:
+        raise RuntimeError('http_' + str(r.status_code))
+    kind = (r.headers.get('content-type') or '').lower()
+    if 'text/html' in kind or (r.content.lstrip()[:1] == b'<'):
+        raise RuntimeError('html_instead_of_data')
+    return r.content
+
+
+def load_pr_corporate_actions(e, cfg, trade_day, pr_fetch=None):
+    last = 'corporate_actions_pr_archive_unavailable'
+    lookback = cfg.get('nse_pr_ca_lookback_sessions') or 3
+    for session_day in pr_session_dates(e, trade_day, lookback):
+        url = pr_zip_url(cfg, session_day)
+        try:
+            blob = pr_fetch(url) if pr_fetch is not None else pr_zip_get(cfg, url)
+            rows = ca_from_pr_zip(blob)
+            return rows, url, session_day.isoformat()
+        except Exception as ex:
+            last = e.au.safe_error(ex) if hasattr(e, 'au') else str(ex)
+            continue
+    raise RuntimeError(last)
 
 
 def surveillance_rows(report, symbols, isins, label):
@@ -326,7 +472,7 @@ def impact(e, db, day, ca_rows, flags):
     }
 
 
-def refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None, feeds_lock=None):
+def refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None, feeds_lock=None, pr_fetch=None):
     """Fetch every source, write what parsed, and report errors per source. Paper data only."""
     lock_path = Path(feeds_lock) if feeds_lock is not None else (e.ROOT / 'reference_feeds.lock')
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -337,7 +483,7 @@ def refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None, feeds
         lock_fh.close()
         return {'trade_day': str(trade_day), 'dry_run': bool(dry_run), 'sources': {}, 'status': 'unavailable', 'error': 'reference_feeds_busy'}
     try:
-        return _refresh(e, db, trade_day, fetch=fetch, dry_run=dry_run, http2_fetch=http2_fetch)
+        return _refresh(e, db, trade_day, fetch=fetch, dry_run=dry_run, http2_fetch=http2_fetch, pr_fetch=pr_fetch)
     finally:
         try:
             fcntl.flock(lock_fh, fcntl.LOCK_UN)
@@ -345,7 +491,7 @@ def refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None, feeds
             lock_fh.close()
 
 
-def _refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None):
+def _refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None, pr_fetch=None):
     cfg = e.CFG['reference_feeds']
     fetcher = None
     if fetch is None:
@@ -363,17 +509,34 @@ def _refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None):
             if not isinstance(payload, list):
                 raise RuntimeError('corporate_actions_unexpected_payload')
         except Exception as api_error:
-            getter = http2_fetch
-            if getter is None and fetcher is not None:
-                getter = lambda u, _cfg=cfg: http2_json(_cfg, u)
-            if getter is None:
-                raise
-            payload = getter(_ca_url(cfg, day, end))
-            if not isinstance(payload, list):
-                raise RuntimeError('corporate_actions_unexpected_payload')
-            via = 'http2'
-            ca_source = SOURCE_CA_HTTP2
-            report.setdefault('fallbacks', {})['corporate_actions'] = {'api_error': e.au.safe_error(api_error)}
+            http2_error = None
+            try:
+                getter = http2_fetch
+                if getter is None and fetcher is not None:
+                    getter = lambda u, _cfg=cfg: http2_json(_cfg, u)
+                if getter is None:
+                    raise
+                payload = getter(_ca_url(cfg, day, end))
+                if not isinstance(payload, list):
+                    raise RuntimeError('corporate_actions_unexpected_payload')
+                via = 'http2'
+                ca_source = SOURCE_CA_HTTP2
+                report.setdefault('fallbacks', {})['corporate_actions'] = {'api_error': e.au.safe_error(api_error)}
+            except Exception as http2_ex:
+                http2_error = http2_ex
+                if pr_fetch is None and fetcher is None:
+                    raise
+                payload, pr_url, pr_session = load_pr_corporate_actions(e, cfg, day, pr_fetch=pr_fetch)
+                if not isinstance(payload, list):
+                    raise RuntimeError('corporate_actions_unexpected_payload')
+                via = 'pr_archive'
+                ca_source = SOURCE_CA_PR_ARCHIVE
+                report.setdefault('fallbacks', {})['corporate_actions'] = {
+                    'api_error': e.au.safe_error(api_error),
+                    'http2_error': e.au.safe_error(http2_error),
+                    'pr_url': pr_url,
+                    'pr_session_day': pr_session,
+                }
         rows, skipped = corporate_action_rows(payload, symbols, isins, day, end, now_iso, source=ca_source)
         write([('INSERT INTO paper_corporate_actions(symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(symbol,ex_date,kind) DO UPDATE SET ratio_num=excluded.ratio_num,ratio_den=excluded.ratio_den,cash_paise=excluded.cash_paise,source=excluded.source,recorded_at=excluded.recorded_at', r) for r in rows])
         report['sources']['corporate_actions'] = {'status': 'ok', 'via': via, 'source': ca_source, 'rows_received': len(payload), 'rows_written': 0 if dry_run else len(rows), 'rows_matched': len(rows), 'window': [day, end], 'skipped': skipped, 'kinds': sorted({r[2] for r in rows})}

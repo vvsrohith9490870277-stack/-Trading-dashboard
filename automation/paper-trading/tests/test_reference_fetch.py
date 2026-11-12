@@ -168,4 +168,56 @@ class RefreshTests(base.ReferenceFeedTests):
   self.assertTrue(r['dry_run']);self.assertEqual(r['guard_rows_written'],0);self.assertEqual(r['sources']['corporate_actions']['rows_written'],0)
   self.assertEqual(r['impact']['entry_blocked_symbols_held'],['INFY-EQ'])
   self.assertEqual(r['impact']['corporate_actions_ex_trade_day_on_held_symbols'],[('RELIANCE-EQ','BONUS'),('RELIANCE-EQ','CASH_DIVIDEND')])
+
+ def test_pr_purpose_and_iso_dates_map_like_the_api(self):
+  self.assertEqual(rf.nse_day('12-Nov-2026'),'2026-11-12')
+  self.assertEqual(rf.nse_day('2026-11-12'),'2026-11-12')
+  self.assertEqual(rf.nse_day('12-11-2026'),'2026-11-12')
+  self.assertIsNone(rf.nse_day('not-a-date'))
+  self.assertEqual(rf.classify(rf.pr_purpose_subject('INTDIV - RS 7 PER SH')),[('CASH_DIVIDEND',None,None,700)])
+  self.assertEqual(rf.classify(rf.pr_purpose_subject('INTDIV -RS 90PERSH')),[('CASH_DIVIDEND',None,None,9000)])
+  self.assertEqual(rf.classify(rf.pr_purpose_subject('INT DIV - RS 1.90 PER SH')),[('CASH_DIVIDEND',None,None,190)])
+  self.assertEqual(rf.classify(rf.pr_purpose_subject('NTDIV - RE 1 PER SH')),[('CASH_DIVIDEND',None,None,100)])
+  self.assertEqual(rf.classify(rf.pr_purpose_subject('SPLDIV-1.50/INTDIV-1.50'))[0][0],'EXTRAORDINARY_DIVIDEND_REVIEW')
+  self.assertEqual(rf.classify(rf.pr_purpose_subject('BUY BACK')),[])
+  self.assertEqual(rf.classify(rf.pr_purpose_subject('RIGHTS 5:12 @ PRM RS855'))[0][0],'RIGHTS')
+ def _pr_zip(self,csv_text,name='bc09112026.csv'):
+  import io,zipfile
+  buf=io.BytesIO()
+  with zipfile.ZipFile(buf,'w') as z:z.writestr(name,csv_text)
+  return buf.getvalue()
+ def test_ca_api_and_http2_403_uses_pr_archive(self):
+  csv='\n'.join([
+   'SERIES,SYMBOL,SECURITY,RECORD_DT,BC_STRT_DT,BC_END_DT,EX_DT,ND_STRT_DT,ND_END_DT,PURPOSE',
+   'EQ,RELIANCE,Reliance,2026-11-09,,,2026-11-09,,,INTDIV - RS 5 PER SH',
+   'BE,RELIANCE,Reliance,2026-11-09,,,2026-11-09,,,INTDIV - RS 5 PER SH',
+   'EQ,NAVNETEDUL,Navneet,2026-11-09,,,2026-11-09,,,SPLDIV-1.50/INTDIV-1.50',
+   'EQ,TCS,TCS,2026-11-16,,,2026-11-16,,,INTDIV - RE 1 PER SH',
+   'EQ,FDC,FDC,2026-11-13,,,2026-11-13,,,BUY BACK',
+  ])+'\n'
+  def ca_fail(url,as_json=True):
+   if url.startswith(CFG['nse_corporate_actions_url']):raise RuntimeError('http_403')
+   return base.fixture_fetch(url,as_json)
+  r=rf.refresh(e,self.db,'2026-11-09',fetch=ca_fail,http2_fetch=lambda u:(_ for _ in ()).throw(RuntimeError('http_403')),pr_fetch=lambda u:self._pr_zip(csv))
+  self.assertEqual(r['sources']['corporate_actions']['status'],'ok')
+  self.assertEqual(r['sources']['corporate_actions']['via'],'pr_archive')
+  self.assertEqual(r['sources']['corporate_actions']['source'],'NSE_PR_BC_ARCHIVE')
+  self.assertEqual(r['fallbacks']['corporate_actions']['api_error'],'http_403')
+  self.assertEqual(r['fallbacks']['corporate_actions']['http2_error'],'http_403')
+  kinds={(x['symbol'],x['ex_date'],x['kind'],x['cash_paise']) for x in self.db.query('SELECT symbol,ex_date,kind,cash_paise FROM paper_corporate_actions')}
+  self.assertIn(('RELIANCE-EQ','2026-11-09','CASH_DIVIDEND',500),kinds)
+  self.assertIn(('NAVNETEDUL-EQ','2026-11-09','EXTRAORDINARY_DIVIDEND_REVIEW',None),kinds)
+  self.assertIn(('TCS-EQ','2026-11-16','CASH_DIVIDEND',100),kinds)
+  self.assertFalse(any(k[0]=='FDC-EQ' for k in kinds))
+ def test_pr_archive_bad_payload_is_unavailable_and_keeps_rows(self):
+  self.db.batch([('INSERT INTO paper_corporate_actions(symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at) VALUES(?,?,?,?,?,?,?,?)',('RELIANCE-EQ','2026-11-09','CASH_DIVIDEND',None,None,500,'RETAINED','2026-11-11T15:40:50+05:30'))])
+  def ca_fail(url,as_json=True):
+   if url.startswith(CFG['nse_corporate_actions_url']):raise RuntimeError('http_403')
+   return base.fixture_fetch(url,as_json)
+  r=rf.refresh(e,self.db,'2026-11-09',fetch=ca_fail,http2_fetch=lambda u:(_ for _ in ()).throw(RuntimeError('http_403')),pr_fetch=lambda u:b'<html>Access Denied</html>')
+  self.assertEqual(r['sources']['corporate_actions']['status'],'unavailable')
+  self.assertEqual(r['sources']['corporate_actions']['error'],'html_instead_of_data')
+  kept=self.db.query('SELECT symbol,cash_paise,source FROM paper_corporate_actions')
+  self.assertEqual(len(kept),1);self.assertEqual(kept[0]['source'],'RETAINED');self.assertEqual(kept[0]['cash_paise'],500)
+
 if __name__=='__main__':unittest.main()

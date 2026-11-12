@@ -10,6 +10,11 @@ TEST_NS = 'paper_exit_test_v1'
 PROTECTED = frozenset({'paper_v1'})
 STOP_SYMBOL = 'RELIANCE-EQ'
 SELL_SYMBOL = 'HDFCBANK-EQ'
+GAP_SYMBOL = 'INFY-EQ'
+CA_SYMBOL = 'TCS-EQ'
+CA_SOURCE = 'PAPER_EXIT_SELFTEST'
+CA_KIND = 'SPLIT'
+CA_RATIO = (2, 1)  # r = new shares per old share
 TIGHT = 0.0015  # 0.15%
 
 
@@ -71,6 +76,7 @@ def cleanup(e, db, ns):
     tables = namespaced_tables(e, db)
     if tables:
         db.batch([('DELETE FROM ' + table + ' WHERE namespace=?', (ns,)) for table in tables])
+    cleanup_test_ca(db)
     suffix = hashlib.sha256((str(getattr(db, 'test_database', None) or 'turso') + '|' + ns).encode()).hexdigest()[:16]
     spool = e.ROOT / 'logs' / 'audit-spool' / suffix
     if spool.is_dir():
@@ -115,6 +121,79 @@ def e_positive(raw):
     except (TypeError, ValueError):
         return None
     return v if v == v and v > 0 else None
+
+
+def frozen_time_exits(rules):
+    """Return sleeve ids whose frozen text defines a max-hold or calendar time exit. Empty means none do."""
+    import re as _re
+    hits = []
+    for key, body in (rules or {}).items():
+        if not str(key).isdigit():
+            continue
+        blob = json.dumps(body).lower()
+        if _re.search(r'max[-_ ]hold|holding[-_ ]period|time[-_ ]based exit|calendar exit|forced close after|max[-_ ]days to (hold|exit)', blob):
+            hits.append(str(key))
+    return hits
+
+
+def holding_period_report(e):
+    hits = frozen_time_exits(getattr(e, 'RULES', {}))
+    return {
+        'defined': bool(hits),
+        'sleeves_with_time_exit': hits,
+        'sleeves_checked': sorted(str(k) for k in getattr(e, 'RULES', {}) if str(k).isdigit()),
+        'note': 'No frozen sleeve defines a max-hold or calendar time exit. Strategies 1-6 exit on completed-bar indicator signals filled at the next official open. Strategy 7 exits on trail_gap, a queued SMA50 open exit, or trail_touch.',
+    }
+
+
+def cleanup_test_ca(db):
+    """Remove only corporate-action rows this harness inserted into the shared table."""
+    try:
+        db.batch([('DELETE FROM paper_corporate_actions WHERE source=?', (CA_SOURCE,))])
+    except Exception:
+        pass
+
+
+def insert_test_split(db, symbol, day, at):
+    existing = db.query('SELECT symbol,ex_date,kind,source FROM paper_corporate_actions WHERE symbol=? AND ex_date=? AND kind=?', (symbol, day, CA_KIND))
+    if existing:
+        return {'inserted': False, 'reason': 'row_already_present', 'existing_source': existing[0].get('source')}
+    db.batch([('INSERT INTO paper_corporate_actions(symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at) VALUES(?,?,?,?,?,?,?,?)',
+               (symbol, day, CA_KIND, CA_RATIO[0], CA_RATIO[1], None, CA_SOURCE, at))])
+    return {'inserted': True, 'symbol': symbol, 'ex_date': day, 'kind': CA_KIND, 'ratio_num': CA_RATIO[0], 'ratio_den': CA_RATIO[1], 'source': CA_SOURCE}
+
+
+def choose_gap_level(quote):
+    official = e_positive(quote.get('open'))
+    last = e_positive(quote.get('price'))
+    if official is None and last is None:
+        raise RuntimeError('missing_live_price')
+    level = official if official is not None else last
+    return round(level, 2), 'trail_gap'
+
+
+def seed_hw_for_post_level(e, post_level, num=None, den=None):
+    import capital as cap
+    import corporate_actions as ca_mod
+    num, den = (num, den) if num and den else CA_RATIO
+    target = high_water_for_level(e, post_level)
+    guess = round(target * num / den, 2)
+    for step in range(-30, 31):
+        cand = round(guess + step * 0.01, 2)
+        if cand <= 0:
+            continue
+        scaled = ca_mod.inr(ca_mod.scale_paise(cap.price_paise(cand), num, den))
+        if e.trail_level(scaled) == round(float(post_level), 2):
+            return cand, scaled
+    return guess, ca_mod.inr(ca_mod.scale_paise(cap.price_paise(guess), num, den))
+
+
+def _seed_s7(e, db, ns, symbol, quote, at, level, expected_rule, qty=1, high_water=None):
+    hw = high_water if high_water is not None else high_water_for_level(e, level)
+    px = float(quote['price'])
+    db.batch([('INSERT INTO paper_positions(namespace,strategy,symbol,qty,entry_price,entry_at,high_water,mark_price,mark_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
+              (ns, 7, symbol, qty, px, at, hw, px, quote.get('quote_at') or at, at))])
+    return {'symbol': symbol, 'strategy': 7, 'entry_price': px, 'high_water': hw, 'level': e.trail_level(hw), 'expected_rule': expected_rule, 'qty': qty}
 
 
 def _budget_ok(snap, max_quotes):
@@ -166,7 +245,7 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
     ns = _require_test_ns(TEST_NS)
     lock_path = e.ROOT / 'exit_selftest.lock'
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    report = {'status': 'ok', 'namespace': ns, 'paper_only': True, 'cases': [], 'fyers_requests_used': 0}
+    report = {'status': 'ok', 'namespace': ns, 'paper_only': True, 'cases': [], 'fyers_requests_used': 0, 'holding_period_exit': holding_period_report(e)}
     previous_ns = e.NS
     lock_fh = lock_path.open('a+')
     try:
@@ -188,7 +267,7 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
         e.init(db)
         t0 = e.now()
         if live:
-            quotes = api.quotes([STOP_SYMBOL, SELL_SYMBOL])
+            quotes = api.quotes([STOP_SYMBOL, SELL_SYMBOL, GAP_SYMBOL, CA_SYMBOL])
         else:
             if not quotes_seed:
                 raise RuntimeError('quotes_seed_required')
@@ -203,6 +282,32 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
         s7 = _seed_s7_stop(e, db, ns, quotes[STOP_SYMBOL], at)
         sell = _seed_pending_sell(e, db, ns, quotes[SELL_SYMBOL], at)
         report['seeds'] = {'s7_trail_stop': s7, 'pending_sell_exit': sell}
+        needed = [STOP_SYMBOL, SELL_SYMBOL]
+        gap = None
+        if quotes.get(GAP_SYMBOL) and e_positive(quotes[GAP_SYMBOL].get('price')) is not None:
+            level, rule = choose_gap_level(quotes[GAP_SYMBOL])
+            gap = _seed_s7(e, db, ns, GAP_SYMBOL, quotes[GAP_SYMBOL], at, level, rule)
+            report['seeds']['s7_trail_gap'] = gap
+            needed.append(GAP_SYMBOL)
+        ca_seed = None
+        ca_insert = None
+        if quotes.get(CA_SYMBOL) and e_positive(quotes[CA_SYMBOL].get('price')) is not None:
+            qca = quotes[CA_SYMBOL]
+            post_level, post_rule = choose_s7_level(qca)
+            seed_hw, scaled_hw = seed_hw_for_post_level(e, post_level)
+            ca_insert = insert_test_split(db, CA_SYMBOL, at[:10], at)
+            report['ca_insert'] = ca_insert
+            if ca_insert.get('inserted'):
+                ca_seed = _seed_s7(e, db, ns, CA_SYMBOL, qca, at, e.trail_level(seed_hw), post_rule, qty=1, high_water=seed_hw)
+                ca_seed['post_level'] = post_level
+                ca_seed['post_high_water'] = scaled_hw
+                ca_seed['unadjusted_level'] = e.trail_level(seed_hw)
+                ca_seed['expected_rule'] = post_rule
+                report['seeds']['ca_adjusted_stop'] = ca_seed
+                needed.append(CA_SYMBOL)
+            else:
+                report['seeds']['ca_adjusted_stop'] = {'skipped': True, 'reason': ca_insert.get('reason')}
+        report['needed_exits'] = needed
 
         stale_case = _case('stale_quote_ignored', skipped=not stale_first, passed=not stale_first)
         if not stale_first:
@@ -230,7 +335,7 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
         while polls < int(max_quotes) and time.monotonic() <= deadline:
             last_monitor = e.monitor(db, api)
             polls += 1
-            if _sell_fill(db, ns, STOP_SYMBOL) and _sell_fill(db, ns, SELL_SYMBOL):
+            if all(_sell_fill(db, ns, sym) for sym in needed):
                 break
             if poll_seconds:
                 time.sleep(float(poll_seconds))
@@ -239,8 +344,15 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
         report['polls'] = polls
         report['last_monitor'] = {k: last_monitor.get(k) for k in ('status', 'fills', 'fresh_quotes', 'at_IST') if last_monitor}
 
-        report['cases'].append(_evaluate_s7(e, db, ns, s7, quotes[STOP_SYMBOL]))
-        report['cases'].append(_evaluate_pending_sell(e, db, ns, sell, quotes.get(SELL_SYMBOL) if live else (later_quotes or quotes).get(SELL_SYMBOL)))
+        qmap = later_quotes or quotes
+        report['cases'].append(_evaluate_s7(e, db, ns, s7, quotes[STOP_SYMBOL], name='s7_trail_stop'))
+        report['cases'].append(_evaluate_pending_sell(e, db, ns, sell, quotes.get(SELL_SYMBOL) if live else qmap.get(SELL_SYMBOL)))
+        if gap is not None:
+            report['cases'].append(_evaluate_s7(e, db, ns, gap, qmap.get(GAP_SYMBOL) or quotes.get(GAP_SYMBOL), name='s7_trail_gap'))
+        if ca_seed is not None:
+            report['cases'].append(_evaluate_ca_adjusted(e, db, ns, ca_seed, qmap.get(CA_SYMBOL) or quotes.get(CA_SYMBOL)))
+        elif quotes.get(CA_SYMBOL):
+            report['cases'].append(_case('ca_adjusted_stop', skipped=True, passed=True, reason=(report.get('ca_insert') or {}).get('reason') or 'not_seeded'))
 
         # Second monitor must not create a duplicate SELL fill.
         sells_before = len(db.query("SELECT id FROM paper_fills WHERE namespace=? AND side='SELL'", (ns,)))
@@ -261,11 +373,12 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
         else:
             report['status'] = 'failed' if report['status'] == 'ok' else report['status']
 
+        cleanup_test_ca(db)
         if cleanup_after and not keep:
             cleanup(e, db, ns)
-            report['cleanup'] = {'removed': True, 'namespace': ns}
+            report['cleanup'] = {'removed': True, 'namespace': ns, 'test_ca_removed': True}
         else:
-            report['cleanup'] = {'removed': False, 'namespace': ns}
+            report['cleanup'] = {'removed': False, 'namespace': ns, 'test_ca_removed': True}
         e.NS = previous_ns
         report['paper_v1_after'] = snapshot_ns(db, 'paper_v1')
         report['paper_v1_positions_unchanged'] = report['paper_v1_after']['positions'] == v1_before['positions']
@@ -274,9 +387,10 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
         report['status'] = 'failed'
         report['error'] = e.au.safe_error(ex)
         try:
+            cleanup_test_ca(db)
             if cleanup_after and not keep:
                 cleanup(e, db, ns)
-                report['cleanup'] = {'removed': True, 'namespace': ns, 'after_error': True}
+                report['cleanup'] = {'removed': True, 'namespace': ns, 'after_error': True, 'test_ca_removed': True}
         except Exception:
             pass
         return report
@@ -288,16 +402,18 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
             lock_fh.close()
 
 
-def _evaluate_s7(e, db, ns, seed, quote):
-    fill = _sell_fill(db, ns, STOP_SYMBOL)
-    dec = _exit_decision(db, ns, STOP_SYMBOL)
+def _evaluate_s7(e, db, ns, seed, quote, name='s7_trail_stop'):
+    symbol = seed.get('symbol') or STOP_SYMBOL
+    fill = _sell_fill(db, ns, symbol)
+    dec = _exit_decision(db, ns, symbol)
     payload = {}
     if dec and dec.get('payload_json'):
         try:
             payload = json.loads(dec['payload_json'])
         except Exception:
             payload = {}
-    case = _case('s7_trail_stop', symbol=STOP_SYMBOL, strategy=7, entry_price=seed['entry_price'],
+    quote = quote or {}
+    case = _case(name, symbol=symbol, strategy=7, entry_price=seed['entry_price'],
                  level=seed['level'], high_water=seed['high_water'], expected_rule=seed['expected_rule'],
                  quote_last=quote.get('price'), quote_open=quote.get('open'), quote_low=quote.get('low'),
                  quote_at=quote.get('quote_at'))
@@ -312,11 +428,11 @@ def _evaluate_s7(e, db, ns, seed, quote):
     case['reference_price'] = payload.get('reference_price')
     case['qty'] = fill['qty']
     case['passed'] = (
-        fill['qty'] == 1
-        and dec.get('rule') in ('trail_touch', 'trail_gap')
+        dec.get('rule') in ('trail_touch', 'trail_gap')
         and fill['execution_path'] in ('LTP_LEGACY', 'FEED_OPEN')
         and case['reference_price'] is not None
-        and not db.query('SELECT 1 FROM paper_positions WHERE namespace=? AND symbol=? AND strategy=7 AND qty>0', (ns, STOP_SYMBOL))
+        and fill['qty'] == seed.get('qty', 1)
+        and not db.query('SELECT 1 FROM paper_positions WHERE namespace=? AND symbol=? AND strategy=7 AND qty>0', (ns, symbol))
     )
     if dec.get('rule') == 'trail_touch':
         case['passed'] = bool(case['passed'] and fill['execution_path'] == 'LTP_LEGACY' and abs(float(case['reference_price']) - float(seed['level'])) < 0.005)
@@ -345,6 +461,29 @@ def _evaluate_pending_sell(e, db, ns, seed, quote):
         and fill['execution_path'] == 'FEED_OPEN'
         and not db.query('SELECT 1 FROM paper_positions WHERE namespace=? AND symbol=? AND strategy=1 AND qty>0', (ns, SELL_SYMBOL))
     )
+    return case
+
+
+def _evaluate_ca_adjusted(e, db, ns, seed, quote):
+    case = _evaluate_s7(e, db, ns, dict(seed, qty=CA_RATIO[0]), quote, name='ca_adjusted_stop')
+    case['post_level'] = seed.get('post_level')
+    case['unadjusted_level'] = seed.get('unadjusted_level')
+    scales = db.query('SELECT old_qty,new_qty,fraction_num,fraction_den FROM paper_state_scales WHERE namespace=? AND symbol=? AND kind=?', (ns, CA_SYMBOL, CA_KIND))
+    case['scaled'] = bool(scales)
+    if scales:
+        case['old_qty'] = scales[0]['old_qty']
+        case['new_qty'] = scales[0]['new_qty']
+    # The unadjusted stop is twice as high, so a trail_touch at the post-split level proves the scale ran first.
+    # Do not reuse _evaluate_s7's pass flag: that compares the fill to the pre-split level.
+    ok_fill = case.get('rule') in ('trail_touch', 'trail_gap') and case.get('reference_price') is not None and case.get('qty') == CA_RATIO[0]
+    if seed.get('expected_rule') == 'trail_touch' and case.get('rule') == 'trail_touch':
+        case['passed'] = bool(ok_fill and case.get('scaled') and case.get('new_qty') == CA_RATIO[0]
+                              and abs(float(case.get('reference_price')) - float(seed.get('post_level'))) < 0.015)
+    elif ok_fill and case.get('scaled') and case.get('new_qty') == CA_RATIO[0]:
+        case['passed'] = True
+    else:
+        case['passed'] = False
+        case['reason'] = case.get('reason') or 'scale_or_exit_mismatch'
     return case
 
 
