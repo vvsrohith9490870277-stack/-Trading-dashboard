@@ -681,11 +681,18 @@ def migrate(db):
  pos=db.query('PRAGMA table_info(paper_positions)')
  if pos and not any(c.get('name')=='pending_exit' for c in pos):
   db.batch([('ALTER TABLE paper_positions ADD COLUMN pending_exit INTEGER NOT NULL DEFAULT 0',()),('ALTER TABLE paper_positions ADD COLUMN pending_exit_since TEXT',())])
+SUPERVISION_COMMANDS = ('worker', 'ensure-monitor', 'health', 'preflight', 'ensure-session', 'guardian', 'replay-audit', 'export-logs', 'support')
+READ_ONLY_COMMANDS = ('trades-today', 'status', 'positions', 'pnl', 'charges', 'finance', 'overlap', 'funnel')
+
+def uses_engine_lock(command):
+    """Exclusive engine.lock is for mutating market/session work only. Read-only reports and the reference-feed refresh do not take it (the refresh uses reference_feeds.lock so it cannot delay the 08:45 scan)."""
+    return command not in SUPERVISION_COMMANDS and command not in READ_ONLY_COMMANDS and command != 'reference-feeds'
+
 def main():
  parser=argparse.ArgumentParser(description='Paper-only Fyers-data/Turso-ledger engine; never broker orders.')
  parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);args=parser.parse_args()
  if not 1<=args.max_history_requests<=1100 or not 1<=args.max_history_seconds<=1080:parser.error('historical repair budget outside safe bounds')
- if args.command in ['worker','ensure-monitor','health','preflight','ensure-session','guardian','replay-audit','export-logs','support']:
+ if args.command in SUPERVISION_COMMANDS:
   # Supervision must remain reachable even while a worker/scan holds engine.lock.
   try:
    db=DB();e=sys.modules[__name__]
@@ -700,6 +707,27 @@ def main():
    else:
     fn={'worker':au.worker,'ensure-monitor':au.ensure_monitor,'health':au.health,'preflight':au.preflight,'ensure-session':gd.ensure,'guardian':gd.run}[args.command]
     with al.scope(e,db,args.command):print(js(fn(e,db)))
+  except Exception as ex:
+   print(js({'status':'failed','error':au.safe_error(ex),'paper_only':True}));sys.exit(1)
+  return
+ if not uses_engine_lock(args.command):
+  # Read-only reports (and reference-feeds, which has its own lock) must not contend with the worker or the 08:45 scan.
+  try:
+   db=DB();e=sys.modules[__name__]
+   if args.command=='reference-feeds':
+    with al.scope(e,db,args.command):
+     out=rf.refresh(e,db,reference_day(now()));log('command_completed',command=args.command,namespace=NS);print(js(out))
+   else:
+    if args.command=='positions':out=db.positions()
+    elif args.command=='trades-today':out=[x for x in db.query('SELECT * FROM paper_fills WHERE namespace=? ORDER BY id',(NS,)) if datetime.fromisoformat(x['filled_at']).astimezone(IST).date()==now().date()]
+    elif args.command=='pnl':out=pnl(db)
+    elif args.command=='status':out={'paper_only':True,'namespace':NS,'market_open':is_open(now()),'calendar_valid_through':CFG['calendar_valid_through'],'last_runs':db.query('SELECT kind,at,status,details_json FROM paper_runs WHERE namespace=? ORDER BY id DESC LIMIT 5',(NS,)),'pending':db.query("SELECT * FROM paper_signals WHERE namespace=? AND status='pending'",(NS,)),'pnl':pnl(db)}
+    elif args.command=='finance':out=au.finance(e,db)
+    elif args.command=='charges':out=db.query('SELECT fill_id,day,strategy,symbol,side,policy_version,components_json,total_paise FROM paper_fill_costs WHERE namespace=? ORDER BY fill_id',(NS,))
+    elif args.command=='overlap':out=au.overlap(e,db)
+    elif args.command=='funnel':out=au.funnel(e,db)
+    else:raise ValueError('unknown_read_only_command')
+    print(js(out))
   except Exception as ex:
    print(js({'status':'failed','error':au.safe_error(ex),'paper_only':True}));sys.exit(1)
   return
@@ -729,19 +757,8 @@ def main():
      out=monitor(db,MarketData())
      if au.active(sys.modules[__name__],now()):out['pnl']=pnl(db)
      else:out['snapshot_skipped_market_closed']=True
-    elif args.command=='positions':out=db.positions()
-    elif args.command=='trades-today':out=[x for x in db.query('SELECT * FROM paper_fills WHERE namespace=? ORDER BY id',(NS,)) if datetime.fromisoformat(x['filled_at']).astimezone(IST).date()==now().date()]
-    elif args.command=='pnl':out=pnl(db)
-    elif args.command=='status':out={'paper_only':True,'namespace':NS,'market_open':is_open(now()),'calendar_valid_through':CFG['calendar_valid_through'],'last_runs':db.query('SELECT kind,at,status,details_json FROM paper_runs WHERE namespace=? ORDER BY id DESC LIMIT 5',(NS,)),'pending':db.query("SELECT * FROM paper_signals WHERE namespace=? AND status='pending'",(NS,)),'pnl':pnl(db)}
-    elif args.command=='ensure-monitor':out=au.ensure_monitor(sys.modules[__name__],db)
-    elif args.command=='health':out=au.health(sys.modules[__name__],db)
-    elif args.command=='finance':out=au.finance(sys.modules[__name__],db)
-    elif args.command=='charges':out=db.query('SELECT fill_id,day,strategy,symbol,side,policy_version,components_json,total_paise FROM paper_fill_costs WHERE namespace=? ORDER BY fill_id',(NS,))
-    elif args.command=='overlap':out=au.overlap(sys.modules[__name__],db)
-    elif args.command=='funnel':out=au.funnel(sys.modules[__name__],db)
     elif args.command=='eod':out=au.eod(sys.modules[__name__],db)
     elif args.command=='weekly':out=au.weekly(sys.modules[__name__],db)
-    elif args.command=='reference-feeds':out=rf.refresh(sys.modules[__name__],db,reference_day(now()))
     log('command_completed',command=args.command,namespace=NS)
     print(js(out))
    if args.command=='eod' and isinstance(out,dict):

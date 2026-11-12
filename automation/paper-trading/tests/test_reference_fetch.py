@@ -117,6 +117,50 @@ class RefreshTests(base.ReferenceFeedTests):
  def test_unexpected_ca_payload_is_unavailable(self):
   r=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with(ca={'error':'x'}))
   self.assertEqual(r['sources']['corporate_actions']['status'],'unavailable')
+ def test_ca_api_403_uses_http2_fallback_with_identical_mapping(self):
+  fixture=base.fixture_fetch(CFG['nse_corporate_actions_url'])
+  api=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with())
+  api_rows=self.db.query('SELECT symbol,ex_date,kind,ratio_num,ratio_den,cash_paise FROM paper_corporate_actions ORDER BY symbol,ex_date,kind')
+  self.db.batch([('DELETE FROM paper_corporate_actions',()),('DELETE FROM paper_price_bands',())])
+  def ca_fail(url,as_json=True):
+   if url.startswith(CFG['nse_corporate_actions_url']):raise RuntimeError('http_403')
+   return base.fixture_fetch(url,as_json)
+  r=rf.refresh(e,self.db,'2026-11-09',fetch=ca_fail,http2_fetch=lambda u: fixture)
+  self.assertEqual(r['sources']['corporate_actions']['status'],'ok')
+  self.assertEqual(r['sources']['corporate_actions']['via'],'http2')
+  self.assertEqual(r['sources']['corporate_actions']['source'],'NSE_CORPORATE_ACTIONS_HTTP2')
+  self.assertIn('corporate_actions',r['fallbacks'])
+  self.assertEqual(r['fallbacks']['corporate_actions']['api_error'],'http_403')
+  fb_rows=self.db.query('SELECT symbol,ex_date,kind,ratio_num,ratio_den,cash_paise FROM paper_corporate_actions ORDER BY symbol,ex_date,kind')
+  self.assertEqual(fb_rows, api_rows)
+  self.assertGreater(len(api_rows),0)
+ def test_ca_all_sources_fail_keeps_existing_rows(self):
+  self.db.batch([('INSERT INTO paper_corporate_actions(symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at) VALUES(?,?,?,?,?,?,?,?)',('RELIANCE-EQ','2026-11-09','CASH_DIVIDEND',None,None,500,'RETAINED','2026-11-11T15:40:50+05:30'))])
+  def ca_fail(url,as_json=True):
+   if url.startswith(CFG['nse_corporate_actions_url']):raise RuntimeError('http_403')
+   return base.fixture_fetch(url,as_json)
+  r=rf.refresh(e,self.db,'2026-11-09',fetch=ca_fail,http2_fetch=lambda u: (_ for _ in ()).throw(RuntimeError('http_403')))
+  self.assertEqual(r['sources']['corporate_actions']['status'],'unavailable')
+  self.assertEqual(r['sources']['corporate_actions']['error'],'http_403')
+  self.assertNotIn('via',r['sources']['corporate_actions'])
+  kept=self.db.query('SELECT symbol,ex_date,kind,cash_paise,source,recorded_at FROM paper_corporate_actions')
+  self.assertEqual(len(kept),1)
+  self.assertEqual(kept[0]['source'],'RETAINED')
+  self.assertEqual(kept[0]['cash_paise'],500)
+ def test_http2_html_is_never_parsed_as_ca_data(self):
+  with self.assertRaisesRegex(RuntimeError,'html_instead_of_data'):
+   rf.http2_json(CFG,'https://www.nseindia.com/api/corporates-corporateActions',curl_get=lambda *a,**k: '<html>Access Denied</html>')
+ def test_reference_feeds_busy_lock_fails_closed_without_writes(self):
+  import fcntl
+  lock=e.ROOT/'tests'/('feeds_lock_'+e.NS)
+  with lock.open('a+') as fh:
+   fcntl.flock(fh,fcntl.LOCK_EX)
+   r=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with(),feeds_lock=lock)
+   self.assertEqual(r['status'],'unavailable')
+   self.assertEqual(r['error'],'reference_feeds_busy')
+   self.assertEqual(self.db.query('SELECT COUNT(*) n FROM paper_corporate_actions')[0]['n'],0)
+   self.assertEqual(self.db.query('SELECT COUNT(*) n FROM paper_price_bands')[0]['n'],0)
+  lock.unlink(missing_ok=True)
  def test_dry_run_writes_nothing_and_reports_impact(self):
   self.db.batch([('INSERT INTO paper_positions(namespace,strategy,symbol,qty,entry_price,entry_at,high_water,updated_at) VALUES(?,?,?,?,?,?,?,?)',(e.NS,1,'RELIANCE-EQ',10,100,T.isoformat(),100,T.isoformat())),('INSERT INTO paper_positions(namespace,strategy,symbol,qty,entry_price,entry_at,high_water,updated_at) VALUES(?,?,?,?,?,?,?,?)',(e.NS,7,'INFY-EQ',5,100,T.isoformat(),100,T.isoformat()))])
   r=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with(),dry_run=True)

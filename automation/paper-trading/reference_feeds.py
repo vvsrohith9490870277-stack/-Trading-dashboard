@@ -9,12 +9,14 @@ Every source is fail-soft: a failed fetch is reported (never invented) and the e
 No classification threshold is invented: dividends described as special/extraordinary are routed to
 manual review because the freeze plan never defines "extraordinary".
 """
-import csv, io, re, time
+import csv, io, json, os, re, shutil, subprocess, tempfile, time, fcntl
 from datetime import date, datetime, timedelta
 from fractions import Fraction
+from pathlib import Path
 import requests
 
 SOURCE_CA = 'NSE_CORPORATE_ACTIONS_API'
+SOURCE_CA_HTTP2 = 'NSE_CORPORATE_ACTIONS_HTTP2'
 SOURCE_ASM = 'NSE_ASM_REPORT'
 SOURCE_GSM = 'NSE_GSM_REPORT'
 SOURCE_MASTER = 'FYERS_SYMBOL_MASTER'
@@ -61,7 +63,7 @@ def classify(subject):
     return []
 
 
-def corporate_action_rows(rows, symbols, isins, start, end, now_iso):
+def corporate_action_rows(rows, symbols, isins, start, end, now_iso, source=SOURCE_CA):
     """Map NSE rows to paper_corporate_actions inserts for universe symbols with ex_date in [start, end]."""
     by_nse = {s.rsplit('-', 1)[0]: s for s in symbols}
     merged, skipped = {}, {'not_in_universe': 0, 'not_equity_series': 0, 'isin_differs_symbol_matched': 0, 'outside_window': 0, 'not_a_position_event': 0}
@@ -86,7 +88,7 @@ def corporate_action_rows(rows, symbols, isins, start, end, now_iso):
             if key in merged and kind == 'CASH_DIVIDEND':
                 merged[key][5] += cash
             else:
-                merged[key] = [sym, day, kind, num, den, cash, SOURCE_CA + ':' + str(r.get('subject'))[:160], now_iso]
+                merged[key] = [sym, day, kind, num, den, cash, source + ':' + str(r.get('subject'))[:160], now_iso]
     return [tuple(v) for v in merged.values()], skipped
 
 
@@ -253,6 +255,55 @@ def _payload_rows(report):
     return len(report) if isinstance(report, list) else 0
 
 
+def http2_json(cfg, url, curl_get=None, cookie_dir=None):
+    """Same NSE URL as the requests API, but via curl --http2 and a cookie warmup (UDiFF pattern)."""
+    body = curl_get(cfg, url) if curl_get is not None else _curl_http2(cfg, url, cookie_dir)
+    text = body.decode('utf-8-sig', errors='replace') if isinstance(body, bytes) else str(body)
+    head = text.lstrip()[:200].lower()
+    if not text.strip() or head.startswith('<') or '<html' in head:
+        raise RuntimeError('html_instead_of_data')
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        raise RuntimeError('corporate_actions_unexpected_payload')
+
+
+def _curl_http2(cfg, url, cookie_dir=None):
+    curl = shutil.which('curl')
+    if not curl:
+        raise RuntimeError('curl_not_found')
+    timeout = str(int(cfg.get('timeout_seconds') or 30))
+    ua = cfg.get('user_agent') or 'Mozilla/5.0'
+    referer = (cfg.get('nse_referers') or {}).get('corporates-corporateActions') or cfg.get('nse_default_referer') or 'https://www.nseindia.com/'
+    work = Path(cookie_dir) if cookie_dir else Path(tempfile.mkdtemp(prefix='nse-ca-'))
+    work.mkdir(parents=True, exist_ok=True)
+    cookie = work / 'cookies.txt'
+    def run(target, dest, allow_non_200=False):
+        cmd = [curl, '-sS', '-L', '--http2', '-A', ua, '-e', referer, '--max-time', timeout,
+               '-c', str(cookie), '-b', str(cookie), '-o', str(dest), '-w', '%{http_code}', target]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        code = (r.stdout or '').strip()
+        try:
+            status = int(code[-3:]) if code else 0
+        except ValueError:
+            status = 0
+        if r.returncode != 0 and status == 0:
+            raise RuntimeError('curl_failed_' + str(r.returncode))
+        if not allow_non_200 and (status >= 400 or status == 0):
+            raise RuntimeError('http_' + str(status))
+        return status
+    warmup = cfg.get('nse_warmup_url') or 'https://www.nseindia.com/'
+    try:
+        run(warmup, work / 'warmup.body', allow_non_200=True)  # homepage 403 may still set cookies
+        dest = work / 'payload.body'
+        run(url, dest)
+        return dest.read_bytes()
+    finally:
+        # leave no cookie material behind in the default temp dir
+        if cookie_dir is None:
+            shutil.rmtree(work, ignore_errors=True)
+
+
 def _ca_url(cfg, day, end):
     template = cfg.get('nse_corporate_actions_range_url')
     if not template:
@@ -275,8 +326,26 @@ def impact(e, db, day, ca_rows, flags):
     }
 
 
-def refresh(e, db, trade_day, fetch=None, dry_run=False):
+def refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None, feeds_lock=None):
     """Fetch every source, write what parsed, and report errors per source. Paper data only."""
+    lock_path = Path(feeds_lock) if feeds_lock is not None else (e.ROOT / 'reference_feeds.lock')
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_fh = lock_path.open('a+')
+    try:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_fh.close()
+        return {'trade_day': str(trade_day), 'dry_run': bool(dry_run), 'sources': {}, 'status': 'unavailable', 'error': 'reference_feeds_busy'}
+    try:
+        return _refresh(e, db, trade_day, fetch=fetch, dry_run=dry_run, http2_fetch=http2_fetch)
+    finally:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        finally:
+            lock_fh.close()
+
+
+def _refresh(e, db, trade_day, fetch=None, dry_run=False, http2_fetch=None):
     cfg = e.CFG['reference_feeds']
     fetcher = None
     if fetch is None:
@@ -287,12 +356,27 @@ def refresh(e, db, trade_day, fetch=None, dry_run=False):
     write = (lambda statements: None) if dry_run else db.batch
     rows = []
     try:
-        payload = fetch(_ca_url(cfg, day, end))
-        if not isinstance(payload, list):
-            raise RuntimeError('corporate_actions_unexpected_payload')
-        rows, skipped = corporate_action_rows(payload, symbols, isins, day, end, now_iso)
+        via = 'api'
+        ca_source = SOURCE_CA
+        try:
+            payload = fetch(_ca_url(cfg, day, end))
+            if not isinstance(payload, list):
+                raise RuntimeError('corporate_actions_unexpected_payload')
+        except Exception as api_error:
+            getter = http2_fetch
+            if getter is None and fetcher is not None:
+                getter = lambda u, _cfg=cfg: http2_json(_cfg, u)
+            if getter is None:
+                raise
+            payload = getter(_ca_url(cfg, day, end))
+            if not isinstance(payload, list):
+                raise RuntimeError('corporate_actions_unexpected_payload')
+            via = 'http2'
+            ca_source = SOURCE_CA_HTTP2
+            report.setdefault('fallbacks', {})['corporate_actions'] = {'api_error': e.au.safe_error(api_error)}
+        rows, skipped = corporate_action_rows(payload, symbols, isins, day, end, now_iso, source=ca_source)
         write([('INSERT INTO paper_corporate_actions(symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(symbol,ex_date,kind) DO UPDATE SET ratio_num=excluded.ratio_num,ratio_den=excluded.ratio_den,cash_paise=excluded.cash_paise,source=excluded.source,recorded_at=excluded.recorded_at', r) for r in rows])
-        report['sources']['corporate_actions'] = {'status': 'ok', 'rows_received': len(payload), 'rows_written': 0 if dry_run else len(rows), 'rows_matched': len(rows), 'window': [day, end], 'skipped': skipped, 'kinds': sorted({r[2] for r in rows})}
+        report['sources']['corporate_actions'] = {'status': 'ok', 'via': via, 'source': ca_source, 'rows_received': len(payload), 'rows_written': 0 if dry_run else len(rows), 'rows_matched': len(rows), 'window': [day, end], 'skipped': skipped, 'kinds': sorted({r[2] for r in rows})}
     except Exception as ex:
         rows = []
         report['sources']['corporate_actions'] = {'status': 'unavailable', 'error': e.au.safe_error(ex)}
