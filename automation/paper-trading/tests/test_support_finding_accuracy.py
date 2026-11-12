@@ -41,11 +41,25 @@ class FindingAccuracy(unittest.TestCase):
         self.store.close()
         self.tdb.c.close()
 
-    def ev(self, at, event_type, data=None, outcome='ok'):
+    def ev(self, at, event_type, data=None, outcome='ok', ns=NS, side=None, symbol=None, extra=None):
         self.n += 1
+        payload = dict(data or {})
+        if side:
+            payload.setdefault('side', side)
+        if symbol:
+            payload.setdefault('symbol', symbol)
+        if extra:
+            payload.update(extra)
         self.tdb.batch([(
             'INSERT INTO paper_events(namespace,event_id,run_id,session_day,source_at,recorded_at,event_type,severity,outcome,data_json) VALUES(?,?,?,?,?,?,?,?,?,?)',
-            (NS, f'e{self.n:05d}', 'r', DAY, at, at, event_type, 'INFO', outcome, json.dumps(data or {})),
+            (ns, f'e{self.n:05d}', 'r', DAY, at, at, event_type, 'INFO', outcome, json.dumps(payload)),
+        )])
+
+    def fill(self, at, side='BUY', symbol='AAA-EQ', ns=NS, price=100.0, qty=1):
+        self.n += 1
+        self.tdb.batch([(
+            'INSERT INTO paper_fills(namespace,signal_id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl,cashflow,execution_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',
+            (ns, f's{self.n}', 1, symbol, side, qty, price, at, at, 'test', 0, 0, 'FEED_OPEN'),
         )])
 
     def run_det(self, now='2026-11-11T16:45:00+05:30'):
@@ -177,6 +191,51 @@ class FindingAccuracy(unittest.TestCase):
         mid = sa.parse_ist('2026-11-11T10:00:00+05:30')
         self.assertEqual(sa.latency_clock_start(pre, start), start)
         self.assertEqual(sa.latency_clock_start(mid, start), mid)
+
+    def test_scan_started_on_time_and_finished_before_open_is_not_missed(self):
+        # 12 Nov shape: started 08:50 IST, completed 09:01 IST (past 09:00 grace, before 09:15 open).
+        self.ev('2026-11-11T08:50:51+05:30', 'scan_started')
+        self.ev('2026-11-11T09:01:27+05:30', 'scan_completed')
+        self.run_det('2026-11-11T11:15:00+05:30')
+        self.assertEqual(self.findings('scan_missed'), [])
+
+    def test_scan_completed_after_open_without_on_time_start_is_missed(self):
+        self.ev('2026-11-11T09:13:40+05:30', 'scan_completed')
+        self.run_det('2026-11-11T11:15:00+05:30')
+        self.assertEqual(len(self.findings('scan_missed')), 1)
+
+    def test_monitor_started_within_grace_is_not_worker_down(self):
+        self.ev('2026-11-11T09:15:40+05:30', 'monitor_started')
+        self.ev('2026-11-11T09:17:08+05:30', 'monitor_completed')
+        self.ev('2026-11-11T09:18:15+05:30', 'monitor_completed')
+        self.run_det('2026-11-11T11:15:00+05:30')
+        self.assertEqual(self.findings('worker_down'), [])
+        # No completion-to-completion gap above 120s, so no staleness either.
+        self.assertEqual(self.findings('monitor_staleness'), [])
+
+    def test_monitor_staleness_still_flags_a_real_completion_gap(self):
+        self.ev('2026-11-11T09:15:40+05:30', 'monitor_started')
+        self.ev('2026-11-11T09:17:00+05:30', 'monitor_completed')
+        self.ev('2026-11-11T10:24:00+05:30', 'monitor_completed')  # 67-minute gap, not <2 min
+        self.run_det('2026-11-11T11:15:00+05:30')
+        stale = self.findings('monitor_staleness')
+        self.assertEqual(len(stale), 1)
+        self.assertGreater(stale[0]['details']['max_check_gap_seconds'], 120)
+
+    def test_exit_selftest_sell_prevents_exit_path_unexercised(self):
+        # paper_v1 had only buys; isolated selftest exercised the live SELL/trail path.
+        self.fill('2026-11-11T09:16:00+05:30', side='BUY', symbol='DLF-EQ')
+        self.fill('2026-11-11T10:46:28+05:30', side='SELL', symbol='HDFCBANK-EQ', ns='paper_exit_test_v1')
+        self.ev('2026-11-11T10:46:38+05:30', 'paper_fill_attempt', ns='paper_exit_test_v1',
+                extra={'result': {'filled': True, 'side': 'SELL', 'symbol': 'RELIANCE-EQ', 'rule': 'trail_touch'}})
+        self.ev('2026-11-11T10:47:29+05:30', 'command_completed', ns='paper_exit_test_v1', extra={'command': 'exit-selftest', 'status': 'ok'})
+        self.run_det('2026-11-11T16:45:00+05:30')
+        self.assertEqual(self.findings('exit_path_unexercised'), [])
+
+    def test_exit_path_unexercised_when_selftest_absent(self):
+        self.fill('2026-11-11T09:16:00+05:30', side='BUY', symbol='DLF-EQ')
+        self.run_det('2026-11-11T16:45:00+05:30')
+        self.assertEqual(len(self.findings('exit_path_unexercised')), 1)
 
 
 if __name__ == '__main__':

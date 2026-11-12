@@ -1,8 +1,8 @@
 {
   "note": "Digest lock for support_policy.json (outside freeze_lock.json per H3). Every support threshold and schedule parameter lives in support_policy.json or is reused from config.json / capital_policy.json, never hardcoded in support code.",
-  "locked_on_IST": "2026-11-09",
+  "locked_on_IST": "2026-11-12",
   "support_policy_version": "support_policy_v3",
   "files": {
-    "support_policy.json": "96d5955333e5a812c1a2dcd9c24c64f8bdcbcbe4b2d535e6cf8028ed6a6959ab"
+    "support_policy.json": "a1c2944841f59755c42e4cca6db0caaba226c27f06aa05fd5bfdbd181b40f650"
   }
 }

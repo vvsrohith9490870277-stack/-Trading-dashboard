@@ -58,7 +58,8 @@ def engine_log_events(path, session_day, namespace):
                 day = str(at)[:10]
             if day != session_day:
                 continue
-            if ev.get('namespace') and ev.get('namespace') != namespace:
+            ev_ns = ev.get('namespace')
+            if ev_ns and ev_ns != namespace and not str(ev_ns).startswith('paper_exit_test'):
                 continue
             kind = ev.get('kind') or ev.get('event_type') or ev.get('action') or 'engine_log'
             # Drop obviously credential-bearing keys if a future log line ever includes them.
@@ -124,9 +125,9 @@ def main(argv=None):
 
     snap_path = Path(os.environ.get('SUPPORT_SNAPSHOT_PATH') or (STATE / 'snapshots' / f'support-{day}.sqlite'))
     counts = snapshot.build(snap_path, [
-        ('paper_events', 'namespace=? AND session_day=?', (ns, day)),
+        ('paper_events', 'session_day=? AND (namespace=? OR namespace LIKE ?)', (day, ns, 'paper_exit_test%')),
         ('paper_decisions', 'namespace=?', (ns,)),
-        ('paper_fills', 'namespace=?', (ns,)),
+        ('paper_fills', 'namespace=? OR namespace LIKE ?', (ns, 'paper_exit_test%')),
         ('paper_signals', 'namespace=?', (ns,)),
         ('paper_price_bands', 'trade_date=?', (day,)),
     ])

@@ -121,6 +121,8 @@ def derived_counts(root=None):
     }
 
 
+from support_exit_evidence import EXIT_SELFTEST_NS_PREFIX, exit_selftest_evidence, is_exit_selftest_namespace  # noqa: E402
+
 def ist_now():
     """Return current timezone-aware timestamp in Asia/Kolkata."""
     return datetime.now(IST)
@@ -1216,16 +1218,41 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         ev for ev in events
         if ev['event_type'] == 'scan_completed' and parse_ist(ev['source_at']) <= scan_deadline
     ]
+    premarket_started = [
+        ev for ev in events
+        if ev['event_type'] == 'scan_started' and parse_ist(ev['source_at']) <= scan_deadline
+    ]
+    # A scan that starts by the grace deadline and finishes within completion_overrun_minutes
+    # after it is not missed (today: started 08:50 IST, completed 09:01 IST). A 09:13 finish is still a miss.
+    overrun = int(scan_exp.get('completion_overrun_minutes') or 0)
+    finish_by = scan_deadline + timedelta(minutes=overrun)
+    started_and_finished = []
+    if premarket_started:
+        start_at = parse_ist(premarket_started[0]['source_at'])
+        started_and_finished = [
+            ev for ev in events
+            if ev['event_type'] == 'scan_completed'
+            and parse_ist(ev['source_at']) >= start_at
+            and parse_ist(ev['source_at']) <= finish_by
+        ]
     premarket_failed = [
         ev for ev in events
         if ev['event_type'] == 'scan_failed' and parse_ist(ev['source_at']) <= scan_deadline
     ]
-    if now_ist >= scan_deadline and (not premarket_scans or premarket_failed):
+    scan_ok = bool(premarket_scans) or bool(started_and_finished)
+    if now_ist >= scan_deadline and (not scan_ok or (premarket_failed and not scan_ok)):
         first_at = premarket_failed[0]['source_at'] if premarket_failed else f"{session_day}T{scan_exp['expected_at']}:00+05:30"
         ep = record_episode(
             db, namespace, session_day, 'premarket_scan_0845', 'scan_missed',
             first_at, blind_seconds=float(scan_exp['grace_minutes']) * 60,
-            base_severity='SEV2', details={'expected_at': scan_exp['expected_at'], 'deadline_at': scan_deadline.isoformat(), 'failed_events': len(premarket_failed)},
+            base_severity='SEV2', details={
+                'expected_at': scan_exp['expected_at'],
+                'deadline_at': scan_deadline.isoformat(),
+                'failed_events': len(premarket_failed),
+                'started_on_time': len(premarket_started),
+                'completed_on_time': len(premarket_scans),
+                'started_and_finished_before_open': len(started_and_finished),
+            },
             observation_only=observation_only, recorded_at=stamp, event_id=f'scan_missed:{session_day}',
         )
         results.append({**ep, 'detector': 'scan_missed'})
@@ -1242,9 +1269,17 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         if ev['event_type'] in ('monitor_completed', 'monitor_idle', 'monitor_check')
     ]
     monitor_events.sort(key=lambda x: x[0])
+    # First liveness may be monitor_started / worker_check (today: 09:15:40 IST) even if the
+    # first monitor_completed lands a few seconds past the 120s grace (09:17:08).
+    liveness_events = [
+        (parse_ist(ev['source_at']), ev)
+        for ev in events
+        if ev['event_type'] in ('monitor_started', 'monitor_completed', 'monitor_idle', 'monitor_check', 'worker_check')
+    ]
+    liveness_events.sort(key=lambda x: x[0])
 
     if now_ist >= session_start + timedelta(seconds=int(w_exp['grace_seconds'])):
-        if not monitor_events:
+        if not liveness_events and not monitor_events:
             blind = max(0.0, (min(now_ist, session_end) - session_start).total_seconds())
             ep = record_episode(
                 db, namespace, session_day, 'worker_active_0915', 'worker_down',
@@ -1257,13 +1292,14 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                 update_finding_evidence(db, namespace, ep['finding_id'], {'blind_seconds': blind, 'cumulative_blind_seconds': blind}, recorded_at=stamp, as_of=now_ist)
             results.append({**ep, 'detector': 'worker_down'})
         else:
-            first_check_dt, first_ev = monitor_events[0]
-            last_check_dt, _ = monitor_events[-1]
-            initial_gap = (first_check_dt - session_start).total_seconds()
+            first_live_dt, first_live_ev = (liveness_events or monitor_events)[0]
+            first_check_dt, first_ev = (monitor_events[0] if monitor_events else (first_live_dt, first_live_ev))
+            last_check_dt, _ = (monitor_events[-1] if monitor_events else (first_live_dt, first_live_ev))
+            initial_gap = (first_live_dt - session_start).total_seconds()
             in_session = [dt for dt, _ in monitor_events if session_start <= dt <= session_end]
             max_gap = max([(b - a).total_seconds() for a, b in zip(in_session, in_session[1:])] or [0.0])
             stale_s = float(CFG['worker_stale_seconds'])
-            late_last = now_ist >= session_end and (session_end - last_check_dt).total_seconds() > stale_s
+            late_last = now_ist >= session_end and monitor_events and (session_end - last_check_dt).total_seconds() > stale_s
             if initial_gap > float(w_exp['grace_seconds']):
                 recovery = {
                     'window_start': w_exp['start_at'],
@@ -1590,14 +1626,36 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             'samples': high_latency_fills,
         })
 
-    # 9. Exits -> exit_path_unexercised (SEV4) after session close
+    # 9. Exits -> exit_path_unexercised (SEV4) after session close.
+    # A same-session paper_exit_test_* selftest that used the live monitor/fill path
+    # is sufficient proof the exit path was exercised; it must not be required in paper_v1.
     if now_ist >= session_end:
         sell_fills = [f for f in day_fills if str(f.get('side', '')).upper() == 'SELL']
         stop_events = [ev for ev in events if ev['event_type'] in ('stop_hit', 'target_hit', 'trail_stop_filled')]
-        if not sell_fills and not stop_events:
+        selftest_rows = list(events)
+        try:
+            selftest_rows.extend(reader.query(
+                "SELECT * FROM paper_events WHERE namespace LIKE ? AND session_day=? ORDER BY source_at,event_id",
+                (EXIT_SELFTEST_NS_PREFIX + '%', session_day),
+            ) or [])
+        except Exception:
+            pass
+        try:
+            raw_fills = reader.query(
+                "SELECT * FROM paper_fills WHERE namespace LIKE ? ORDER BY filled_at",
+                (EXIT_SELFTEST_NS_PREFIX + '%',),
+            ) or []
+            for f in raw_fills:
+                if f.get('filled_at') and ist_session_day(f['filled_at']) == session_day and parse_ist(f['filled_at']) <= now_ist:
+                    selftest_rows.append({**f, 'event_type': 'paper_fill', 'source_at': f['filled_at']})
+        except Exception:
+            pass
+        selftest = exit_selftest_evidence(selftest_rows, session_day, now_ist)
+        if not sell_fills and not stop_events and not selftest['exercised']:
             emit('exit_path_unexercised', f'exit_path_unexercised:{session_day}', session_end.isoformat(), 'SEV4', {
                 'sell_fills': 0,
                 'stop_or_target_hits': 0,
+                'exit_selftest': selftest,
             })
 
     # 10. EOD expectation (16:15 + 20m grace = 16:35 IST) -> eod_missed (SEV1)

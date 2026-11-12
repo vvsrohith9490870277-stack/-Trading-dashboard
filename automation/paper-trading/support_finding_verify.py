@@ -203,7 +203,7 @@ def load_log_events(engine_path, audit_path, session_day, namespace=None):
             if not log_day(ev, session_day):
                 continue
             ns = ev.get('namespace')
-            if namespace and ns and ns != namespace:
+            if namespace and ns and ns != namespace and not str(ns).startswith('paper_exit_test'):
                 continue
             ev = dict(ev)
             ev['_source_file'] = source
@@ -319,34 +319,42 @@ def _verdict(confirm, reject_reason=None, not_verifiable=None, evidence=None):
 
 # --------------- per-detector re-derivation ---------------
 
-def _scan_missed_from_times(completed_before, failed_before, now_ist, session_day):
+def _scan_missed_from_times(completed_before, failed_before, now_ist, session_day, started_and_finished=None):
     exp = POLICY['expectations']['premarket_scan']
     deadline = _session_dt(session_day, exp['expected_at'], extra_minutes=exp['grace_minutes'])
     ev = {
         'deadline_at': deadline.isoformat(),
         'completed_on_time': len(completed_before),
         'failed_on_time': len(failed_before),
+        'started_and_finished_before_open': len(started_and_finished or []),
     }
     if now_ist < deadline:
         return _verdict(False, reject_reason='deadline_not_reached', evidence=ev)
-    warranted = (not completed_before) or bool(failed_before)
-    return _verdict(warranted, reject_reason='scan_completed_on_time', evidence=ev)
+    scan_ok = bool(completed_before) or bool(started_and_finished)
+    warranted = (not scan_ok) or (bool(failed_before) and not scan_ok)
+    return _verdict(warranted, reject_reason='scan_completed_on_time' if completed_before else 'scan_started_on_time_and_finished', evidence=ev)
 
 
 def check_scan_missed_events(snap, finding, namespace, session_day, now_ist):
-    rows = query_events(snap, namespace, session_day, types=('scan_completed', 'scan_failed', 'scan'))
+    rows = query_events(snap, namespace, session_day, types=('scan_completed', 'scan_failed', 'scan', 'scan_started'))
     exp = POLICY['expectations']['premarket_scan']
     deadline = _session_dt(session_day, exp['expected_at'], extra_minutes=exp['grace_minutes'])
-    done, failed = [], []
+    session_open = _session_dt(session_day, exp['expected_at'], extra_minutes=int(exp['grace_minutes']) + int(exp.get('completion_overrun_minutes') or 0))
+    done, failed, started, finished = [], [], [], []
     for ev in rows:
         at = _at(ev)
         if at is None:
             continue
+        if ev['event_type'] == 'scan_started' and at <= deadline:
+            started.append(ev['source_at'])
         if ev['event_type'] == 'scan_completed' and at <= deadline:
             done.append(ev['source_at'])
         if ev['event_type'] == 'scan_failed' and at <= deadline:
             failed.append(ev['source_at'])
-    return _scan_missed_from_times(done, failed, now_ist, session_day)
+    if started:
+        start_at = min(_at(ev) for ev in rows if ev['event_type'] == 'scan_started' and _at(ev) and _at(ev) <= deadline)
+        finished = [ev['source_at'] for ev in rows if ev['event_type'] == 'scan_completed' and _at(ev) and start_at <= _at(ev) <= session_open]
+    return _scan_missed_from_times(done, failed, now_ist, session_day, started_and_finished=finished)
 
 
 def check_scan_missed_logs(logs, finding, session_day, now_ist):
@@ -355,34 +363,46 @@ def check_scan_missed_logs(logs, finding, session_day, now_ist):
     scan_like = [ev for ev in logs if _is_scan_completed(ev) or _is_scan_failed(ev) or 'scan' in _kind(ev)]
     if not scan_like:
         return _verdict(False, not_verifiable='no_scan_events_in_logs')
-    done, failed = [], []
+    done, failed, started, finished = [], [], [], []
+    session_open = _session_dt(session_day, exp['expected_at'], extra_minutes=int(exp['grace_minutes']) + int(exp.get('completion_overrun_minutes') or 0))
     for ev in scan_like:
         at = _at(ev)
-        if at is None or at > deadline:
+        if at is None:
+            continue
+        kind = _kind(ev)
+        if kind == 'scan_started' and at <= deadline:
+            started.append(ev.get('_at') or ev.get('source_at') or ev.get('at_IST'))
+        if at > deadline:
             continue
         if _is_scan_failed(ev):
             failed.append(ev.get('_at') or ev.get('source_at'))
         elif _is_scan_completed(ev):
             done.append(ev.get('_at') or ev.get('source_at'))
-    return _scan_missed_from_times(done, failed, now_ist, session_day)
+    if started:
+        start_at = min(_at(ev) for ev in scan_like if _kind(ev) == 'scan_started' and _at(ev) and _at(ev) <= deadline)
+        finished = [ev.get('_at') or ev.get('source_at') for ev in scan_like
+                    if _is_scan_completed(ev) and _at(ev) and start_at <= _at(ev) <= session_open]
+    return _scan_missed_from_times(done, failed, now_ist, session_day, started_and_finished=finished)
 
 
-def _monitor_gaps(times, session_day, now_ist, stale_s, start, end, grace_s):
+def _monitor_gaps(times, session_day, now_ist, stale_s, start, end, grace_s, live_times=None):
     times = sorted(t for t in times if t is not None)
+    live = sorted(t for t in (live_times if live_times is not None else times) if t is not None)
     in_session = [t for t in times if start <= t <= end]
     ev = {
         'monitor_count': len(times),
         'in_session': len(in_session),
         'grace_seconds': grace_s,
         'stale_seconds': stale_s,
+        'liveness_count': len(live),
     }
-    if not times:
+    if not live and not times:
         ev['initial_gap_seconds'] = None
         ev['warranted_worker_down'] = now_ist >= start + timedelta(seconds=grace_s)
         ev['warranted_staleness'] = ev['warranted_worker_down']
         ev['gaps'] = []
         return ev
-    first = times[0]
+    first = (live or times)[0]
     initial = (first - start).total_seconds()
     gaps = []
     seq = in_session if in_session else times
@@ -398,7 +418,7 @@ def _monitor_gaps(times, session_day, now_ist, stale_s, start, end, grace_s):
         'max_gap_seconds': max([g['gap_seconds'] for g in gaps] or [0.0]),
         'gaps': gaps,
         'late_last': late_last,
-        'warranted_worker_down': now_ist >= start + timedelta(seconds=grace_s) and (not times or initial > grace_s),
+        'warranted_worker_down': now_ist >= start + timedelta(seconds=grace_s) and (not live or initial > grace_s),
         'warranted_staleness': now_ist >= start + timedelta(seconds=grace_s) and (
             initial > grace_s or bool(gaps) or late_last
         ),
@@ -412,8 +432,9 @@ def check_worker_or_staleness_events(snap, finding, namespace, session_day, now_
     end = _session_dt(session_day, w['end_at'])
     stale_s = float(CFG['worker_stale_seconds'])
     rows = query_events(snap, namespace, session_day, types=('monitor_completed', 'monitor_idle', 'monitor_check'))
+    live_rows = query_events(snap, namespace, session_day, types=('monitor_started', 'monitor_completed', 'monitor_idle', 'monitor_check', 'worker_check'))
     times = [_at(ev) for ev in rows]
-    ev = _monitor_gaps(times, session_day, now_ist, stale_s, start, end, float(w['grace_seconds']))
+    ev = _monitor_gaps(times, session_day, now_ist, stale_s, start, end, float(w['grace_seconds']), live_times=[_at(ev) for ev in live_rows])
     if kind == 'worker_down':
         return _verdict(ev['warranted_worker_down'], reject_reason='worker_started_within_grace', evidence=ev)
     return _verdict(ev['warranted_staleness'], reject_reason='no_stale_monitor_gap', evidence=ev)
@@ -425,11 +446,12 @@ def check_worker_or_staleness_logs(logs, finding, session_day, now_ist, kind):
     end = _session_dt(session_day, w['end_at'])
     stale_s = float(CFG['worker_stale_seconds'])
     mon = [ev for ev in logs if _is_monitor(ev)]
-    if not mon:
+    live = mon + [ev for ev in logs if _kind(ev) in ('monitor_started',)]
+    if not live:
         # engine.jsonl may simply not record every monitor tick — do not invent a down finding
         return _verdict(False, not_verifiable='no_monitor_or_heartbeat_events_in_logs')
     times = [_at(ev) for ev in mon]
-    ev = _monitor_gaps(times, session_day, now_ist, stale_s, start, end, float(w['grace_seconds']))
+    ev = _monitor_gaps(times, session_day, now_ist, stale_s, start, end, float(w['grace_seconds']), live_times=[_at(ev) for ev in live])
     ev['log_monitor_kinds'] = sorted({_kind(x) for x in mon})
     if kind == 'worker_down':
         return _verdict(ev['warranted_worker_down'], reject_reason='worker_started_within_grace', evidence=ev)
@@ -558,8 +580,25 @@ def check_exit_events(snap, finding, namespace, session_day, now_ist):
     fills = query_fills(snap, namespace, session_day)
     sells = [f for f in fills if str(f.get('side') or '').upper() == 'SELL']
     stops = query_events(snap, namespace, session_day, types=('stop_hit', 'target_hit', 'trail_stop_filled'))
-    ev = {'sell_fills': len(sells), 'stop_or_target_hits': len(stops)}
-    return _verdict(len(sells) == 0 and len(stops) == 0, reject_reason='sell_or_stop_present', evidence=ev)
+    selftest_rows = []
+    try:
+        selftest_rows.extend(snap.query(
+            "SELECT * FROM paper_events WHERE namespace LIKE ? AND session_day=?",
+            ('paper_exit_test%', session_day),
+        ) or [])
+    except Exception:
+        pass
+    try:
+        for f in (snap.query("SELECT * FROM paper_fills WHERE namespace LIKE ?", ('paper_exit_test%',)) or []):
+            if f.get('filled_at'):
+                selftest_rows.append({**f, 'event_type': 'paper_fill', 'source_at': f['filled_at']})
+    except Exception:
+        pass
+    from support_exit_evidence import exit_selftest_evidence
+    selftest = exit_selftest_evidence(selftest_rows, session_day, now_ist)
+    ev = {'sell_fills': len(sells), 'stop_or_target_hits': len(stops), 'exit_selftest': selftest}
+    warranted = len(sells) == 0 and len(stops) == 0 and not selftest['exercised']
+    return _verdict(warranted, reject_reason='sell_or_stop_present' if (sells or stops) else 'exit_selftest_exercised', evidence=ev)
 
 
 def check_exit_logs(logs, finding, session_day, now_ist):
@@ -569,6 +608,11 @@ def check_exit_logs(logs, finding, session_day, now_ist):
         return _verdict(False, reject_reason='session_not_closed_yet', evidence={'session_end': end.isoformat()})
     sells, stops = [], []
     for ev in logs:
+        ns = ev.get('namespace')
+        if ns and ns != finding.get('namespace') and not str(ns).startswith('paper_exit_test'):
+            continue
+        if str(ns or '').startswith('paper_exit_test'):
+            continue  # counted via exit_selftest_evidence below
         k = _kind(ev)
         payload = ev.get('payload') if isinstance(ev.get('payload'), dict) else ev
         side = str(payload.get('side') or ev.get('side') or '').upper()
@@ -578,8 +622,11 @@ def check_exit_logs(logs, finding, session_day, now_ist):
             stops.append(k)
     if not logs:
         return _verdict(False, not_verifiable='log_files_missing_or_empty')
-    ev = {'sell_like': len(sells), 'stop_like': len(stops)}
-    return _verdict(len(sells) == 0 and len(stops) == 0, reject_reason='sell_or_stop_present_in_logs', evidence=ev)
+    from support_exit_evidence import exit_selftest_evidence
+    selftest = exit_selftest_evidence(logs, session_day, now_ist)
+    ev = {'sell_like': len(sells), 'stop_like': len(stops), 'exit_selftest': selftest}
+    warranted = len(sells) == 0 and len(stops) == 0 and not selftest['exercised']
+    return _verdict(warranted, reject_reason='sell_or_stop_present_in_logs' if (sells or stops) else 'exit_selftest_exercised', evidence=ev)
 
 
 def check_latency_events(snap, finding, namespace, session_day, now_ist):

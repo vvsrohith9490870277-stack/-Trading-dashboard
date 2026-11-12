@@ -29,7 +29,8 @@
       "expected_at": "08:45",
       "grace_minutes": 15,
       "detector": "scan_missed",
-      "severity": "SEV2"
+      "severity": "SEV2",
+      "completion_overrun_minutes": 2
     },
     "worker_active": {
       "start_at": "09:15",

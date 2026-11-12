@@ -19,12 +19,12 @@ def _snap(events, fills=None, signals=None):
     c.execute('CREATE TABLE paper_signals(namespace TEXT,id TEXT,symbol TEXT,created_at TEXT)')
     for i, ev in enumerate(events):
         c.execute('INSERT INTO paper_events VALUES(?,?,?,?,?,?,?,?,?,?,?)', (
-            NS, ev.get('event_id', f'e{i}'), 'run', DAY, ev['source_at'], ev['source_at'],
+            ev.get('namespace', NS), ev.get('event_id', f'e{i}'), 'run', ev.get('session_day', DAY), ev['source_at'], ev['source_at'],
             ev['event_type'], 'INFO', ev.get('outcome', 'ok'), ev.get('data_json', '{}'), ev.get('signal_id'),
         ))
     for i, f in enumerate(fills or []):
         c.execute('INSERT INTO paper_fills VALUES(?,?,?,?,?,?,?,?,?,?)', (
-            NS, f.get('id', f'f{i}'), f.get('symbol', 'AAA-EQ'), f.get('strategy', 1),
+            f.get('namespace', NS), f.get('id', f'f{i}'), f.get('symbol', 'AAA-EQ'), f.get('strategy', 1),
             f.get('side', 'BUY'), f['price'], f['qty'], f['filled_at'], f.get('signal_id'), DAY,
         ))
     for s in signals or []:
@@ -218,6 +218,41 @@ class FindingVerifiers(unittest.TestCase):
         self.assertEqual(sfv.aggregate_status(['CONFIRM', 'REJECT']), 'disputed')
         self.assertEqual(sfv.aggregate_status(['REJECT', 'REJECT']), 'rejected')
         self.assertEqual(sfv.aggregate_status(['CONFIRM', 'NOT_VERIFIABLE']), 'unconfirmed')
+
+    def test_scan_missed_rejected_when_started_on_time_and_finished_before_open(self):
+        events = [
+            {'event_type': 'scan_started', 'source_at': f'{DAY}T08:50:51+05:30'},
+            {'event_type': 'scan_completed', 'source_at': f'{DAY}T09:01:27+05:30'},
+        ]
+        snap = _snap(events)
+        tmp = Path(tempfile.mkdtemp())
+        engine, audit = _logs(tmp, engine_rows=[
+            {'kind': 'scan_started', 'at_IST': f'{DAY}T08:50:51+05:30', 'namespace': NS},
+            {'kind': 'command_completed', 'command': 'scan', 'outcome': 'ok', 'at_IST': f'{DAY}T09:01:27+05:30', 'namespace': NS},
+        ])
+        rec = sfv.verify_findings([_finding('scan_missed')], snapshot_path=snap, engine_path=engine, audit_path=audit,
+                                  namespace=NS, session_day=DAY, now_ist=_now('16:45'))['findings'][0]
+        self.assertEqual(rec['status'], 'rejected')
+        self.assertEqual([v['verdict'] for v in rec['verifiers']], ['REJECT', 'REJECT'])
+
+    def test_exit_path_rejected_when_selftest_sell_in_isolated_namespace(self):
+        fills = [{'symbol': 'DLF-EQ', 'side': 'BUY', 'price': 100.0, 'qty': 1, 'filled_at': f'{DAY}T09:16:00+05:30'}]
+        snap = _snap([], fills=fills + [
+            {'namespace': 'paper_exit_test_v1', 'symbol': 'HDFCBANK-EQ', 'side': 'SELL', 'price': 802.6, 'qty': 1,
+             'filled_at': f'{DAY}T10:46:28+05:30'},
+        ])
+        tmp = Path(tempfile.mkdtemp())
+        engine, audit = _logs(tmp, engine_rows=[
+            {'kind': 'paper_fill_attempt', 'at_IST': f'{DAY}T10:46:38+05:30', 'namespace': 'paper_exit_test_v1',
+             'symbol': 'RELIANCE-EQ', 'result': {'filled': True, 'side': 'SELL', 'rule': 'trail_touch'}},
+            {'kind': 'command_completed', 'command': 'exit-selftest', 'status': 'ok',
+             'at_IST': f'{DAY}T10:47:29+05:30', 'namespace': 'paper_exit_test_v1'},
+        ])
+        rec = sfv.verify_findings([_finding('exit_path_unexercised', severity='SEV4')], snapshot_path=snap,
+                                  engine_path=engine, audit_path=audit, namespace=NS, session_day=DAY,
+                                  now_ist=_now('16:45'))['findings'][0]
+        self.assertEqual(rec['status'], 'rejected')
+        self.assertEqual([v['verdict'] for v in rec['verifiers']], ['REJECT', 'REJECT'])
 
 
 if __name__ == '__main__':
