@@ -29,6 +29,9 @@ def fixture_fetch(url, as_json=True):
         return {'longterm': {'data': [{'symbol': 'INFY', 'isin': e.ISINS['INFY-EQ'], 'asmSurvIndicator': 'Stage I'}]}, 'shortterm': {'data': []}}
     if url == cfg['nse_gsm_url']:
         raise RuntimeError('http_403')
+    if url in (cfg.get('nse_gsm_archive_urls') or []):
+        # Valid header, no universe names — documents that API 403 falls back without inventing flags.
+        return '\ufeff"SR. NO \n","SYMBOL \n","COMPANY NAME \n","ISIN \n","GSM STAGE \n"\n1,"NOTINUNIVERSE","Other Ltd","INE000X00000","GSM - I (1)"\n'
     if url == cfg['fyers_symbol_master_url']:
         return MASTER
     raise AssertionError(url)
@@ -58,7 +61,10 @@ class ReferenceFeedTests(unittest.TestCase):
         r = rf.refresh(e, self.db, '2026-11-09', fetch=fixture_fetch)
         self.assertEqual(r['sources']['corporate_actions']['rows_written'], 2)
         self.assertEqual(r['sources']['corporate_actions']['skipped'], {'not_in_universe': 1, 'not_equity_series': 1, 'isin_differs_symbol_matched': 1, 'outside_window': 1, 'not_a_position_event': 0})
-        self.assertEqual(r['sources']['gsm']['status'], 'unavailable')
+        self.assertEqual(r['sources']['gsm']['status'], 'ok')
+        self.assertEqual(r['sources']['gsm']['via'], 'archive_csv')
+        self.assertEqual(r['sources']['gsm']['universe_symbols_flagged'], 0)
+        self.assertIn('gsm', r['fallbacks'])
         rows = {(x['kind'], x['ratio_num'], x['ratio_den'], x['cash_paise']) for x in self.db.query('SELECT * FROM paper_corporate_actions WHERE symbol=?', ('RELIANCE-EQ',))}
         self.assertEqual(rows, {('BONUS', 2, 1, None), ('CASH_DIVIDEND', None, None, 500)})
         bands = {x['symbol']: (x['series'], x['surveillance']) for x in self.db.query('SELECT * FROM paper_price_bands WHERE trade_date=?', ('2026-11-09',))}

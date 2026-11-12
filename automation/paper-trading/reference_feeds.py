@@ -161,6 +161,10 @@ class NseFetcher:
             if r.status_code != 200:
                 raise RuntimeError('http_' + str(r.status_code))
 
+    def _on_nse(self, url):
+        host = url.split('/')[2].split(':')[0].lower() if '://' in url else ''
+        return host == self.cfg['nse_session_host'] or host.endswith('.nseindia.com') or host == 'nseindia.com'
+
     def __call__(self, url, as_json=True):
         last = 'request_failed'
         for attempt in range(self.cfg['max_attempts']):
@@ -168,7 +172,7 @@ class NseFetcher:
                 self.sleep(min(self.cfg['backoff_seconds'] * 2 ** (attempt - 1), self.cfg['backoff_max_seconds']))
             self.attempts += 1
             try:
-                if self.cfg['nse_session_host'] in url:
+                if self._on_nse(url):
                     if self.session is None:
                         self._new_session()
                     r = self.session.get(url, headers=self._headers(url), timeout=self.cfg['timeout_seconds'])
@@ -214,6 +218,31 @@ def asm_from_archive(texts):
                 out.append({'symbol': rec['SYMBOL'], 'isin': rec.get('ISIN'), 'stage': next((v for k, v in rec.items() if k.startswith('ASM STAG')), None)})
         if header is None:
             raise RuntimeError('asm_archive_unexpected_format')
+    return out
+
+
+def gsm_from_archive(texts):
+    """NSE archive GSM CSV (BOM; quoted header cells may contain newlines) -> [{'symbol','isin','stage'}]."""
+    out = []
+    for text in texts:
+        if text.startswith('\ufeff'):
+            text = text.lstrip('\ufeff')
+        reader = csv.reader(io.StringIO(text))
+        header = None
+        for row in reader:
+            cells = [c.strip().strip('|').strip() for c in row]
+            if not any(cells) or set(''.join(cells)) <= {'-'}:
+                continue
+            names = [c.upper() for c in cells]
+            if header is None:
+                if 'SYMBOL' in names:
+                    header = names
+                continue
+            rec = dict(zip(header, cells))
+            if rec.get('SYMBOL'):
+                out.append({'symbol': rec['SYMBOL'], 'isin': rec.get('ISIN'), 'stage': next((v for k, v in rec.items() if k.startswith('GSM STAG')), None)})
+        if header is None:
+            raise RuntimeError('gsm_archive_unexpected_format')
     return out
 
 
@@ -279,12 +308,13 @@ def refresh(e, db, trade_day, fetch=None, dry_run=False):
                 if not archives:
                     raise
                 # Every listed archive file must load; a partial list would silently under-block.
-                payload = asm_from_archive([fetch(u, as_json=False) for u in archives]); via = 'archive_csv'
+                parser = gsm_from_archive if name == 'gsm' else asm_from_archive
+                payload = parser([fetch(u, as_json=False) for u in archives]); via = 'archive_csv'
                 report.setdefault('fallbacks', {})[name] = {'api_error': e.au.safe_error(api_error), 'archive_files': len(archives)}
             found = surveillance_rows(payload, symbols, isins, label)
             for sym, lab in found.items():
                 flags.setdefault(sym, {})['surveillance'] = 'GSM' if 'GSM' in (lab, flags.get(sym, {}).get('surveillance')) else lab
-            report['sources'][name] = {'status': 'ok', 'via': via, 'rows_received': _payload_rows(payload), 'universe_symbols_flagged': len(found), 'flagged_symbols': sorted(found)}
+            report['sources'][name] = {'status': 'ok', 'via': via, 'source': {'api': 'NSE_' + label + '_REPORT', 'archive_csv': 'NSE_' + label + '_ARCHIVE'}[via], 'rows_received': _payload_rows(payload), 'universe_symbols_flagged': len(found), 'flagged_symbols': sorted(found)}
         except Exception as ex:
             report['sources'][name] = {'status': 'unavailable', 'error': e.au.safe_error(ex)}
     try:

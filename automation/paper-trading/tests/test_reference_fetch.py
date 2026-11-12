@@ -62,7 +62,8 @@ SYMBOL              ,COMPANY             ,ISIN          ,ASM Stag,TIMESTAMP
 TCS                 ,TCS Limited         ,INE467B01029  ,Stage I ,11-Nov-2026
 '''
 class RefreshTests(base.ReferenceFeedTests):
- def fetch_with(self,asm_api_ok=True,archive_ok=(True,True),ca=None):
+ GSM_ARCHIVE='\ufeff"SR. NO \n","SYMBOL \n","COMPANY NAME \n","ISIN \n","GSM STAGE \n"\n1,"INFY","Infosys Limited","INE009A01021","GSM - I (1)"\n2,"NOTINUNIV","Other","INE000X00000","GSM - 0 (99)"\n'
+ def fetch_with(self,asm_api_ok=True,archive_ok=(True,True),ca=None,gsm_api_ok=False,gsm_archive_ok=True):
   def fetch(url,as_json=True):
    if url==CFG['nse_asm_url']:
     if asm_api_ok:return {'longterm':{'data':[{'symbol':'INFY'}]},'shortterm':{'data':[]}}
@@ -71,6 +72,12 @@ class RefreshTests(base.ReferenceFeedTests):
     i=CFG['nse_asm_archive_urls'].index(url)
     if not archive_ok[i]:raise RuntimeError('http_403')
     return [ARCHIVE,SHORT][i]
+   if url==CFG['nse_gsm_url']:
+    if gsm_api_ok:return {'gsm':{'data':[{'symbol':'INFY'}]}}
+    raise RuntimeError('http_403')
+   if url in (CFG.get('nse_gsm_archive_urls') or []):
+    if not gsm_archive_ok:raise RuntimeError('http_403')
+    return self.GSM_ARCHIVE
    if url.startswith(CFG['nse_corporate_actions_url']) and ca is not None:return ca
    return base.fixture_fetch(url,as_json)
   return fetch
@@ -82,6 +89,20 @@ class RefreshTests(base.ReferenceFeedTests):
  def test_asm_api_refused_uses_archive(self):
   r=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with(asm_api_ok=False))
   self.assertEqual(r['sources']['asm']['via'],'archive_csv');self.assertEqual(r['sources']['asm']['flagged_symbols'],['INFY-EQ','TCS-EQ']);self.assertIn('asm',r['fallbacks'])
+ def test_gsm_archive_parser(self):
+  rows=rf.gsm_from_archive([self.GSM_ARCHIVE]);self.assertEqual([r['symbol'] for r in rows],['INFY','NOTINUNIV']);self.assertEqual(rows[0]['stage'],'GSM - I (1)');self.assertEqual(rows[0]['isin'],'INE009A01021')
+  with self.assertRaisesRegex(RuntimeError,'gsm_archive_unexpected_format'):rf.gsm_from_archive(['<html></html>'])
+ def test_gsm_api_refused_uses_archive(self):
+  r=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with(asm_api_ok=True,gsm_api_ok=False,gsm_archive_ok=True))
+  self.assertEqual(r['sources']['gsm']['status'],'ok');self.assertEqual(r['sources']['gsm']['via'],'archive_csv')
+  self.assertEqual(r['sources']['gsm']['flagged_symbols'],['INFY-EQ']);self.assertEqual(r['sources']['gsm']['source'],'NSE_GSM_ARCHIVE')
+  self.assertIn('gsm',r['fallbacks']);self.assertEqual(r['fallbacks']['gsm']['api_error'],'http_403')
+  row=self.db.query("SELECT surveillance,source FROM paper_price_bands WHERE symbol=? AND trade_date=?",('INFY-EQ','2026-11-09'))[0]
+  self.assertEqual(row['surveillance'],'GSM')
+ def test_gsm_all_sources_fail_is_unavailable(self):
+  r=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with(gsm_api_ok=False,gsm_archive_ok=False))
+  self.assertEqual(r['sources']['gsm']['status'],'unavailable')
+  self.assertNotIn('via',r['sources']['gsm'])
  def test_partial_archive_is_unavailable_not_partial(self):
   r=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with(asm_api_ok=False,archive_ok=(True,False)))
   self.assertEqual(r['sources']['asm']['status'],'unavailable')

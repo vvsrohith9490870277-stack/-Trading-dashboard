@@ -119,6 +119,7 @@
       "corporates-corporateActions": "https://www.nseindia.com/companies-listing/corporate-filings-actions",
       "reportASM": "https://www.nseindia.com/reports/asm",
       "reportGSM": "https://www.nseindia.com/reports/gsm",
+      "invest/content/GSM.csv": "https://www.nseindia.com/reports/gsm",
       "nsearchives.nseindia.com": "https://www.nseindia.com/reports/asm"
     },
     "nse_corporate_actions_range_url": "https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date={from_date}&to_date={to_date}",
@@ -126,10 +127,13 @@
       "https://nsearchives.nseindia.com/invest/content/Long_Term_ASM.csv",
       "https://nsearchives.nseindia.com/invest/content/Short_Term_ASM.csv"
     ],
+    "nse_gsm_archive_urls": [
+      "https://nsearchives.nseindia.com/invest/content/GSM.csv"
+    ],
     "max_attempts": 6,
     "backoff_seconds": 2,
     "backoff_max_seconds": 15,
-    "fetch_note": "NSE refuses non-browser user agents and refuses whole sessions at random (403). Each refused session is replaced after exponential backoff (backoff_seconds doubling, capped at backoff_max_seconds) for up to max_attempts; HTML pages are never parsed as data. ASM falls back to the nsearchives CSVs only when every listed file loads.",
+    "fetch_note": "NSE refuses non-browser user agents and refuses whole sessions at random (403). Each refused session is replaced after exponential backoff (backoff_seconds doubling, capped at backoff_max_seconds) for up to max_attempts; HTML pages are never parsed as data. ASM and GSM fall back to the nsearchives CSVs only when every listed file loads. nsearchives fetches reuse the warmed NSE session.",
     "corporate_action_lookahead_days": 7
   },
   "runtime_deps": {
