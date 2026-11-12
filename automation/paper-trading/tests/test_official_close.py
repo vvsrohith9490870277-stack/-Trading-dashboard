@@ -166,6 +166,7 @@ class TaxonomyTests(unittest.TestCase):
         self.assertEqual(al.classified_error(RuntimeError('auth_circuit_open_30min')), 'auth_circuit_open_30min')
         self.assertEqual(al.classified_error(RuntimeError('SERVER_ERROR')), 'SERVER_ERROR')
         self.assertEqual(al.classified_error(RuntimeError('HELPER_TIMEOUT')), 'HELPER_TIMEOUT')
+        self.assertEqual(al.classified_error(RuntimeError('position_mark_stale')), 'position_mark_stale')
         self.assertEqual(al.classified_error(RuntimeError('database_operation_failed')), 'database_operation_failed')
         self.assertEqual(al.classified_error(RuntimeError('market_data_error_SERVER_ERROR')), 'market_data_error_SERVER_ERROR')
         self.assertEqual(al.classified_error(RuntimeError('weird_token_not_allowlisted')), 'RuntimeError')

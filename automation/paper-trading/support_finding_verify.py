@@ -731,6 +731,20 @@ def check_generic_logs(logs, finding, session_day, now_ist):
     return _verdict(True, evidence=ev)
 
 
+def check_mark_stale_events(snap, finding, namespace, session_day, now_ist):
+    rows = query_events(snap, namespace, session_day, types=('position_marks_stale',))
+    ev = {'events': len(rows), 'source_at': [r.get('source_at') for r in rows[:10]]}
+    return _verdict(bool(rows), reject_reason='no_position_marks_stale_event', evidence=ev)
+
+
+def check_mark_stale_logs(logs, finding, session_day, now_ist):
+    if not logs:
+        return _verdict(False, not_verifiable='log_files_missing_or_empty')
+    hits = [ev for ev in logs if _kind(ev) == 'position_marks_stale']
+    ev = {'matching_logs': len(hits)}
+    return _verdict(bool(hits), reject_reason='no_position_marks_stale_log', evidence=ev)
+
+
 EVENTS_CHECKERS = {
     'scan_missed': check_scan_missed_events,
     'worker_down': lambda *a, **k: check_worker_or_staleness_events(*a, kind='worker_down', **k),
@@ -741,6 +755,7 @@ EVENTS_CHECKERS = {
     'exit_path_unexercised': check_exit_events,
     'signal_to_fill_latency': check_latency_events,
     'quote_batch_failed': check_quote_batch_events,
+    'position_marks_stale': check_mark_stale_events,
 }
 
 LOG_CHECKERS = {
@@ -753,6 +768,7 @@ LOG_CHECKERS = {
     'exit_path_unexercised': check_exit_logs,
     'signal_to_fill_latency': check_latency_logs,
     'quote_batch_failed': check_quote_batch_logs,
+    'position_marks_stale': check_mark_stale_logs,
 }
 
 

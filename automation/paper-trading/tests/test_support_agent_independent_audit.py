@@ -145,6 +145,15 @@ class RealShapeReplayTests(unittest.TestCase):
         self.assertEqual(f['details']['samples'][0]['expected_qty'], 578)
         self.assertEqual(f['details']['samples'][0]['filled_qty'], 2)
 
+    def test_position_marks_stale_opens_a_finding(self):
+        self.ev('09:16:00', 'monitor_completed')
+        self.ev('10:10:00', 'position_marks_stale', 'failed', {'error_code': 'position_mark_stale', 'count': 23, 'threshold': 180})
+        self.ev('15:29:00', 'monitor_completed')
+        sa.run_v3_production_detectors(self.store, NS, DAY, now_at=f'{DAY}T16:35:00+05:30', trading_db=self.tdb)
+        f = next(x for x in sa.current_findings(self.store, NS, DAY) if x['detector'] == 'position_marks_stale')
+        self.assertEqual(f['details']['occurrences'], 1)
+        self.assertEqual(f['details']['error_code'], 'position_mark_stale')
+
     def test_holiday_is_silent_even_at_0830_policy_hygiene(self):
         res = sa.run_v3_production_detectors(self.store, NS, '2026-11-10', now_at='2026-11-10T08:30:00+05:30', trading_db=self.tdb)
         self.assertFalse(res['trading_day'])

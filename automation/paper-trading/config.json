@@ -2,6 +2,7 @@
   "paper_only": true,
   "namespace": "paper_v1",
   "quote_max_age_seconds": 60,
+  "position_mark_stale_seconds": 180,
   "max_signal_age_sessions": 1,
   "poll_seconds": 30,
   "holidays": [

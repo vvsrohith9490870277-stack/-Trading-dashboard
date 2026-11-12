@@ -621,16 +621,35 @@ def _monitor(db,api):
  # Entry-day stop cannot be hit by the exact same entry LTP; it is checked on subsequent fresh polls.
  # Positions change only through fill(); with no fill attempted this cycle the post-gate snapshot is current.
  # The price band feeds market_guard only for a carried exit's lower-circuit haircut, so it is read only then.
- st=[];t=now()
+ # Mark writes keep the post-quotes batch clock so a slow fill loop cannot silently skip every mark.
+ st=[];written=0;skipped=0;checked=[]
  for p in (db.positions() if actions else positions):
-  q=quotes.get(p['symbol']);ok,_=valid_quote(q,t)
-  if not ok:continue
+  q=quotes.get(p['symbol']);ok,why=valid_quote(q,t)
+  if not ok:
+   skipped+=1;checked.append(p);continue
   price=q['price']
   if p.get('pending_exit') and market_guard(q,band_for(db,p['symbol'],t.date().isoformat()))['circuit']=='LOWER':
    days=db.query('SELECT COUNT(*) AS n FROM paper_circuit_locks WHERE namespace=? AND strategy=? AND symbol=?',(NS,p['strategy'],p['symbol']))[0]['n'];marked=circuit_haircut(price,days)
    if marked is not None:price=marked
-  st.append(('UPDATE paper_positions SET mark_price=?,mark_at=?,updated_at=? WHERE namespace=? AND strategy=? AND symbol=?',(price,q['quote_at'],t.isoformat(),NS,p['strategy'],p['symbol'])))
- db.batch(st);report={'status':'ok','fresh_quotes':sum(valid_quote(q,t)[0] for q in quotes.values()),'quotes':len(quotes),'fills':fills,'at_IST':t.isoformat()};db.run('monitor','ok',**report);return report
+  st.append(('UPDATE paper_positions SET mark_price=?,mark_at=?,updated_at=? WHERE namespace=? AND strategy=? AND symbol=?',(price,q['quote_at'],now().isoformat(),NS,p['strategy'],p['symbol'])))
+  written+=1;checked.append({**p,'mark_price':price,'mark_at':q['quote_at']})
+ db.batch(st)
+ if skipped:
+  try:log('marks_skipped',count=skipped,reason='stale_or_future_quote')
+  except Exception:pass
+ seen=now();threshold=int(CFG.get('position_mark_stale_seconds',180));stale_syms=[];oldest=None
+ for p in checked:
+  mark=p.get('mark_at');age=None if not mark else (seen-datetime.fromisoformat(mark)).total_seconds()
+  if age is None or age>threshold:
+   stale_syms.append(p['symbol'])
+   if oldest is None or (age is not None and age>oldest):oldest=age
+ if stale_syms and au.active(sys.modules[__name__],seen):
+  payload={'count':len(stale_syms),'threshold':threshold,'error_code':'position_mark_stale','age_seconds':oldest,'symbols':sorted(set(stale_syms))[:50],'stale':True}
+  try:log('position_marks_stale',**payload)
+  except Exception:pass
+  try:al.emit(sys.modules[__name__],db,'position_marks_stale',outcome='failed',severity='ERROR',**payload)
+  except Exception:pass
+ report={'status':'ok','fresh_quotes':sum(valid_quote(q,t)[0] for q in quotes.values()),'quotes':len(quotes),'fills':fills,'at_IST':t.isoformat()};db.run('monitor','ok',**report);return report
 
 def monitor(db,api):
  e=sys.modules[__name__];start=time.monotonic()

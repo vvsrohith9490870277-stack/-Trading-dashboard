@@ -143,6 +143,33 @@ class FindingVerifiers(unittest.TestCase):
         gaps = rec['verifiers'][0]['evidence']['gaps']
         self.assertTrue(any(abs(g['gap_seconds'] - 245) < 1 for g in gaps))
 
+    def test_position_marks_stale_confirmed_by_both_verifiers(self):
+        events = [{'event_type': 'position_marks_stale', 'source_at': f'{DAY}T10:10:00+05:30',
+                   'data_json': json.dumps({'error_code': 'position_mark_stale', 'count': 23, 'threshold': 180})}]
+        snap = _snap(events)
+        tmp = Path(tempfile.mkdtemp())
+        engine, audit = _logs(tmp, engine_rows=[
+            {'kind': 'position_marks_stale', 'at_IST': f'{DAY}T10:10:00+05:30', 'namespace': NS,
+             'error_code': 'position_mark_stale', 'count': 23, 'threshold': 180},
+        ])
+        rec = sfv.verify_findings([_finding('position_marks_stale')], snapshot_path=snap, engine_path=engine, audit_path=audit,
+                                  namespace=NS, session_day=DAY, now_ist=_now('16:45'))['findings'][0]
+        self.assertEqual(rec['status'], 'confirmed')
+        vmap = {v['verifier_id']: v['verdict'] for v in rec['verifiers']}
+        self.assertEqual(vmap['events_sql'], 'CONFIRM')
+        self.assertEqual(vmap['log_files'], 'CONFIRM')
+
+    def test_position_marks_stale_rejected_when_absent(self):
+        events = [{'event_type': 'monitor_completed', 'source_at': f'{DAY}T10:10:00+05:30'}]
+        snap = _snap(events)
+        tmp = Path(tempfile.mkdtemp())
+        engine, audit = _logs(tmp, engine_rows=[
+            {'kind': 'monitor_completed', 'at_IST': f'{DAY}T10:10:00+05:30', 'namespace': NS, 'fresh_quotes': 19},
+        ])
+        rec = sfv.verify_findings([_finding('position_marks_stale')], snapshot_path=snap, engine_path=engine, audit_path=audit,
+                                  namespace=NS, session_day=DAY, now_ist=_now('16:45'))['findings'][0]
+        self.assertEqual(rec['status'], 'rejected')
+
     def test_worker_down_rejected_when_first_check_within_grace(self):
         events = [{'event_type': 'monitor_completed', 'source_at': f'{DAY}T09:16:30+05:30'}]
         snap = _snap(events)

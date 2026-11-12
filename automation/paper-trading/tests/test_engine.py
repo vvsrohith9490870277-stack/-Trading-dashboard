@@ -523,6 +523,31 @@ class PaperTests(unittest.TestCase):
   self.assertEqual(report['fills'],2)
   held={p['symbol'] for p in self.db.positions()}
   self.assertEqual(held,{'RELIANCE-EQ','TCS-EQ'})
+  # Marks and the fresh_quotes report must keep the post-quotes batch clock; a 70s fill loop must not skip writes.
+  self.assertEqual(report['fresh_quotes'],2)
+  for p in self.db.positions():
+   self.assertEqual(p['mark_at'],T.isoformat());self.assertEqual(p['mark_price'],100)
+ def test_monitor_emits_position_marks_stale_when_marks_stop_updating(self):
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),T)['filled'])
+  later=T+timedelta(minutes=10);e.now=lambda:later
+  class Feed:
+   def quotes(_,requested):
+    # Already stale at batch time, so marks must not be rewritten; the aged 10:00 mark is then reported.
+    return {sym:{'symbol':sym,'price':101,'quote_at':(later-timedelta(seconds=61)).isoformat(),'provider_status':'ok'} for sym in requested}
+  logged=[];orig=e.log
+  def spy(kind,**data):
+   logged.append((kind,data));return orig(kind,**data)
+  e.log=spy
+  try:e.monitor(self.db,Feed())
+  finally:e.log=orig;e.now=lambda:T
+  pos=self.db.positions()[0]
+  self.assertEqual(pos['mark_at'],T.isoformat())
+  ev=self.db.query("SELECT outcome,data_json FROM paper_events WHERE namespace=? AND event_type='position_marks_stale'",(e.NS,))
+  self.assertTrue(ev)
+  payload=json.loads(ev[-1]['data_json'])
+  self.assertEqual(payload.get('error_code'),'position_mark_stale')
+  self.assertGreater(payload.get('count'),0)
+  self.assertIn('position_marks_stale',[k for k,_ in logged])
  def test_monitor_does_not_retry_a_full_sleeve_in_the_same_cycle(self):
   symbols=['360ONE-EQ','3MINDIA-EQ','ABB-EQ','ACC-EQ','AGI-EQ','AIAENG-EQ','APLAPOLLO-EQ','ASKAUTOLTD-EQ','AUBANK-EQ']
   for sym in symbols:self.assertTrue(e.fill(self.db,self.signal(symbol=sym,strategy=1),self.quote(),T)['filled'])

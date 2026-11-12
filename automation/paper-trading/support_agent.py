@@ -1345,6 +1345,23 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                     ms_details['last_check_gap_to_close_seconds'] = (session_end - last_check_dt).total_seconds()
                 emit('monitor_staleness', f'monitor_staleness:{session_day}', first_ev['source_at'], 'SEV2', ms_details)
 
+    # Position marks that stop updating during the session (worker emits position_marks_stale).
+    mark_events = [ev for ev in events if ev['event_type'] == 'position_marks_stale']
+    if mark_events:
+        first = mark_events[0]
+        try:
+            data = json.loads(first.get('data_json') or '{}')
+        except Exception:
+            data = {}
+        emit('position_marks_stale', f'position_marks_stale:{session_day}', first['source_at'], 'SEV2', {
+            'threshold_seconds': data.get('threshold') or int(CFG.get('position_mark_stale_seconds', 180)),
+            'count': data.get('count'),
+            'occurrences': len(mark_events),
+            'first_at': first['source_at'],
+            'last_at': mark_events[-1]['source_at'],
+            'error_code': data.get('error_code') or 'position_mark_stale',
+        })
+
     # 3. Scan lock blocked gaps -> lock_blocked_gap (SEV3, escalates to SEV2 via episode rules)
     lock_gap_min = float(thresh['lock_blocked_gap_seconds'])
     # The engine emits worker_waiting(reason=singleton_busy) every poll while a scan holds engine.lock.
