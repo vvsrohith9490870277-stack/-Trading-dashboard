@@ -1017,6 +1017,7 @@ def simulate_track_window(
                 'entry_price': pos['entry_price'],
                 'exit_price': fill_paise / 100.0,
                 'reference_exit_price': raw_fill,
+                'side': pos.get('side'),
                 'exit_slippage_applied': bool(adv),
                 'net_pnl_paise': net_proceeds - entry_cost,
                 'reason': sig.get('reason', 'daily_exit'),
@@ -1076,6 +1077,7 @@ def simulate_track_window(
                 'series': pit_ser,
                 'pending_exit': False,
                 'locked_days': 0,
+                'side': sig.get('side'),
             }
 
         # Update marks and high-water at close of day t

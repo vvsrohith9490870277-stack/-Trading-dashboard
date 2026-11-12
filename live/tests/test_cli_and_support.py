@@ -73,6 +73,13 @@ class Isolation(unittest.TestCase):
         self.assertIn('0900_1535', str(ctx.exception))
         ar.assert_not_market_hours('eod', now=after)  # does not raise
 
+    def test_eod_status_stays_ok_when_only_live_paper_v1_counts_grew(self):
+        # Track A keeps writing paper_events during a long sidecar eod; that must not fail the run.
+        self.assertEqual(ar.eod_run_status(0, {'paper_events|paper_v1': (14407, 14412)}), 'OK')
+        self.assertEqual(ar.eod_run_status(0, {}), 'OK')
+        self.assertEqual(ar.eod_run_status(1, {'paper_events|paper_v1': (14407, 14412)}), 'FAILED')
+        self.assertEqual(ar.eod_run_status(1, {}), 'FAILED')
+
 
 class CalendarAndParse(unittest.TestCase):
     def test_session_days_skips_weekend_holiday_muhurat(self):

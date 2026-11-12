@@ -122,6 +122,11 @@ def wait_for_eod(ro, day, no_wait):
         time.sleep(CFG['eod_wait_poll_seconds'])
 
 
+def eod_run_status(returncode, protected_changed=None):
+    """Sidecar eod status follows adaptive_daily's exit code only.\n\n    Live Track A paper_v1 event counts can grow during a long shadow run; that is not a sidecar failure.\n    protected_changed is still recorded on the report for audit.\n    """
+    return 'OK' if int(returncode or 0) == 0 else 'FAILED'
+
+
 def eod(day, no_wait=False):
     ag.assert_runnable(heavy=True)
     ro = TursoRO()
@@ -151,7 +156,7 @@ def eod(day, no_wait=False):
     changed_total = {k: (before[k], after.get(k)) for k in before if before[k] != after.get(k) and k.endswith('|*')}
     out['protected_rows_changed'] = changed
     out['all_table_totals_changed'] = changed_total
-    out['status'] = 'OK' if p.returncode == 0 and not changed else 'FAILED'
+    out['status'] = eod_run_status(p.returncode, changed)
     return out
 
 

@@ -15,6 +15,7 @@ LIB = HERE.parent / 'automation' / 'paper-trading'
 sys.path.insert(0, str(LIB))
 import pandas as pd                    # noqa: E402
 import adaptive_engine as ae           # noqa: E402
+import adaptive_sim_trades as ast      # noqa: E402
 import adaptive_guard as ag            # noqa: E402
 import adaptive_logging as alog        # noqa: E402
 import adaptive_observation as aobs    # noqa: E402
@@ -57,6 +58,7 @@ def open_adaptive_db():
     db.batch([('CREATE TABLE IF NOT EXISTS adaptive_live_track_a_equity(namespace TEXT NOT NULL,trade_date TEXT NOT NULL,strategy INTEGER NOT NULL,'
                'equity_paise INTEGER NOT NULL,cash_paise INTEGER NOT NULL,market_value_paise INTEGER NOT NULL,open_positions INTEGER NOT NULL,'
                'basis TEXT NOT NULL,source_hash TEXT NOT NULL,recorded_at TEXT NOT NULL,PRIMARY KEY(namespace,trade_date,strategy))', ())])
+    ast.ensure_table(db)
     return db
 
 
@@ -201,6 +203,9 @@ def main():
                 sims[s] = {'status': 'WARM_START_ONLY_NO_FORWARD_SESSION_YET'}; continue
             base = ae.simulate_track_window(db, NS, s, ae.BASELINE_PARAMS[s], stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands)
             out = []
+            tape = {}
+            for sid in info.get('track_a_replica') or []:
+                tape[sid] = ast.persist_sim_trades(db, NS, sid, s, day, base['closed_trades'], stamp, track='A')
             for ch in info['track_b_challengers']:
                 params = {**ae.BASELINE_PARAMS[s], **ch['params_changed']}
                 var = ae.simulate_track_window(db, NS, s, params, stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands)
@@ -209,9 +214,10 @@ def main():
                     rows.append(('INSERT OR REPLACE INTO adaptive_daily_returns(namespace,spawn_id,strategy,trade_date,r_var,r_base,d_t,r_index,equity_var_paise,equity_base_paise,cash_var_paise,cash_base_paise,open_positions_var,open_positions_base,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                  (NS, ch['spawn_id'], s, rv['trade_date'], rv['return'], rb['return'], rv['return'] - rb['return'], float(r_idx.get(rv['trade_date']) or 0.0), rv['equity_paise'], rb['equity_paise'], rv['cash_paise'], rb['cash_paise'], rv['open_positions'], rb['open_positions'], stamp)))
                 db.batch(rows)
+                tape[ch['spawn_id']] = ast.persist_sim_trades(db, NS, ch['spawn_id'], s, day, var['closed_trades'], stamp, track='B')
                 out.append({'spawn_id': ch['spawn_id'], 'eval_days': len(ev), 'closed_trades': len(var['closed_trades']), 'open_positions': len(var['open_positions']),
                             'skips': dict(Counter(x['cause'] for x in var['entry_skips']))})
-            sims[s] = {'status': 'SIMULATED', 'baseline_replica_closed': len(base['closed_trades']), 'challengers': out}
+            sims[s] = {'status': 'SIMULATED', 'baseline_replica_closed': len(base['closed_trades']), 'challengers': out, 'sim_tape': tape}
             aobs.log_shadow_session_completed(db, NS, s, day, {'eval_days': len(ev)})
         report['simulation_status'] = 'SIMULATED'
     report['simulations'] = sims
