@@ -91,6 +91,9 @@ class RefreshTests(base.ReferenceFeedTests):
   self.assertEqual(r['sources']['asm']['via'],'archive_csv');self.assertEqual(r['sources']['asm']['flagged_symbols'],['INFY-EQ','TCS-EQ']);self.assertIn('asm',r['fallbacks'])
  def test_gsm_archive_parser(self):
   rows=rf.gsm_from_archive([self.GSM_ARCHIVE]);self.assertEqual([r['symbol'] for r in rows],['INFY','NOTINUNIV']);self.assertEqual(rows[0]['stage'],'GSM - I (1)');self.assertEqual(rows[0]['isin'],'INE009A01021')
+  # requests often decodes a UTF-8 BOM as Latin-1 (ï»¿), which would otherwise break quoted headers.
+  mis=self.GSM_ARCHIVE.encode('utf-8').decode('latin-1')
+  rows=rf.gsm_from_archive([mis]);self.assertEqual([r['symbol'] for r in rows],['INFY','NOTINUNIV'])
   with self.assertRaisesRegex(RuntimeError,'gsm_archive_unexpected_format'):rf.gsm_from_archive(['<html></html>'])
  def test_gsm_api_refused_uses_archive(self):
   r=rf.refresh(e,self.db,'2026-11-09',fetch=self.fetch_with(asm_api_ok=True,gsm_api_ok=False,gsm_archive_ok=True))

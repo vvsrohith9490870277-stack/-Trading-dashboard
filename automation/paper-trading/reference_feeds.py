@@ -221,8 +221,13 @@ def gsm_from_archive(texts):
     """NSE archive GSM CSV (BOM; quoted header cells may contain newlines) -> [{'symbol','isin','stage'}]."""
     out = []
     for text in texts:
-        if text.startswith('\ufeff'):
-            text = text.lstrip('\ufeff')
+        if isinstance(text, bytes):
+            text = text.decode('utf-8-sig')
+        elif text.startswith('﻿'):
+            text = text.lstrip('﻿')
+        elif text.startswith('ï»¿'):
+            # UTF-8 BOM misdecoded as Latin-1 (requests default when the response has no charset).
+            text = text[3:].encode('latin-1').decode('utf-8')
         reader = csv.reader(io.StringIO(text))
         header = None
         for row in reader:
