@@ -4,7 +4,7 @@ and touches ONLY local SQLite files: reads state/market.sqlite + state/track_a_e
 
 Usage: adaptive_daily.py --session YYYY-MM-DD --eod-json PATH [--report-dir DIR]
 """
-import argparse, hashlib, json, os, sqlite3, sys
+import argparse, hashlib, json, os, sqlite3, sys, time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -106,6 +106,24 @@ def snapshot_hash(stock, start):
     return h.hexdigest()
 
 
+class PhaseTimer:
+    """Monotonic-clock phase timings (Task 8). Accumulates seconds per key;
+    never touches simulation inputs or outputs."""
+
+    def __init__(self):
+        self.timings = {}
+        self._started = {}
+
+    def start(self, key):
+        self._started[key] = time.monotonic()
+
+    def stop(self, key):
+        t0 = self._started.pop(key, None)
+        if t0 is None:
+            return
+        self.timings[key] = self.timings.get(key, 0.0) + max(0.0, time.monotonic() - t0)
+
+
 def report_dir_default():
     """Report directory: ADAPTIVE_REPORT_DIR env override, else /workspace/reports/adaptive."""
     return str(apath.report_dir())
@@ -204,6 +222,7 @@ def main():
     eod = json.loads(Path(a.eod_json).read_text())
     report = {'session_day': day, 'namespace': NS, 'started_at_ist': stamp, 'observation_only': bool(ENGINE_CFG.get('adaptive_observation_only', True)),
               'harness_hash': ae.compute_harness_hash()}
+    timer = PhaseTimer()
 
     # 1. Reconciled Track A EOD marker (session-truth rule input) and the forward Track A arm per strategy.
     rec = bool(eod.get('ledger_reconciled'))
@@ -226,6 +245,7 @@ def main():
     report['circuit_ingest'] = cb.ingest_raw_dir(db, raw_cir, as_of=day)
 
     # 3. Spawns: Track A replica arm + up to max_track_b_challengers Track B challengers per strategy (idempotent).
+    timer.start('spawn')
     spawns = {}
     for s in sorted(ae.BASELINE_PARAMS):
         live = db.query("SELECT track,slot_index,spawn_id,params_json,status FROM adaptive_tracks WHERE namespace=? AND strategy=? AND status IN ('active','challenger','champion','probation') ORDER BY track,slot_index", (NS, s))
@@ -258,14 +278,17 @@ def main():
                      'ledger': [{'track': r['track'], 'slot': r['slot_index'], 'cash_paise': r['cash_paise'], 'allocated_paise': r['allocated_capital_paise'],
                                  'reconciled': int(r['cash_paise']) == int(r['allocated_capital_paise']) == int(r['starting_equity_net_haircut_paise'])} for r in rows]}
     report['spawns'] = spawns
+    timer.stop('spawn')
     report['track_c_note'] = 'No Track C champion can exist: promotion is locked (observation-only, calibration P7 and CI proof not done).'
 
     # 4. Freshness + PIT Bhavcopy SERIES coverage gate (Task 5, P1). Without the
     # gate every new entry is refused (EQ-only, never assumed). needed_sessions
     # now comes from the expected trading calendar, not the snapshot's own index.
+    timer.start('coverage_gate')
     need_from = min(v['warm_start'][0] for v in spawns.values() if 'warm_start' in v)
     covered = {r['trade_date'] for r in db.query('SELECT DISTINCT trade_date FROM bhavcopy_series_archive WHERE trade_date>=? AND source LIKE ?', (need_from, aobs.OFFICIAL_BHAVCOPY_PREFIX + '%'))}
     gate = evaluate_freshness(day, latest_bar, covered, sessions, need_from)
+    timer.stop('coverage_gate')
     report['input_freshness'] = gate['input_freshness']
     report['pit_series_coverage'] = gate['pit_series_coverage']
 
@@ -286,20 +309,28 @@ def main():
             ev = [d for d in sessions if d > info['warm_start'][1]]
             if not ev:
                 sims[s] = {'status': 'WARM_START_ONLY_NO_FORWARD_SESSION_YET'}; continue
+            timer.start(f'simulate_{s}')
             base = ae.simulate_track_window(db, NS, s, ae.BASELINE_PARAMS[s], stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands)
+            timer.stop(f'simulate_{s}')
             out = []
             tape = {}
+            timer.start('persist')
             for sid in info.get('track_a_replica') or []:
                 tape[sid] = ast.persist_sim_trades(db, NS, sid, s, day, base['closed_trades'], stamp, track='A')
+            timer.stop('persist')
             for ch in info['track_b_challengers']:
                 params = {**ae.BASELINE_PARAMS[s], **ch['params_changed']}
+                timer.start(f'simulate_{s}')
                 var = ae.simulate_track_window(db, NS, s, params, stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands)
+                timer.stop(f'simulate_{s}')
                 rows = []
                 for rv, rb in zip(var['daily_records'], base['daily_records']):
                     rows.append(('INSERT OR REPLACE INTO adaptive_daily_returns(namespace,spawn_id,strategy,trade_date,r_var,r_base,d_t,r_index,equity_var_paise,equity_base_paise,cash_var_paise,cash_base_paise,open_positions_var,open_positions_base,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                  (NS, ch['spawn_id'], s, rv['trade_date'], rv['return'], rb['return'], rv['return'] - rb['return'], float(r_idx.get(rv['trade_date']) or 0.0), rv['equity_paise'], rb['equity_paise'], rv['cash_paise'], rb['cash_paise'], rv['open_positions'], rb['open_positions'], stamp)))
+                timer.start('persist')
                 db.batch(rows)
                 tape[ch['spawn_id']] = ast.persist_sim_trades(db, NS, ch['spawn_id'], s, day, var['closed_trades'], stamp, track='B')
+                timer.stop('persist')
                 out.append({'spawn_id': ch['spawn_id'], 'eval_days': len(ev), 'closed_trades': len(var['closed_trades']), 'open_positions': len(var['open_positions']),
                             'skips': dict(Counter(x['cause'] for x in var['entry_skips']))})
             sims[s] = {'status': 'SIMULATED', 'baseline_replica_closed': len(base['closed_trades']), 'challengers': out, 'sim_tape': tape}
@@ -330,10 +361,17 @@ def main():
             report['parity'][s] = {'status': 'not_evaluable',
                                    'reason': 'simulation_not_simulated' if report.get('simulation_status') == 'SIMULATED' else str(report.get('simulation_status') or 'not_simulated')}
     report['simulations'] = sims
+    timer.start('after')
+    timer.start('hash_chain')
     report['hash_chain'] = alog.verify_hash_chain(db, NS)
+    timer.stop('hash_chain')
     report['decision_log_rows'] = db.query('SELECT COUNT(*) n FROM adaptive_decision_logs WHERE namespace=?', (NS,))[0]['n']
     report['observation'] = {s: {k: v for k, v in aobs.observation_status(db, NS, s).items() if k in ('sessions', 'parity_streak', 'completed', 'min_sessions')} for s in sorted(ae.BASELINE_PARAMS)}
     report['finished_at_ist'] = datetime.now(IST).isoformat()
+    timer.stop('after')
+    # 'after' is finalisation time excluding the hash-chain check itself.
+    timer.timings['after'] = max(0.0, timer.timings.get('after', 0.0) - timer.timings.get('hash_chain', 0.0))
+    report['timings_seconds'] = timer.timings
     out_dir = Path(a.report_dir or report_dir_default()) / day; out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / 'adaptive-daily.json').write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report, default=str))

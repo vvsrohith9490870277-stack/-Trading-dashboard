@@ -8,6 +8,7 @@
 - backfill (P1, minimal UDiFF era): guarded NSE Bhavcopy fetch into the LOCAL archive; refuses before the 11 Nov EOD.
 """
 import argparse, fcntl, json, os, resource, subprocess, sys, time
+from contextlib import contextmanager
 from datetime import datetime, date, time as dt_time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -32,6 +33,17 @@ STATE = HERE.parent / 'state'
 def report_dir():
     """Report directory: ADAPTIVE_REPORT_DIR env override, else /workspace/reports/adaptive."""
     return apath.report_dir()
+
+
+@contextmanager
+def _timed(timings, key):
+    """Monotonic-clock phase timing (Task 8): accumulates non-negative seconds
+    into timings[key]; never touches any other logic."""
+    t0 = time.monotonic()
+    try:
+        yield
+    finally:
+        timings[key] = timings.get(key, 0.0) + max(0.0, time.monotonic() - t0)
 
 
 def get_track_a_namespace():
@@ -142,15 +154,17 @@ def eod_run_status(returncode, protected_changed=None):
     return 'OK' if int(returncode or 0) == 0 else 'FAILED'
 
 
-def eod(day, no_wait=False):
+def eod(day, no_wait=False, ro=None):
     ag.assert_runnable(heavy=True)
-    ro = TursoRO()
+    ro = ro or TursoRO()
     out = {'phase': 'eod', 'session_day': day, 'at_ist': datetime.now(IST).isoformat()}
     rep = wait_for_eod(ro, day, no_wait)
     if rep is None:
         out['status'] = 'SKIPPED_TRACK_A_EOD_NOT_RECONCILED_BY_DEADLINE'
         return out
-    eod_path = STATE / f'track_a_eod-{day}.json'; eod_path.write_text(json.dumps(rep))
+    eod_path = STATE / f'track_a_eod-{day}.json'
+    STATE.mkdir(parents=True, exist_ok=True)
+    eod_path.write_text(json.dumps(rep))
     # Task 4: live fills for the session, for the replica-parity comparison in
     # adaptive_daily.py. Best effort: if Turso cannot be read here, the daily
     # step reports parity as not_evaluable instead of failing the whole run.
@@ -164,21 +178,27 @@ def eod(day, no_wait=False):
     except Exception as e:
         out['live_fills'] = {'status': 'unavailable', 'error_code': str(e).split(':')[0]}
     import market_snapshot
-    out['snapshot'] = market_snapshot.refresh(ro)
-    before = protected_counts(ro)
+    timings = {}
+    with _timed(timings, 'snapshot'):
+        out['snapshot'] = market_snapshot.refresh(ro)
+    with _timed(timings, 'protected_counts_before'):
+        before = protected_counts(ro)
     def limits():
         mb = int(AP['runner_memory_max_mb']) * 1024 * 1024   # address-space cap from policy (C-06)
         resource.setrlimit(resource.RLIMIT_AS, (mb, mb)); os.nice(10); apply_ionice_idle()
     env = ag.scrubbed_env()
     env['PYTHONPATH'] = str(LIB)
-    p = subprocess.run([PY, str(HERE / 'adaptive_daily.py'), '--session', day, '--eod-json', str(eod_path)],
-                       env=env, capture_output=True, text=True, preexec_fn=limits)
+    with _timed(timings, 'daily'):
+        p = subprocess.run([PY, str(HERE / 'adaptive_daily.py'), '--session', day, '--eod-json', str(eod_path)],
+                           env=env, capture_output=True, text=True, preexec_fn=limits)
     out['daily_exit_code'] = p.returncode
     if p.returncode:
         out['daily_stderr_tail'] = p.stderr.strip().splitlines()[-5:]
     else:
         out['daily'] = json.loads(p.stdout.strip().splitlines()[-1])
-    after = protected_counts(ro)
+    with _timed(timings, 'protected_counts_after'):
+        after = protected_counts(ro)
+    out['timings_seconds'] = timings
     changed = {k: (before[k], after.get(k)) for k in before if before[k] != after.get(k) and not k.endswith('|*')}
     changed_total = {k: (before[k], after.get(k)) for k in before if before[k] != after.get(k) and k.endswith('|*')}
     out['protected_rows_changed'] = changed
@@ -326,6 +346,7 @@ def failure_report(phase, session_day, exc):
 
 
 def main(argv=None):
+    t0 = time.monotonic()
     a = build_parser().parse_args(argv)
     lock_fd = None
     if a.phase in ('eod', 'backfill'):
@@ -361,8 +382,10 @@ def main(argv=None):
                 pass
     day = a.session or datetime.now(IST).date().isoformat()
     rdir = report_dir() / day; rdir.mkdir(parents=True, exist_ok=True)
+    total = max(0.0, time.monotonic() - t0)
     if error is not None:
         failed = failure_report(a.phase, day, error)
+        failed['timings_seconds'] = {'total': total}
         (rdir / f'runner-{a.phase}-FAILED.json').write_text(json.dumps(failed, indent=2, default=str))
         try:
             print(json.dumps(failed, indent=1, default=str))
@@ -373,6 +396,7 @@ def main(argv=None):
                 pass
         sys.exit(1)
     (rdir / f'runner-{a.phase}-FAILED.json').unlink(missing_ok=True)
+    out.setdefault('timings_seconds', {})['total'] = total
     (rdir / f'runner-{a.phase}.json').write_text(json.dumps(out, indent=2, default=str))
     try:
         print(json.dumps(out, indent=1, default=str))
