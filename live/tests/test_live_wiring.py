@@ -1,5 +1,5 @@
 """Tests for the adaptive-live sidecar wiring (offline: no Turso, no NSE, no Track A writes)."""
-import io, json, os, subprocess, sys, tempfile, unittest, zipfile
+import io, json, os, subprocess, sys, tempfile, time, unittest, zipfile
 from pathlib import Path
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent / 'automation' / 'paper-trading'))
@@ -355,6 +355,34 @@ class MarketHoursAndLockRefusal(unittest.TestCase):
             self.assertFalse(rep['ok'])
 
 
+def _newest_mtime_under(root):
+    """Newest mtime of any file under root, or None if root has no files
+    (or does not exist). T1: read-only snapshot of /workspace state."""
+    newest = None
+    try:
+        for p in Path(root).rglob('*'):
+            try:
+                if p.is_file():
+                    m = p.stat().st_mtime
+                    if newest is None or m > newest:
+                        newest = m
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return newest
+
+
+def _safe_mtime(path):
+    """mtime of path, or None if it cannot be statted (absent, or gone
+    between the exists() check and the stat — the snapshot must not crash
+    the test over external state)."""
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return None
+
+
 class EodReportDirPassthrough(unittest.TestCase):
     """R6: eod() must launch adaptive_daily.py with --report-dir <override>,
     so the child writes to ADAPTIVE_REPORT_DIR, not to /workspace."""
@@ -363,6 +391,17 @@ class EodReportDirPassthrough(unittest.TestCase):
         import types
         from unittest import mock
         day = '2026-11-11'
+        # T1: machine-independent — a real 11 Nov report may already exist
+        # (Grok's box has one), so asserting the dir "does not exist" fails
+        # although the code is right. Snapshot the /workspace state first
+        # and assert it is unchanged at the end; nothing is created or
+        # deleted under /workspace by this test.
+        ws_root = Path('/workspace/reports/adaptive')
+        ws_day = ws_root / day
+        started = time.time()
+        before_exists = ws_day.exists()
+        before_mtime = _safe_mtime(ws_day) if before_exists else None
+        before_newest = _newest_mtime_under(ws_root)
         with tempfile.TemporaryDirectory() as t:
             reports = Path(t) / 'reports'
             state = Path(t) / 'state'
@@ -411,8 +450,17 @@ class EodReportDirPassthrough(unittest.TestCase):
             argv = calls[0]
             self.assertIn('--report-dir', argv)
             self.assertEqual(argv[argv.index('--report-dir') + 1], str(reports))
-            self.assertFalse((Path('/workspace/reports/adaptive') / day).exists(),
-                             'nothing may be written under /workspace')
+            # T1: the /workspace state must be exactly as before the run —
+            # and no file under it may be newer than the test start.
+            self.assertEqual(ws_day.exists(), before_exists,
+                             '/workspace report dir must be unchanged by the run')
+            if before_exists:
+                self.assertEqual(_safe_mtime(ws_day), before_mtime)
+            self.assertEqual(_newest_mtime_under(ws_root), before_newest,
+                             'no file under /workspace/reports/adaptive may be written')
+            after_newest = _newest_mtime_under(ws_root)
+            self.assertTrue(after_newest is None or after_newest <= started,
+                            'no file under /workspace/reports/adaptive may be newer than the test start')
 
 
 class BackfillRetryPassthrough(unittest.TestCase):
