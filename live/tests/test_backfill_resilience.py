@@ -136,6 +136,29 @@ class BackfillResilienceTests(unittest.TestCase):
             self.assertEqual(out2['detail'], [])
             self.assertEqual(self.calls, [])
 
+    def test_all_404_date_makes_zero_fetch_calls_on_second_retry_run(self):
+        # R9: an all-404 (no_session) date is persisted under state/ and
+        # skipped on the next --retry-missing run — no more NSE calls for it.
+        bb.fetch_official = self._fake_fetch({'udiff': '404', 'legacy_cm': '404', 'sec_bhavdata_full': '404'})
+        with tempfile.TemporaryDirectory() as t:
+            record = Path(t) / 'bhavcopy_no_session.json'
+            old_record = bb.NO_SESSION_RECORD
+            bb.NO_SESSION_RECORD = record
+            try:
+                out = bb.main(['--dates', '2026-07-23', '--probe', '--scratch-dir', t, '--retry-missing'])
+                self.assertEqual([r['status'] for r in out['detail']], ['no_session'])
+                first_calls = len(self.calls)
+                self.assertEqual(first_calls, 3)  # one per archive form, then stop
+                self.assertTrue(record.exists())
+                self.assertIn('2026-07-23', bb.load_no_session_dates())
+                self.calls.clear()
+                out2 = bb.main(['--dates', '2026-07-23', '--probe', '--scratch-dir', t, '--retry-missing'])
+                self.assertEqual(self.calls, [])
+                self.assertEqual([r['status'] for r in out2['detail']], ['no_session_known'])
+                self.assertEqual(out2['skipped_known_no_session'], ['2026-07-23'])
+            finally:
+                bb.NO_SESSION_RECORD = old_record
+
 
 if __name__ == '__main__':
     unittest.main()

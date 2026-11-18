@@ -415,5 +415,31 @@ class EodReportDirPassthrough(unittest.TestCase):
                              'nothing may be written under /workspace')
 
 
+class BackfillRetryPassthrough(unittest.TestCase):
+    """R9: run_adaptive.sh backfill can pass --retry-missing through the runner."""
+    def test_parser_accepts_retry_missing(self):
+        import adaptive_runner as ar
+        a = ar.build_parser().parse_args(['backfill', '--from', '2026-07-23', '--to', '2026-07-24',
+                                          '--retry-missing'])
+        self.assertTrue(a.retry_missing)
+
+    def test_backfill_passes_retry_missing_to_child(self):
+        import adaptive_runner as ar
+        from unittest import mock
+        calls = []
+        def fake_run(argv, **kw):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout='{"days_requested": 0}\n', stderr='')
+        with mock.patch('subprocess.run', side_effect=fake_run):
+            out = ar.backfill('2026-07-23', '2026-07-24', retry_missing=True)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('--retry-missing', calls[0])
+        self.assertEqual(out['status'], 'OK')
+        with mock.patch('subprocess.run', side_effect=fake_run):
+            calls.clear()
+            ar.backfill('2026-07-23', '2026-07-24')
+        self.assertNotIn('--retry-missing', calls[0])
+
+
 if __name__ == '__main__':
     unittest.main()

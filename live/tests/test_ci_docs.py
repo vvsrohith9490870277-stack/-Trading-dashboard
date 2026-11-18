@@ -39,7 +39,7 @@ class CiWorkflowTests(unittest.TestCase):
     def test_readme_commands_exist_in_runner_parser(self):
         readme = (HERE / 'README.md').read_text()
         help_text = ar.build_parser().format_help()
-        for flag in ('--session', '--no-wait', '--catch-up', '--force', '--from', '--to'):
+        for flag in ('--session', '--no-wait', '--catch-up', '--force', '--from', '--to', '--retry-missing'):
             self.assertIn(flag, help_text, flag)
             self.assertIn(flag, readme, flag)
         for cmd in ('run_adaptive.sh preflight', 'run_adaptive.sh eod', 'run_adaptive.sh backfill'):

@@ -34,6 +34,40 @@ UA = BF.get('user_agent') or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 REFERER = BF.get('referer') or 'https://www.nseindia.com/'
 CURL = shutil.which('curl')
 
+# R9: local record of dates NSE already answered 404 for on every archive
+# form (a no_session outcome). Kept under state/, never in Turso, so a later
+# --retry-missing run skips those dates instead of re-hitting NSE for them.
+NO_SESSION_RECORD = HERE.parent / 'state' / 'bhavcopy_no_session.json'
+
+
+def load_no_session_dates(record_path=None):
+    """Dates recorded as no_session. Missing/corrupt record => no dates."""
+    p = Path(record_path) if record_path is not None else NO_SESSION_RECORD
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return set()
+    if not isinstance(data, dict):
+        return set()
+    return {str(k) for k, v in data.items() if isinstance(v, dict) and v.get('status') == 'no_session'}
+
+
+def record_no_session_dates(dates, record_path=None):
+    """Persist no_session outcomes (one entry per date) in the local record."""
+    p = Path(record_path) if record_path is not None else NO_SESSION_RECORD
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    stamp = datetime.now(IST).isoformat()
+    for d in dates:
+        data[str(d)[:10]] = {'status': 'no_session', 'recorded_at': stamp}
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(data, indent=1, sort_keys=True))
+    return sorted(data)
+
 
 def session_days(frm, to):
     """Weekdays minus config holidays minus indicator-excluded sessions (Muhurat).
@@ -549,7 +583,7 @@ def main(argv=None):
     a.add_argument('--scratch-dir', default=None)
     a.add_argument('--no-ingest', action='store_true')
     a.add_argument('--retry-missing', action='store_true',
-                   help='re-attempt only dates without a valid local file or archive rows; a second run is a no-op when nothing is missing')
+                   help='re-attempt only dates without a valid local file or archive rows; dates NSE already 404\'d are recorded under state/ and skipped; a second run is a no-op when nothing is missing')
     a.add_argument('--probe', action='store_true', help='scratch-only; skip EOD/window gates; never ingest')
     a = a.parse_args(argv)
 
@@ -575,7 +609,13 @@ def main(argv=None):
     out = []
     db = None if a.no_ingest else ad.open_adaptive_db()
     if a.retry_missing:
-        days = [d for d in days if date_is_missing(d, raw_dir, db)]
+        # R9: skip dates already recorded as no_session (NSE 404'd every
+        # form) — a second --retry-missing run makes no fetch calls for them.
+        known = load_no_session_dates()
+        skipped_known = [d for d in days if d in known]
+        days = [d for d in days if d not in known and date_is_missing(d, raw_dir, db)]
+    else:
+        skipped_known = []
     session = None if a.offline_dir else NseBrowserSession(timeout=BF['request_timeout_seconds'])
     if session is not None and days:
         session.warmup()
@@ -620,6 +660,16 @@ def main(argv=None):
         )
         out.append(rec)
 
+    # R9: persist today's no_session outcomes so the next --retry-missing
+    # run skips them — but only when the run actually asked NSE (an
+    # --offline-dir no_session only means "no valid local file", not a 404).
+    # Report already-known ones explicitly (not as failures).
+    newly_no_session = [x['date'] for x in out if x.get('status') == 'no_session']
+    if newly_no_session and not a.offline_dir:
+        record_no_session_dates(newly_no_session)
+    if skipped_known:
+        out = [{'date': d, 'status': 'no_session_known'} for d in skipped_known] + out
+
     ingested = [x for x in out if x.get('status') in ('ingested', 'parsed')]
     result = {
         'days_requested': len(days),
@@ -628,10 +678,11 @@ def main(argv=None):
         'coverage': len(ingested) / len(days) if days else 0,
         'required': AP['archive_min_coverage'],
         'retry_missing': bool(a.retry_missing),
+        'skipped_known_no_session': skipped_known,
         'probe': probe,
         'scratch_dir': str(raw_dir),
         'detail': out,
-        'failures': [x for x in out if x.get('status') not in ('ingested', 'parsed', 'no_session')],
+        'failures': [x for x in out if x.get('status') not in ('ingested', 'parsed', 'no_session', 'no_session_known')],
         'no_session': [x for x in out if x.get('status') == 'no_session'],
     }
     print(json.dumps(result, indent=1, default=str))

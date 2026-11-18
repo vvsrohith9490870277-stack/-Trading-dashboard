@@ -114,6 +114,8 @@ def build_parser():
     ap.add_argument('--force', action='store_true', help='eod --catch-up: re-run already-marked days')
     ap.add_argument('--from', dest='frm', default=None)
     ap.add_argument('--to', default=None)
+    ap.add_argument('--retry-missing', action='store_true',
+                    help='backfill: re-attempt only dates without a valid local file or archive rows')
     return ap
 
 
@@ -326,10 +328,13 @@ def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_da
     return out
 
 
-def backfill(frm, to):
+def backfill(frm, to, retry_missing=False):
     """P1 minimal (UDiFF era). Guards live in bhavcopy_backfill.py; runs in a scrubbed env (no credentials needed)."""
     env = ag.scrubbed_env(); env['PYTHONPATH'] = str(LIB)
-    p = subprocess.run([PY, str(HERE / 'bhavcopy_backfill.py'), '--from', frm, '--to', to], env=env, capture_output=True, text=True)
+    args = [PY, str(HERE / 'bhavcopy_backfill.py'), '--from', frm, '--to', to]
+    if retry_missing:
+        args.append('--retry-missing')
+    p = subprocess.run(args, env=env, capture_output=True, text=True)
     out = {'phase': 'backfill', 'from': frm, 'to': to, 'exit_code': p.returncode}
     if p.returncode:
         out['status'] = 'REFUSED_OR_FAILED'; out['stderr_tail'] = p.stderr.strip().splitlines()[-3:]
@@ -408,7 +413,7 @@ def main(argv=None):
             if not a.frm or not a.to:
                 out = {'phase': 'backfill', 'status': 'REFUSED_OR_FAILED', 'error': 'backfill_requires_from_and_to'}
             else:
-                out = backfill(a.frm, a.to)
+                out = backfill(a.frm, a.to, a.retry_missing)
         else:
             out = status()
     except Exception as e:  # noqa: BLE001 — every phase failure becomes a structured FAILED report
