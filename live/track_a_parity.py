@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
+import adaptive_paths as apath
 from ro_client import TursoRO
 
 IST = ZoneInfo('Asia/Kolkata')
@@ -76,7 +77,7 @@ def adaptive_state(session=None):
     returns_n = c.execute('SELECT COUNT(*) n FROM adaptive_daily_returns WHERE namespace=?', (NS,)).fetchone()['n']
     archive_days = [r['trade_date'] for r in c.execute('SELECT DISTINCT trade_date FROM bhavcopy_series_archive ORDER BY trade_date')]
     c.close()
-    report_path = Path('/workspace/reports/adaptive') / (session or (equity[-1]['trade_date'] if equity else '')) / 'adaptive-daily.json'
+    report_path = apath.report_dir() / (session or (equity[-1]['trade_date'] if equity else '')) / 'adaptive-daily.json'
     daily = json.loads(report_path.read_text()) if report_path.exists() else None
     return {
         'adaptive_db': str(dbp),
@@ -173,7 +174,7 @@ def main(argv=None):
         'comparison': cmp,
     }
     day = a.session or live.get('latest_eod_day') or datetime.now(IST).date().isoformat()
-    out_dir = Path('/workspace/reports/adaptive') / day
+    out_dir = apath.report_dir() / day
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / 'track-a-parity.json'
     path.write_text(json.dumps(report, indent=2, default=str))

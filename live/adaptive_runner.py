@@ -18,15 +18,25 @@ sys.path.insert(0, str(LIB)); sys.path.insert(0, str(HERE))
 import adaptive_guard as ag      # noqa: E402
 import adaptive_engine as ae     # noqa: E402
 import adaptive_policy as apol   # noqa: E402
+import adaptive_paths as apath   # noqa: E402
 from ro_client import TursoRO    # noqa: E402
 
 IST = ZoneInfo('Asia/Kolkata')
 CFG = json.loads((HERE / 'adaptive_live_config.json').read_text())
 AP = apol.POLICY
-TRACK_A = Path(CFG['track_a_root'])
-TRACK_A_NS = json.loads((TRACK_A / 'config.json').read_text())['namespace']
+TRACK_A = apath.track_a_root(CFG)
 PY = sys.executable
 STATE = HERE.parent / 'state'
+
+
+def report_dir():
+    """Report directory: ADAPTIVE_REPORT_DIR env override, else /workspace/reports/adaptive."""
+    return apath.report_dir()
+
+
+def get_track_a_namespace():
+    """Lazily read the Track A namespace; raises track_a_root_not_found only when actually needed."""
+    return apath.track_a_namespace(TRACK_A, CFG)
 
 
 def protected_counts(ro):
@@ -95,6 +105,8 @@ def build_parser():
 def preflight():
     out = {'phase': 'preflight', 'at_ist': datetime.now(IST).isoformat()}
     out['kill_switch'] = ag.kill_switch_engaged()
+    # Fail with a clear error (not a bare FileNotFoundError) when the Track A root is absent.
+    track_a_ns = get_track_a_namespace()
     ag.assert_frozen_files()                                            # worktree copy
     ag.assert_frozen_files(lock_path=LIB / 'freeze_lock.json', root=TRACK_A)  # installed Track A (read-only)
     out['frozen_files'] = 'match (worktree and installed runtime)'
@@ -103,7 +115,7 @@ def preflight():
     out['modules_scanned'] = len(v['modules_scanned'])
     out['harness_hash'] = ae.compute_harness_hash()
     ro = TursoRO()
-    r = ro.many([("SELECT MAX(trade_date) AS d FROM daily_ohlcv", ()), ("SELECT MAX(day) AS d FROM paper_eod WHERE namespace=?", (TRACK_A_NS,))])
+    r = ro.many([("SELECT MAX(trade_date) AS d FROM daily_ohlcv", ()), ("SELECT MAX(day) AS d FROM paper_eod WHERE namespace=?", (track_a_ns,))])
     out['turso_read_only'] = {'latest_daily_bar': r[0][0]['d'], 'latest_track_a_eod': r[1][0]['d']}
     out['ok'] = (not out['kill_switch']) and not out['forbidden_import_violations']
     return out
@@ -111,8 +123,9 @@ def preflight():
 
 def wait_for_eod(ro, day, no_wait):
     deadline = datetime.combine(date.fromisoformat(day), datetime.strptime(AP['eod_marker_deadline_ist'], '%H:%M').time(), IST)
+    ns = get_track_a_namespace()
     while True:
-        rows = ro.query('SELECT report_json FROM paper_eod WHERE namespace=? AND day=?', (TRACK_A_NS, day))
+        rows = ro.query('SELECT report_json FROM paper_eod WHERE namespace=? AND day=?', (ns, day))
         if rows:
             rep = json.loads(rows[0]['report_json'])
             if rep.get('ledger_reconciled'):
@@ -211,7 +224,7 @@ def main(argv=None):
                 os.close(lock_fd)
             except Exception:
                 pass
-    rdir = Path('/workspace/reports/adaptive') / (a.session or datetime.now(IST).date().isoformat()); rdir.mkdir(parents=True, exist_ok=True)
+    rdir = report_dir() / (a.session or datetime.now(IST).date().isoformat()); rdir.mkdir(parents=True, exist_ok=True)
     (rdir / f'runner-{a.phase}.json').write_text(json.dumps(out, indent=2, default=str))
     print(json.dumps(out, indent=1, default=str))
     sys.exit(0 if out.get('ok', out.get('status') in (None, 'OK')) else 1)

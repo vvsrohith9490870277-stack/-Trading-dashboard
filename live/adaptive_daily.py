@@ -4,7 +4,7 @@ and touches ONLY local SQLite files: reads state/market.sqlite + state/track_a_e
 
 Usage: adaptive_daily.py --session YYYY-MM-DD --eod-json PATH [--report-dir DIR]
 """
-import argparse, hashlib, json, sqlite3, sys
+import argparse, hashlib, json, os, sqlite3, sys
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 LIB = HERE.parent / 'automation' / 'paper-trading'
-sys.path.insert(0, str(LIB))
+sys.path.insert(0, str(LIB)); sys.path.insert(0, str(HERE))
+import adaptive_paths as apath          # noqa: E402
 import pandas as pd                    # noqa: E402
 import adaptive_engine as ae           # noqa: E402
 import adaptive_sim_trades as ast      # noqa: E402
@@ -104,11 +105,16 @@ def snapshot_hash(stock, start):
     return h.hexdigest()
 
 
+def report_dir_default():
+    """Report directory: ADAPTIVE_REPORT_DIR env override, else /workspace/reports/adaptive."""
+    return str(apath.report_dir())
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--session', required=True)
     ap.add_argument('--eod-json', required=True)
-    ap.add_argument('--report-dir', default='/workspace/reports/adaptive')
+    ap.add_argument('--report-dir', default=None)
     a = ap.parse_args()
     day = str(a.session)[:10]
     ag.assert_runnable(heavy=True)
@@ -225,7 +231,7 @@ def main():
     report['decision_log_rows'] = db.query('SELECT COUNT(*) n FROM adaptive_decision_logs WHERE namespace=?', (NS,))[0]['n']
     report['observation'] = {s: {k: v for k, v in aobs.observation_status(db, NS, s).items() if k in ('sessions', 'parity_streak', 'completed', 'min_sessions')} for s in sorted(ae.BASELINE_PARAMS)}
     report['finished_at_ist'] = datetime.now(IST).isoformat()
-    out_dir = Path(a.report_dir) / day; out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(a.report_dir or report_dir_default()) / day; out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / 'adaptive-daily.json').write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report, default=str))
 
