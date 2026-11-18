@@ -355,5 +355,65 @@ class MarketHoursAndLockRefusal(unittest.TestCase):
             self.assertFalse(rep['ok'])
 
 
+class EodReportDirPassthrough(unittest.TestCase):
+    """R6: eod() must launch adaptive_daily.py with --report-dir <override>,
+    so the child writes to ADAPTIVE_REPORT_DIR, not to /workspace."""
+    def test_daily_child_gets_report_dir_override(self):
+        import adaptive_runner as ar
+        import types
+        from unittest import mock
+        day = '2026-11-11'
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            state = Path(t) / 'state'
+            old_state, old_env = ar.STATE, os.environ.get('ADAPTIVE_REPORT_DIR')
+            os.environ['ADAPTIVE_REPORT_DIR'] = str(reports)
+            ar.STATE = state
+            stub = types.ModuleType('market_snapshot')
+            stub.refresh = lambda ro: {'stubbed': True}
+            old_ms = sys.modules.get('market_snapshot')
+            sys.modules['market_snapshot'] = stub
+            old_runnable = ar.ag.assert_runnable
+            ar.ag.assert_runnable = lambda **kw: True
+            old_counts = ar.protected_counts
+            ar.protected_counts = lambda ro: {}
+            old_ns = ar.get_track_a_namespace
+            ar.get_track_a_namespace = lambda: 'paper_v1'
+            calls = []
+            def fake_run(argv, **kw):
+                calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, stdout='{"session_day": "%s"}\n' % day, stderr='')
+            class FakeRO:
+                def query(self, sql, args=()):
+                    if 'paper_eod' in sql:
+                        return [{'report_json': json.dumps({'ledger_reconciled': True})}]
+                    return []
+                def many(self, qs):
+                    return [[{'n': 0}] for _ in qs]
+            try:
+                with mock.patch('subprocess.run', side_effect=fake_run):
+                    out = ar.eod(day, no_wait=True, ro=FakeRO())
+            finally:
+                ar.STATE = old_state
+                ar.ag.assert_runnable = old_runnable
+                ar.protected_counts = old_counts
+                ar.get_track_a_namespace = old_ns
+                if old_ms is None:
+                    sys.modules.pop('market_snapshot', None)
+                else:
+                    sys.modules['market_snapshot'] = old_ms
+                if old_env is None:
+                    os.environ.pop('ADAPTIVE_REPORT_DIR', None)
+                else:
+                    os.environ['ADAPTIVE_REPORT_DIR'] = old_env
+            self.assertEqual(out['status'], 'OK')
+            self.assertEqual(len(calls), 1)
+            argv = calls[0]
+            self.assertIn('--report-dir', argv)
+            self.assertEqual(argv[argv.index('--report-dir') + 1], str(reports))
+            self.assertFalse((Path('/workspace/reports/adaptive') / day).exists(),
+                             'nothing may be written under /workspace')
+
+
 if __name__ == '__main__':
     unittest.main()

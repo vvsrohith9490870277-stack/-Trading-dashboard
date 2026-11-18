@@ -189,7 +189,11 @@ def eod(day, no_wait=False, ro=None):
     env = ag.scrubbed_env()
     env['PYTHONPATH'] = str(LIB)
     with _timed(timings, 'daily'):
-        p = subprocess.run([PY, str(HERE / 'adaptive_daily.py'), '--session', day, '--eod-json', str(eod_path)],
+        # R6: pass --report-dir explicitly — the scrubbed child env drops
+        # ADAPTIVE_REPORT_DIR, so without this the daily step would write to
+        # /workspace/reports/adaptive while the runner writes to the override.
+        p = subprocess.run([PY, str(HERE / 'adaptive_daily.py'), '--session', day, '--eod-json', str(eod_path),
+                            '--report-dir', str(report_dir())],
                            env=env, capture_output=True, text=True, preexec_fn=limits)
     out['daily_exit_code'] = p.returncode
     if p.returncode:
