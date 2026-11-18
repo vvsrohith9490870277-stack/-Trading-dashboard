@@ -4,6 +4,10 @@ Fixtures are clearly synthetic (AAA-EQ / BBB-EQ, round prices) and are never
 presented as real data. Comparison basis (per the engine's own definition in
 adaptive_engine.classify_discordant_trades): only trades whose entry_date is
 after warm_start_end count — warm-start-inherited entries/exits are excluded.
+
+R4 HOLD: record_for_session writes no row until Grok approves a basis, so the
+comparison assertions in this file drive the pure compare_session_parity
+directly; parity_ok / streak assertions drive aobs.record_parity directly.
 """
 import json, sqlite3, sys, unittest
 from pathlib import Path
@@ -63,68 +67,89 @@ def record(db, **kw):
     return pr.record_for_session(db, NS, 1, DAY, **args)
 
 
+def compare(**kw):
+    """Pure comparison for one session (R4: record_for_session is held, so the
+    comparison assertions live here, on compare_session_parity directly)."""
+    args = dict(replica_closed_trades=replica_trades(), replica_open_positions=[],
+                replica_entry_skips=[{'day': DAY, 'symbol': 'BBB-EQ', 'cause': 'UPPER_CIRCUIT_BUY_BLOCK'}],
+                live_fills=live_fills(), warm_start_end=WS_END, session_day=DAY,
+                replica_equity_paise=1000000, live_equity_paise=1000000, strategy=1)
+    args.update(kw)
+    return pr.compare_session_parity(**args)
+
+
 class ParityRecordTests(unittest.TestCase):
-    def test_full_match_records_parity_ok_and_streak_increments(self):
+    def test_parity_basis_hold_writes_no_row(self):
+        # R4: until Grok approves a comparison basis, record_for_session
+        # writes no adaptive_parity row, even on the full SIMULATED fixture.
         db = make_db()
         out = record(db)
-        self.assertEqual(out['status'], 'compared')
-        self.assertTrue(out['parity_ok'])
+        self.assertEqual(out, {'status': 'not_evaluable', 'reason': 'parity_basis_pending_review'})
+        rows = db.query('SELECT COUNT(*) n FROM adaptive_parity')[0]['n']
+        self.assertEqual(rows, 0)
+
+    def test_full_match_pure_comparison_agrees(self):
+        # Pure comparison (was: record_for_session wrote parity_ok=1).
+        out = compare()
         self.assertTrue(out['fills_match']); self.assertTrue(out['skips_match']); self.assertTrue(out['qty_match'])
+        self.assertEqual(out['equity_diff_paise'], 0)
+        self.assertEqual(out['reasons'], [])
+        # The parity_ok / streak rule itself (aobs.record_parity) is unchanged:
+        # an exact match still records parity_ok=1 and a streak of 1.
+        db = make_db()
+        self.assertTrue(aobs.record_parity(db, NS, 1, DAY, out['fills_match'], out['skips_match'],
+                                           out['qty_match'], out['equity_diff_paise']))
         rows = db.query('SELECT * FROM adaptive_parity WHERE namespace=? AND strategy=?', (NS, 1))
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]['parity_ok'], 1)
-        # Streak over the one counted session is 1.
         self.assertEqual(aobs.parity_streak(db, NS, 1, [DAY])['streak'], 1)
 
     def test_other_strategy_fills_do_not_break_parity(self):
         # R3: live fills for another strategy on the same day must not be
-        # compared against this strategy's replica fills.
-        db = make_db()
+        # compared against this strategy's replica fills (pure comparison).
         fills = live_fills() + [{'strategy': 6, 'symbol': 'ZZZ-EQ', 'side': 'BUY', 'qty': 3,
                                  'price': 77.0, 'filled_at': '2026-11-11T09:16:00+05:30'}]
-        out = record(db, live_fills=fills)
-        self.assertEqual(out['status'], 'compared')
+        out = compare(live_fills=fills)
         self.assertTrue(out['fills_match'], out)
-        self.assertTrue(out['parity_ok'], out)
         self.assertEqual(len(out['live_fills']), 2)  # only strategy 1 fills compared
 
     def test_inherited_warm_start_trade_is_not_discordance(self):
-        db = make_db()
         trades = replica_trades() + [
             {'symbol': 'OLD-EQ', 'entry_date': '2026-11-09', 'exit_date': '2026-11-11', 'qty': 7,
              'entry_price': 20.0, 'exit_price': 21.0, 'net_pnl_paise': 700, 'side': 'BUY'},
         ]
-        out = record(db, replica_closed_trades=trades)
-        self.assertEqual(out['status'], 'compared')
-        self.assertTrue(out['parity_ok'], out)  # live never held OLD-EQ; its warm-start exit is excluded
+        out = compare(replica_closed_trades=trades)
+        self.assertTrue(out['fills_match'], out)  # live never held OLD-EQ; its warm-start exit is excluded
 
-    def test_one_fill_price_mismatch_records_parity_ok_zero_and_streak_resets(self):
-        db = make_db()
+    def test_one_fill_price_mismatch_is_not_a_match(self):
         bad = live_fills(); bad[0] = {**bad[0], 'price': 100.5}
-        out = record(db, live_fills=bad)
-        self.assertEqual(out['status'], 'compared')
-        self.assertFalse(out['parity_ok'])
+        out = compare(live_fills=bad)
         self.assertFalse(out['fills_match'])
+        self.assertIn('replica fills for the session differ from live fills', out['reasons'])
+        db = make_db()
+        self.assertFalse(aobs.record_parity(db, NS, 1, DAY, out['fills_match'], out['skips_match'],
+                                            out['qty_match'], out['equity_diff_paise']))
         self.assertEqual(aobs.parity_streak(db, NS, 1, [DAY])['streak'], 0)
 
     def test_qty_mismatch_and_skip_mismatch(self):
-        db = make_db()
         bad = live_fills(); bad[0] = {**bad[0], 'qty': 11}
-        out = record(db, live_fills=bad)
-        self.assertFalse(out['qty_match']); self.assertFalse(out['parity_ok'])
+        out = compare(live_fills=bad)
+        self.assertFalse(out['qty_match']); self.assertFalse(out['fills_match'])
         # Live bought a symbol the replica skipped -> skips do not match.
         bought_skipped = live_fills() + [{'strategy': 1, 'symbol': 'BBB-EQ', 'side': 'BUY', 'qty': 1,
                                           'price': 10.0, 'filled_at': '2026-11-11T09:15:00+05:30'}]
-        out = record(db, live_fills=bought_skipped)
-        self.assertFalse(out['skips_match']); self.assertFalse(out['parity_ok'])
+        out = compare(live_fills=bought_skipped)
+        self.assertFalse(out['skips_match'])
 
     def test_equity_diff_beyond_tolerance_is_parity_ok_zero(self):
-        db = make_db()
-        out = record(db, live_equity_paise=1000000 - 101)  # tolerance is 100 paise
+        out = compare(live_equity_paise=1000000 - 101)  # tolerance is 100 paise
         self.assertEqual(out['equity_diff_paise'], 101)
-        self.assertFalse(out['parity_ok'])
-        out = record(db, live_equity_paise=1000000 - 100)
-        self.assertTrue(out['parity_ok'])
+        db = make_db()
+        self.assertFalse(aobs.record_parity(db, NS, 1, DAY, out['fills_match'], out['skips_match'],
+                                            out['qty_match'], out['equity_diff_paise']))
+        out = compare(live_equity_paise=1000000 - 100)
+        self.assertTrue(aobs.record_parity(db, NS, 1, DAY, out['fills_match'], out['skips_match'],
+                                           out['qty_match'], out['equity_diff_paise']))
 
     def test_non_reconciled_or_missing_live_fills_writes_nothing(self):
         db = make_db()
@@ -135,11 +160,12 @@ class ParityRecordTests(unittest.TestCase):
         rows = db.query('SELECT COUNT(*) n FROM adaptive_parity')[0]['n']
         self.assertEqual(rows, 0)
 
-    def test_idempotent_rerun_does_not_duplicate_rows(self):
+    def test_hold_rerun_still_writes_no_rows(self):
+        # R4: re-running the held recorder never creates a row.
         db = make_db()
         record(db); record(db)
         rows = db.query('SELECT COUNT(*) n FROM adaptive_parity')[0]['n']
-        self.assertEqual(rows, 1)
+        self.assertEqual(rows, 0)
 
 
 class TradeParityLabelTests(unittest.TestCase):

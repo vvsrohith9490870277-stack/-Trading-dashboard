@@ -23,6 +23,14 @@ If live fills cannot be obtained, or the EOD is not reconciled, or the
 simulation did not run, record_for_session records NOTHING — a missing parity
 row correctly breaks the parity streak — and returns not_evaluable + reason.
 Never write parity_ok=1 unless every compared field truly matched.
+
+R4 HOLD (pending Grok's approval of a comparison basis): the exact-2dp price
+basis and the replica-vs-live-sleeve equity basis are both unevaluable as
+specified (see review of adaptive-engine-01), so record_for_session currently
+writes NO row and returns {'status': 'not_evaluable',
+'reason': 'parity_basis_pending_review'} for every call. The pure comparison
+functions below (compare_session_parity, evaluation_window_fills) are
+unchanged and still unit-tested; only the recording step is held.
 """
 import sys
 from collections import Counter
@@ -32,7 +40,9 @@ HERE = Path(__file__).resolve().parent
 LIB = HERE.parent / 'automation' / 'paper-trading'
 if str(LIB) not in sys.path:
     sys.path.insert(0, str(LIB))
-import adaptive_observation as aobs  # noqa: E402
+# NOTE: adaptive_observation is intentionally NOT imported here while the R4
+# hold is in force: record_for_session writes no parity row, so there is no
+# record_parity call to make.
 
 
 def _price(v):
@@ -106,7 +116,11 @@ def record_for_session(db, namespace, strategy, session_day, *, reconciled, simu
                        replica_entry_skips, warm_start_end,
                        replica_equity_paise, live_equity_paise):
     """Record one parity row, or nothing (not_evaluable) when the comparison
-    cannot honestly be made. Idempotent: re-running the same day replaces the row."""
+    cannot honestly be made. Idempotent: re-running the same day replaces the row.
+
+    R4 HOLD: no row is written and this returns
+    {'status': 'not_evaluable', 'reason': 'parity_basis_pending_review'} until
+    Grok approves a comparison basis. Do not wire any parity row writes until then."""
     day = str(session_day)[:10]
     if not reconciled:
         return {'status': 'not_evaluable', 'reason': 'track_a_eod_not_reconciled'}
@@ -116,12 +130,9 @@ def record_for_session(db, namespace, strategy, session_day, *, reconciled, simu
         return {'status': 'not_evaluable', 'reason': 'live_fills_unavailable'}
     if replica_equity_paise is None or live_equity_paise is None:
         return {'status': 'not_evaluable', 'reason': 'equity_unavailable'}
-    cmp = compare_session_parity(replica_closed_trades, replica_open_positions, replica_entry_skips,
-                                 live_fills, warm_start_end, day,
-                                 replica_equity_paise, live_equity_paise, strategy=int(strategy))
-    ok = aobs.record_parity(db, namespace, int(strategy), day,
-                            cmp['fills_match'], cmp['skips_match'], cmp['qty_match'],
-                            cmp['equity_diff_paise'],
-                            details={'replica_fills': cmp['replica_fills'], 'live_fills': cmp['live_fills'],
-                                     'reasons': cmp['reasons'], 'warm_start_end': str(warm_start_end)})
-    return {'status': 'compared', 'parity_ok': bool(ok), **cmp}
+    # R4 HOLD (pending Grok's approval of a comparison basis): the pure
+    # comparison (compare_session_parity) is kept and unit-tested, but no
+    # parity row is written here. The pre-hold write path (compare, then
+    # aobs.record_parity) is deliberately removed, not left unreachable,
+    # so no row can be written until the basis is approved and re-wired.
+    return {'status': 'not_evaluable', 'reason': 'parity_basis_pending_review'}
