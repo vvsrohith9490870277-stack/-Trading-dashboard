@@ -334,6 +334,7 @@ class PaperTests(unittest.TestCase):
   self.assertEqual(len(self.db.positions()),0);self.assertEqual(len(self.db.query('SELECT * FROM paper_fills WHERE namespace=?',(e.NS,))),0)
  def test_old_position_exit_guard(self):
   e.fill(self.db,self.signal(),self.quote(),T);s=self.signal('SELL');self.db.batch([('UPDATE paper_signals SET reason=? WHERE namespace=? AND id=?',('daily_exit:2026-11-01T10:00:00+05:30',e.NS,s['id']))]);self.assertFalse(e.fill(self.db,s,self.quote(),T)['filled']);self.assertEqual(len(self.db.positions()),1)
+ @unittest.skipUnless(Path('/workspace/strategies').exists(),'original strategy files only exist on the owner box')
  def test_frozen_indicators_match_originals(self):
   import ast,numpy as np,pandas as pd
   n=400;c=100+np.sin(np.arange(n)/9)*15+np.arange(n)*.02;g=pd.DataFrame({'open':c-.3,'high':c+1,'low':c-1,'close':c,'volume':100,'trade_date':pd.date_range('2025-01-01',periods=n).strftime('%Y-%m-%d')})
