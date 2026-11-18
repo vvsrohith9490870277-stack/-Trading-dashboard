@@ -97,6 +97,8 @@ def build_parser():
     ap.add_argument('phase', choices=['preflight', 'eod', 'backfill', 'status'])
     ap.add_argument('--session', default=None)
     ap.add_argument('--no-wait', action='store_true')
+    ap.add_argument('--catch-up', action='store_true', help='eod: process every missed session in order')
+    ap.add_argument('--force', action='store_true', help='eod --catch-up: re-run already-marked days')
     ap.add_argument('--from', dest='frm', default=None)
     ap.add_argument('--to', default=None)
     return ap
@@ -185,6 +187,86 @@ def eod(day, no_wait=False):
     return out
 
 
+def _read_marked_days():
+    """Days with a reconciled adaptive_eod_markers row (local adaptive DB)."""
+    p = HERE.parent / CFG['adaptive_db']
+    if not p.exists():
+        return set()
+    import sqlite3
+    try:
+        c = sqlite3.connect(p)
+        rows = c.execute('SELECT trade_date FROM adaptive_eod_markers WHERE namespace=? AND reconciled=1',
+                         (CFG['namespace'],)).fetchall()
+        c.close()
+        return {r[0] for r in rows}
+    except Exception:
+        return set()
+
+
+def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_days=None, namespace=None):
+    """Catch-up (Task 7): from the day after the last reconciled adaptive EOD
+    marker (or --from) through --session/today, iterate calendar trading
+    sessions in order. A day runs the normal eod flow only if Track A's
+    paper_eod row exists and ledger_reconciled is true; otherwise it is
+    recorded SKIPPED_NO_RECONCILED_TRACK_A_EOD and nothing is synthesised.
+    Already-marked days are skipped unless --force. Stops on the first hard
+    failure (the runner writes the FAILED report). Market-hours refusal, the
+    lock and the memory cap are enforced by main()/eod() as for a single eod.
+    """
+    ns = namespace or get_track_a_namespace()
+    marked = set(marked_days) if marked_days is not None else _read_marked_days()
+    if frm:
+        start = str(frm)[:10]
+    elif marked:
+        from datetime import timedelta
+        start = (date.fromisoformat(max(marked)) + timedelta(days=1)).isoformat()
+    else:
+        raise RuntimeError('catch_up_needs_from_when_no_markers')
+    end = str(to)[:10] if to else datetime.now(IST).date().isoformat()
+    import adaptive_daily as ad
+    days = ad.expected_session_days(start, end)
+    ro = ro or TursoRO()
+    fn = eod_fn or eod
+    out = {'phase': 'eod', 'catch_up': True, 'from': start, 'to': end,
+           'at_ist': datetime.now(IST).isoformat(), 'days': []}
+
+    def _fail(day, exc):
+        summary = ';'.join(f"{d['day']}:{d['status']}" for d in out['days'])
+        raise RuntimeError(f'catch_up_failed_at:{day}:{summary}') from exc
+
+    for day in days:
+        if day in marked and not force:
+            out['days'].append({'day': day, 'status': 'SKIPPED_ALREADY_MARKED'})
+            continue
+        try:
+            rows = ro.query('SELECT report_json FROM paper_eod WHERE namespace=? AND day=?', (ns, day))
+        except Exception as e:
+            out['days'].append({'day': day, 'status': 'FAILED', 'error': str(e)})
+            _fail(day, e)
+        reconciled = False
+        if rows:
+            try:
+                reconciled = bool(json.loads(rows[0]['report_json']).get('ledger_reconciled'))
+            except Exception:
+                reconciled = False
+        if not reconciled:
+            out['days'].append({'day': day, 'status': 'SKIPPED_NO_RECONCILED_TRACK_A_EOD'})
+            continue
+        try:
+            res = fn(day, no_wait=True)
+        except Exception as e:
+            out['days'].append({'day': day, 'status': 'FAILED', 'error': str(e)})
+            _fail(day, e)
+        status = res.get('status') if isinstance(res, dict) else 'OK'
+        out['days'].append({'day': day, 'status': status})
+        if status == 'OK':
+            marked.add(day)
+        else:
+            _fail(day, RuntimeError(f'eod_status:{status}'))
+    out['status'] = 'OK'
+    return out
+
+
 def backfill(frm, to):
     """P1 minimal (UDiFF era). Guards live in bhavcopy_backfill.py; runs in a scrubbed env (no credentials needed)."""
     env = ag.scrubbed_env(); env['PYTHONPATH'] = str(LIB)
@@ -255,7 +337,10 @@ def main(argv=None):
             if a.phase == 'preflight':
                 out = preflight()
             elif a.phase == 'eod':
-                out = eod(a.session or datetime.now(IST).date().isoformat(), a.no_wait)
+                if a.catch_up:
+                    out = eod_catch_up(a.frm, a.session, a.force)
+                else:
+                    out = eod(a.session or datetime.now(IST).date().isoformat(), a.no_wait)
             elif a.phase == 'backfill':
                 if not a.frm or not a.to:
                     out = {'phase': 'backfill', 'status': 'REFUSED_OR_FAILED', 'error': 'backfill_requires_from_and_to'}
