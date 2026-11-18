@@ -114,7 +114,8 @@ class SessionDaemon(Base):
   e.CFG['sessiond_exit_selftest']=False;times=[datetime(2026,11,8,10,0,tzinfo=e.IST),datetime(2026,11,8,11,0,tzinfo=e.IST)];i={'n':0}
   def now():return times[min(i['n'],1)]
   def sleep(_):i['n']+=1
-  e.now=now;out=sd.run(e,self.db,sleep=sleep,max_ticks=2)
+  e.now=now
+  with __import__('audit').scope(e,self.db,'sessiond'):out=sd.run(e,self.db,sleep=sleep,max_ticks=2)
   self.assertEqual(out['ticks'],2)
   self.assertTrue(self.db.query("SELECT 1 FROM paper_events WHERE namespace=? AND event_type='sessiond_wake'",(e.NS,)))
   hb=json.loads(self.db.query("SELECT value FROM paper_meta WHERE namespace=? AND key='sessiond_heartbeat'",(e.NS,))[0]['value']);self.assertEqual(hb['status'],'stopped')

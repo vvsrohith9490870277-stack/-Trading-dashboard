@@ -110,6 +110,10 @@ def run(e,db,sleep=time.sleep,max_ticks=None):
      al.emit(e,db,'sessiond_wake',outcome='ok',frozen_seconds=round(frozen,1),reason='box_resumed_catching_up')
     last_wall,last_mono=wall,mono
     try:
+     # The engine runs this command inside an audit scope, which spools events to logs/audit-spool; replay every
+     # tick (as the guardian does) so daemon alerts reach Turso within one tick instead of at the next command.
+     try:al.replay(e,db)
+     except Exception:pass
      acted=tick(e,db,state,wall,mono);heartbeat(e,db,'running',{'acted':acted} if acted else None)
      if acted:al.emit(e,db,'sessiond_actions',actions=[list(a) for a in acted])
     except Exception as ex:
