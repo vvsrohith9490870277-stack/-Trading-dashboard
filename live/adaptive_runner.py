@@ -20,6 +20,7 @@ import adaptive_guard as ag      # noqa: E402
 import adaptive_engine as ae     # noqa: E402
 import adaptive_policy as apol   # noqa: E402
 import adaptive_paths as apath   # noqa: E402
+import adaptive_observation as aobs  # noqa: E402 — SESSION_DONE_CAUSE (R7)
 from ro_client import TursoRO    # noqa: E402
 
 IST = ZoneInfo('Asia/Kolkata')
@@ -212,7 +213,13 @@ def eod(day, no_wait=False, ro=None):
 
 
 def _read_marked_days():
-    """Days with a reconciled adaptive_eod_markers row (local adaptive DB)."""
+    """Days whose simulation actually ran (simulation_status == 'SIMULATED').
+
+    R7: a reconciled adaptive_eod_markers row alone is NOT "done" — the EOD
+    marker is written before the freshness/PIT gate, so a day whose simulation
+    was BLOCKED would otherwise never be caught up. A day counts as done only
+    when the shadow runner also logged a SESSION_DONE_CAUSE decision-log row
+    for it (written only on the SIMULATED path in adaptive_daily.py)."""
     p = HERE.parent / CFG['adaptive_db']
     if not p.exists():
         return set()
@@ -221,8 +228,11 @@ def _read_marked_days():
         c = sqlite3.connect(p)
         rows = c.execute('SELECT trade_date FROM adaptive_eod_markers WHERE namespace=? AND reconciled=1',
                          (CFG['namespace'],)).fetchall()
+        done = c.execute("SELECT DISTINCT substr(source_at,1,10) FROM adaptive_decision_logs "
+                         "WHERE namespace=? AND named_cause=?",
+                         (CFG['namespace'], aobs.SESSION_DONE_CAUSE)).fetchall()
         c.close()
-        return {r[0] for r in rows}
+        return {r[0] for r in rows} & {r[0] for r in done}
     except Exception:
         return set()
 
@@ -236,6 +246,10 @@ def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_da
     Already-marked days are skipped unless --force. Stops on the first hard
     failure (the runner writes the FAILED report). Market-hours refusal, the
     lock and the memory cap are enforced by main()/eod() as for a single eod.
+
+    R7: a day counts as done only when its simulation_status is 'SIMULATED'
+    (a BLOCKED run never marks the day, so a later catch-up re-runs it).
+    Every days[] entry carries simulation_status.
     """
     ns = namespace or get_track_a_namespace()
     marked = set(marked_days) if marked_days is not None else _read_marked_days()
@@ -260,12 +274,13 @@ def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_da
 
     for day in days:
         if day in marked and not force:
-            out['days'].append({'day': day, 'status': 'SKIPPED_ALREADY_MARKED'})
+            # Marked days are SIMULATED by construction (see _read_marked_days).
+            out['days'].append({'day': day, 'status': 'SKIPPED_ALREADY_MARKED', 'simulation_status': 'SIMULATED'})
             continue
         try:
             rows = ro.query('SELECT report_json FROM paper_eod WHERE namespace=? AND day=?', (ns, day))
         except Exception as e:
-            out['days'].append({'day': day, 'status': 'FAILED', 'error': str(e)})
+            out['days'].append({'day': day, 'status': 'FAILED', 'error': str(e), 'simulation_status': None})
             _fail(day, e)
         reconciled = False
         if rows:
@@ -274,17 +289,28 @@ def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_da
             except Exception:
                 reconciled = False
         if not reconciled:
-            out['days'].append({'day': day, 'status': 'SKIPPED_NO_RECONCILED_TRACK_A_EOD'})
+            out['days'].append({'day': day, 'status': 'SKIPPED_NO_RECONCILED_TRACK_A_EOD', 'simulation_status': None})
             continue
         try:
             res = fn(day, no_wait=True)
         except Exception as e:
-            out['days'].append({'day': day, 'status': 'FAILED', 'error': str(e)})
+            out['days'].append({'day': day, 'status': 'FAILED', 'error': str(e), 'simulation_status': None})
             _fail(day, e)
         status = res.get('status') if isinstance(res, dict) else 'OK'
-        out['days'].append({'day': day, 'status': status})
-        if status == 'OK':
+        # The real eod() nests the daily report under res['daily']; fakes may
+        # carry simulation_status at the top level.
+        sim = None
+        if isinstance(res, dict):
+            sim = res.get('simulation_status')
+            if sim is None and isinstance(res.get('daily'), dict):
+                sim = res['daily'].get('simulation_status')
+        out['days'].append({'day': day, 'status': status, 'simulation_status': sim})
+        if status == 'OK' and sim == 'SIMULATED':
             marked.add(day)
+        elif status == 'OK':
+            # R7: the eod run "succeeded" but the simulation was blocked — the
+            # day is NOT done and a later catch-up must re-run it.
+            pass
         else:
             _fail(day, RuntimeError(f'eod_status:{status}'))
     out['status'] = 'OK'
