@@ -233,5 +233,62 @@ class PortableSidecar(unittest.TestCase):
             self.assertEqual(r.stdout.strip(), str(out))
 
 
+class StructuredFailureReports(unittest.TestCase):
+    """Task 3: any phase failure writes runner-<phase>-FAILED.json with a short
+    error_code and a non-secret detail; a clean run writes no FAILED file."""
+    def _track_a_root(self, t, alter=False):
+        root = Path(t) / 'track-a'
+        root.mkdir()
+        lib = HERE.parent / 'automation' / 'paper-trading'
+        (root / 'config.json').write_text((lib / 'config.json').read_text())
+        for name in ('capital_policy.json', 'charge_policy.json', 'charge_rates.json'):
+            (root / name).write_text((lib / name).read_text())
+        if alter:
+            p = root / 'capital_policy.json'
+            data = json.loads(p.read_text()); data['master_capital_inr'] = int(data['master_capital_inr']) + 1
+            p.write_text(json.dumps(data))
+        return root
+
+    def _run_main(self, args, env_extra):
+        env = dict(os.environ)
+        env.pop('TRACK_A_ROOT', None); env.pop('ADAPTIVE_REPORT_DIR', None)
+        env.update(env_extra)
+        return subprocess.run([sys.executable, str(HERE / 'adaptive_runner.py')] + args,
+                              capture_output=True, text=True, cwd=HERE, env=env)
+
+    def test_preflight_frozen_mismatch_writes_failed_report(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self._track_a_root(t, alter=True)
+            reports = Path(t) / 'reports'
+            secret = 's3cr3t-marker-xyz-123'
+            r = self._run_main(['preflight'], {'TRACK_A_ROOT': str(root),
+                                               'ADAPTIVE_REPORT_DIR': str(reports),
+                                               'ADAPTIVE_TEST_SECRET': secret})
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            today = __import__('datetime').date.today().isoformat()
+            failed = reports / today / 'runner-preflight-FAILED.json'
+            self.assertTrue(failed.exists(), r.stdout + r.stderr)
+            rep = json.loads(failed.read_text())
+            self.assertEqual(rep['phase'], 'preflight')
+            self.assertEqual(rep['status'], 'FAILED')
+            self.assertEqual(rep['error_code'], 'frozen_file_hash_mismatch')
+            self.assertFalse(rep['ok'])
+            self.assertIn('capital_policy.json', rep['detail'])
+            self.assertIn('installed', rep['detail'])
+            self.assertIn('expected=', rep['detail'])
+            self.assertIn('actual=', rep['detail'])
+            self.assertNotIn(secret, failed.read_text())
+            self.assertNotIn('traceback', failed.read_text().lower())
+
+    def test_clean_status_run_writes_normal_report_and_no_failed(self):
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            r = self._run_main(['status'], {'ADAPTIVE_REPORT_DIR': str(reports)})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            today = __import__('datetime').date.today().isoformat()
+            self.assertTrue((reports / today / 'runner-status.json').exists())
+            self.assertFalse((reports / today / 'runner-status-FAILED.json').exists())
+
+
 if __name__ == '__main__':
     unittest.main()

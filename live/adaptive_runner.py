@@ -199,24 +199,62 @@ def status():
             'log_rows': q('SELECT COUNT(*) FROM adaptive_decision_logs WHERE namespace=?', (CFG['namespace'],))[0][0]}
 
 
+def _scrub_detail(detail):
+    """Remove values of credential-like env vars from a report detail (never leak secrets)."""
+    out = str(detail)
+    for k in ag.credential_like_keys(dict(os.environ)):
+        v = os.environ.get(k)
+        if v and len(v) >= 4:
+            out = out.replace(v, '[redacted]')
+    return out
+
+
+def _error_code(exc):
+    msg = str(exc).strip()
+    if msg:
+        return msg.split(':')[0].strip() or type(exc).__name__
+    return type(exc).__name__
+
+
+def _error_detail(exc):
+    mm = getattr(exc, 'frozen_mismatch', None)
+    if mm:
+        root = str(mm.get('root') or '')
+        label = 'installed' if root == str(TRACK_A) else ('worktree' if root == str(LIB) else root)
+        return _scrub_detail(
+            f"root={label} ({root}) file={mm.get('name')} expected={mm.get('expected')} actual={mm.get('actual')}")
+    return _scrub_detail(str(exc))
+
+
+def failure_report(phase, session_day, exc):
+    return {'phase': phase, 'session_day': session_day, 'at_ist': datetime.now(IST).isoformat(),
+            'status': 'FAILED', 'error_code': _error_code(exc), 'detail': _error_detail(exc), 'ok': False}
+
+
 def main(argv=None):
     a = build_parser().parse_args(argv)
     lock_fd = None
     if a.phase in ('eod', 'backfill'):
         assert_not_market_hours(a.phase)
         lock_fd = acquire_run_lock()
+    out, error = None, None
     try:
-        if a.phase == 'preflight':
-            out = preflight()
-        elif a.phase == 'eod':
-            out = eod(a.session or datetime.now(IST).date().isoformat(), a.no_wait)
-        elif a.phase == 'backfill':
-            if not a.frm or not a.to:
-                out = {'phase': 'backfill', 'status': 'REFUSED_OR_FAILED', 'error': 'backfill_requires_from_and_to'}
+        try:
+            if a.phase == 'preflight':
+                out = preflight()
+            elif a.phase == 'eod':
+                out = eod(a.session or datetime.now(IST).date().isoformat(), a.no_wait)
+            elif a.phase == 'backfill':
+                if not a.frm or not a.to:
+                    out = {'phase': 'backfill', 'status': 'REFUSED_OR_FAILED', 'error': 'backfill_requires_from_and_to'}
+                else:
+                    out = backfill(a.frm, a.to)
             else:
-                out = backfill(a.frm, a.to)
-        else:
-            out = status()
+                out = status()
+        except Exception as e:  # noqa: BLE001 — every phase failure becomes a structured FAILED report
+            error = e
+            import traceback
+            traceback.print_exc()
     finally:
         if lock_fd is not None:
             try:
@@ -224,7 +262,20 @@ def main(argv=None):
                 os.close(lock_fd)
             except Exception:
                 pass
-    rdir = report_dir() / (a.session or datetime.now(IST).date().isoformat()); rdir.mkdir(parents=True, exist_ok=True)
+    day = a.session or datetime.now(IST).date().isoformat()
+    rdir = report_dir() / day; rdir.mkdir(parents=True, exist_ok=True)
+    if error is not None:
+        failed = failure_report(a.phase, day, error)
+        (rdir / f'runner-{a.phase}-FAILED.json').write_text(json.dumps(failed, indent=2, default=str))
+        try:
+            print(json.dumps(failed, indent=1, default=str))
+        except BrokenPipeError:
+            try:
+                sys.stdout.close()
+            except Exception:
+                pass
+        sys.exit(1)
+    (rdir / f'runner-{a.phase}-FAILED.json').unlink(missing_ok=True)
     (rdir / f'runner-{a.phase}.json').write_text(json.dumps(out, indent=2, default=str))
     try:
         print(json.dumps(out, indent=1, default=str))
