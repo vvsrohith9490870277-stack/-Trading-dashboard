@@ -291,9 +291,19 @@ def quote_from_fyers(x,stamp=None):
  row={'symbol':sym,'price':positive_price(v.get('lp')),'quote_at':stamp,'provider_status':x.get('s'),'source':'FYERS_QUOTES','open':official,'high':positive_price(v.get('high_price')),'low':positive_price(v.get('low_price')),'ask':book_price(v.get('ask')),'bid':book_price(v.get('bid'))}
  if official is None and indicative is not None and cas is not None:row['auction_price']=indicative
  return row
-def execution_reference(q,stop=False,stop_level=None,pending_exit=False):
- """Next-open orders use the official open. Strategy 07 stops fill at the open on a gap through the prior stop (trail_gap) or at the stop level when the bar low touches it (trail_touch)."""
+def entry_open_window_open(t):
+ """True while an entry may still take the session's official open: from the open until entry_open_fill_window_seconds after it.
+ Unknown time (legacy callers) keeps the old behaviour."""
+ if t is None:return True
+ ss=session(t.date())
+ if not ss:return False
+ opened=datetime.combine(t.date(),ss[0],tzinfo=IST)
+ return (t-opened).total_seconds()<=float(CFG['entry_open_fill_window_seconds'])
+def execution_reference(q,stop=False,stop_level=None,pending_exit=False,at=None,side='BUY'):
+ """Next-open orders use the official open. Strategy 07 stops fill at the open on a gap through the prior stop (trail_gap) or at the stop level when the bar low touches it (trail_touch).
+ A BUY attempted after the entry window (entry_open_fill_window_seconds past the open) uses the actual last-traded price of that quote, never the earlier open."""
  if not q:return None,'LTP_LEGACY'
+ if side=='BUY' and not stop and not entry_open_window_open(at):return positive_price(q.get('price')),'LTP_LEGACY'
  if stop and not pending_exit:
   official=positive_price(q.get('open'));low=positive_price(q.get('low'));level=positive_price(stop_level)
   if official is not None and level is not None and official<=level:return official,'FEED_OPEN'
@@ -357,8 +367,41 @@ def stable_id(*parts):return hashlib.sha256('|'.join(map(str,parts)).encode()).h
 def decide(db,s,t,decision_type,cause,rule,payload=None,execution_path='LTP_LEGACY'):
  correlation=s.get('id') or stable_id(decision_type,cause,s.get('strategy'),s.get('symbol'),t.isoformat())
  db.call({'action':'decision','namespace':NS,'correlation_id':correlation,'decision_type':decision_type,'strategy':s.get('strategy'),'symbol':s.get('symbol'),'signal_id':s.get('id'),'cause':cause,'rule':rule,'execution_path':execution_path,'source_at':t.isoformat(),'payload':{'strategy_version':RULE_HASH.get(str(s.get('strategy'))),**(payload or {})}})
+REFERENCE_STATUS_KEY='reference_feeds_status:'
+_SURV_CACHE={}
+def record_reference_status(db,day,report):
+ """Persist which surveillance/series sources loaded for a session, so the BUY gate can fail closed when they did not."""
+ src=(report or {}).get('sources') or {}
+ status={k:(src.get(k) or {}).get('status','missing') for k in CFG['surveillance_required_sources']}
+ row={'day':str(day),'sources':status,'dry_run':bool((report or {}).get('dry_run')),'recorded_at':now().isoformat()}
+ if row['dry_run']:return row
+ db.batch([('INSERT INTO paper_meta(namespace,key,value) VALUES(?,?,?) ON CONFLICT(namespace,key) DO UPDATE SET value=excluded.value',(NS,REFERENCE_STATUS_KEY+str(day),js(row)))]);_SURV_CACHE.clear();return row
+def refresh_reference(db,day=None):
+ """Run the reference feeds for a session (ASM, GSM, series, corporate actions) and record their load status."""
+ day=day or reference_day(now());out=rf.refresh(sys.modules[__name__],db,day)
+ out['surveillance_status']=record_reference_status(db,out.get('trade_day') or day,out);return out
+def surveillance_ready(db,day):
+ """Fail-closed gate input: True only when ASM, GSM and series all loaded for this session."""
+ if not CFG.get('surveillance_fail_closed'):return {'ready':True,'reason':'gate_disabled'}
+ if NS.startswith('test_') and not CFG.get('surveillance_fail_closed_in_tests'):return {'ready':True,'reason':'test_namespace'}
+ hit=_SURV_CACHE.get((NS,day))
+ if hit and time.monotonic()-hit[0]<float(CFG['surveillance_status_cache_seconds']):return hit[1]
+ try:rows=db.query('SELECT value FROM paper_meta WHERE namespace=? AND key=?',(NS,REFERENCE_STATUS_KEY+str(day)))
+ except Exception:rows=[]
+ if not rows:r={'ready':False,'reason':'reference_feed_not_loaded_for_session','day':str(day)}
+ else:
+  st=json.loads(rows[0]['value']).get('sources') or {};bad=sorted(k for k in CFG['surveillance_required_sources'] if st.get(k)!='ok')
+  r={'ready':not bad,'reason':'loaded' if not bad else 'source_unavailable','unavailable':bad,'day':str(day),'sources':st}
+ _SURV_CACHE[(NS,day)]=(time.monotonic(),r);return r
+_SURV_ALERTED=set()
+def _surveillance_alert(db,t,ready):
+ key=(NS,t.date().isoformat())
+ if key in _SURV_ALERTED:return
+ _SURV_ALERTED.add(key)
+ try:al.emit(sys.modules[__name__],db,'surveillance_data_missing',outcome='failed',severity='ERROR',reason=ready.get('reason'),unavailable=ready.get('unavailable'),trade_day=t.date().isoformat())
+ except Exception:pass
 def _fill(db,s,q,t):
- ok,why=valid_quote(q,t);reference,path=execution_reference(q,stop=bool(s.get('stop')),stop_level=s.get('stop_level'),pending_exit=bool(s.get('pending_exit')));guard=market_guard(q,band_for(db,s['symbol'],t.date().isoformat()) if q else None)
+ ok,why=valid_quote(q,t);reference,path=execution_reference(q,stop=bool(s.get('stop')),stop_level=s.get('stop_level'),pending_exit=bool(s.get('pending_exit')),at=t,side=s.get('side'));guard=market_guard(q,band_for(db,s['symbol'],t.date().isoformat()) if q else None)
  if not ok:
   decide(db,s,t,'SKIP',why,'quote_not_fillable',{'price':q.get('price') if q else None},path);return {'filled':False,'reason':why,'execution_path':path}
  if s['eligible_date']>t.date().isoformat():
@@ -382,6 +425,13 @@ def _fill(db,s,q,t):
    log('order_skipped',strategy=s['strategy'],symbol=s['symbol'],signal_id=s['id'],cause='UNAFFORDABLE_ZERO_SHARES',price=reference,target_notional_inr=cap.POLICY['target_notional_inr'],quantity=0)
    decide(db,s,t,'SKIP','UNAFFORDABLE_ZERO_SHARES','floor_notional_over_fill_price_is_zero',{'price':reference,'quantity':0,'target_notional_inr':cap.POLICY['target_notional_inr']},path)
    return {'filled':False,'reason':'UNAFFORDABLE_ZERO_SHARES','quantity':0,'execution_path':path}
+ if s['side']=='BUY':
+  ready=surveillance_ready(db,t.date().isoformat())
+  if not ready['ready']:
+   decide(db,s,t,'SKIP','SURVEILLANCE_DATA_MISSING','new_entries_blocked_until_asm_gsm_series_loaded_for_session',{'price':reference,'quantity':0,'reference_feeds':ready},path)
+   log('order_skipped',strategy=s['strategy'],symbol=s['symbol'],signal_id=s['id'],cause='SURVEILLANCE_DATA_MISSING',price=reference,reference_feeds=ready,quantity=0)
+   _surveillance_alert(db,t,ready)
+   return {'filled':False,'reason':'SURVEILLANCE_DATA_MISSING','quantity':0,'execution_path':path}
  r=db.call({'action':'fill','namespace':NS,'signal':s,'quantity':quantity,'price':reference,'isin':ISINS.get(s['symbol']),'quote_at':q['quote_at'],'at':t.isoformat(),'audit_run_id':al.run_id(),'execution_path':path,'strategy_version':RULE_HASH.get(str(s['strategy'])),'circuit':guard['circuit'],'series':guard['series'],'surveillance':guard['surveillance'],'lock_unknown':guard['lock_unknown']});log('paper_fill_attempt',strategy=s['strategy'],symbol=s['symbol'],result=r)
  if isinstance(r,dict) and r.get('reason') in ('SLEEVE_SLOT_FULL','ISIN_CAP','INSUFFICIENT_CASH','ADV_FILTER_SKIP','ADV_PARTICIPATION_CAP','CIRCUIT_LOCKED','SERIES_TRANSITION_BE_BZ','ASM_GSM_RESTRICTION','KILL_PAUSE'):
   log('order_skipped',strategy=s['strategy'],symbol=s['symbol'],signal_id=s['id'],cause=r['reason'],price=reference,open_positions=r.get('open_positions'),max_positions_per_sleeve=cap.POLICY['max_positions_per_sleeve'],max_strategies_per_isin=cap.POLICY['max_strategies_per_isin'],quantity=0)
@@ -627,6 +677,15 @@ def _remember_skip(day,s,r):
  if s.get('side')=='BUY' and s.get('id') and r.get('reason') in set(CFG.get('monitor_session_sticky_skips') or []):
   for k in [k for k in _SESSION_SKIPS if k[0]!=day]:_SESSION_SKIPS.pop(k,None)
   _SESSION_SKIPS[(day,s['id'])]=r['reason']
+_FULL_NOTED=set()
+def _note_full_sleeve(db,s,t,day):
+ """A BUY passed over because its sleeve filled earlier in this poll gets one SKIP decision per session (not one per poll)."""
+ key=(NS,day,s.get('id'))
+ if key in _FULL_NOTED:return
+ for k in [k for k in _FULL_NOTED if k[1]!=day]:_FULL_NOTED.discard(k)
+ _FULL_NOTED.add(key)
+ try:decide(db,s,t,'SKIP','SLEEVE_SLOT_FULL','sleeve_full_earlier_in_poll',{'quantity':0,'recorded_once_per_session':True})
+ except Exception:pass
 def _monitor(db,api):
  t=now()
  if not au.active(sys.modules[__name__],t):r={'status':'market_closed_or_calendar_unverified','at_IST':t.isoformat(),'fills':0};db.run('monitor','closed',**r);return r
@@ -662,7 +721,8 @@ def _monitor(db,api):
  for s in actions:
   key=(s['strategy'],s['symbol'])
   if key in used:continue
-  if s.get('side')!='SELL' and s.get('strategy') in full_sleeves:continue
+  if s.get('side')!='SELL' and s.get('strategy') in full_sleeves:
+   _note_full_sleeve(db,s,t,day);continue
   if _sticky_skip(day,s):sticky+=1;continue
   q=quotes.get(s['symbol'])
   if s.get('stop') and not s.get('pending_exit') and q:
@@ -765,8 +825,16 @@ def migrate(db):
  pos=db.query('PRAGMA table_info(paper_positions)')
  if pos and not any(c.get('name')=='pending_exit' for c in pos):
   db.batch([('ALTER TABLE paper_positions ADD COLUMN pending_exit INTEGER NOT NULL DEFAULT 0',()),('ALTER TABLE paper_positions ADD COLUMN pending_exit_since TEXT',())])
-SUPERVISION_COMMANDS = ('worker', 'ensure-monitor', 'health', 'preflight', 'ensure-session', 'guardian', 'replay-audit', 'export-logs', 'support')
+SUPERVISION_COMMANDS = ('worker', 'ensure-monitor', 'health', 'preflight', 'ensure-session', 'guardian', 'replay-audit', 'export-logs', 'support', 'sessiond', 'ensure-sessiond', 'record-outages')
 READ_ONLY_COMMANDS = ('trades-today', 'status', 'positions', 'pnl', 'charges', 'finance', 'overlap', 'funnel')
+
+def _ensure_session(e,db):
+ """Arm the guardian and (re)start the session daemon, so any supervision call also restores self-recovery."""
+ import sessiond as sd
+ r=gd.ensure(e,db)
+ try:r['sessiond']=sd.ensure(e,db)
+ except Exception as ex:r['sessiond']={'status':'unavailable','reason':au.safe_error(ex)}
+ return r
 
 def uses_engine_lock(command):
     """Exclusive engine.lock is for mutating market/session work only. Read-only reports, reference-feeds (its own lock), and exit-selftest (its own lock and namespace) do not take it."""
@@ -774,7 +842,7 @@ def uses_engine_lock(command):
 
 def main():
  parser=argparse.ArgumentParser(description='Paper-only Fyers-data/Turso-ledger engine; never broker orders.')
- parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history','exit-selftest']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);parser.add_argument('--cleanup-only',action='store_true');parser.add_argument('--keep',action='store_true');parser.add_argument('--max-seconds',type=int,default=1200);parser.add_argument('--max-quotes',type=int,default=40);args=parser.parse_args()
+ parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history','exit-selftest','sessiond','ensure-sessiond','record-outages','revalue-eod']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);parser.add_argument('--cleanup-only',action='store_true');parser.add_argument('--keep',action='store_true');parser.add_argument('--max-seconds',type=int,default=1200);parser.add_argument('--max-quotes',type=int,default=40);args=parser.parse_args()
  if not 1<=args.max_history_requests<=1100 or not 1<=args.max_history_seconds<=1080:parser.error('historical repair budget outside safe bounds')
  if args.command in SUPERVISION_COMMANDS:
   # Supervision must remain reachable even while a worker/scan holds engine.lock.
@@ -789,7 +857,8 @@ def main():
    elif args.command=='support':
     print(js(sa.run_cli(e,db,args.session)))
    else:
-    fn={'worker':au.worker,'ensure-monitor':au.ensure_monitor,'health':au.health,'preflight':au.preflight,'ensure-session':gd.ensure,'guardian':gd.run}[args.command]
+    import sessiond as sd
+    fn={'worker':au.worker,'ensure-monitor':au.ensure_monitor,'health':au.health,'preflight':au.preflight,'ensure-session':_ensure_session,'guardian':gd.run,'sessiond':sd.run,'ensure-sessiond':sd.ensure,'record-outages':au.record_outages}[args.command]
     with al.scope(e,db,args.command):print(js(fn(e,db)))
   except Exception as ex:
    print(js({'status':'failed','error':au.safe_error(ex),'paper_only':True}));sys.exit(1)
@@ -800,7 +869,7 @@ def main():
    db=DB();e=sys.modules[__name__]
    if args.command=='reference-feeds':
     with al.scope(e,db,args.command):
-     out=rf.refresh(e,db,reference_day(now()));log('command_completed',command=args.command,namespace=NS);print(js(out))
+     out=refresh_reference(db,reference_day(now()));log('command_completed',command=args.command,namespace=NS);print(js(out))
    elif args.command=='exit-selftest':
     if not 1<=args.max_seconds<=1800 or not 1<=args.max_quotes<=80:raise ValueError('exit_selftest_bounds')
     out=xst.cli(e,db,args);log('command_completed',command=args.command,namespace=xst.TEST_NS);print(js(out))
@@ -845,6 +914,9 @@ def main():
      if au.active(sys.modules[__name__],now()):out['pnl']=pnl(db)
      else:out['snapshot_skipped_market_closed']=True
     elif args.command=='eod':out=au.eod(sys.modules[__name__],db)
+    elif args.command=='revalue-eod':
+     if not args.session:raise ValueError('revalue_needs_session')
+     out=au.revalue_eod(sys.modules[__name__],db,args.session)
     elif args.command=='weekly':out=au.weekly(sys.modules[__name__],db)
     log('command_completed',command=args.command,namespace=NS)
     print(js(out))

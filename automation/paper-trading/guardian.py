@@ -41,6 +41,14 @@ def run(e,db,sleep=time.sleep,max_checks=480):
   try:fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:return {'status':'already_running','checks':0}
   initial=e.now().date();checks=0;began=time.monotonic();last=began;last_wall=None
+  try:return _loop(e,db,sleep,max_checks,initial,began,last,last_wall)
+  except BaseException as ex:
+   # Abnormal exit (exception, SIGTERM via SystemExit, interrupt): never leave a stale 'checking' heartbeat behind.
+   try:heartbeat(e,db,'stopped');al.emit(e,db,'guardian_stopped',reason='abnormal_exit',outcome='failed',severity='ERROR',error_code=type(ex).__name__)
+   except Exception:pass
+   raise
+def _loop(e,db,sleep,max_checks,initial,began,last,last_wall):
+  checks=0
   while e.now().date()==initial and armable(e,e.now()) and checks<max_checks and time.monotonic()-began<e.CFG['guardian_max_session_seconds']:
    tick=time.monotonic();lag=max(0,tick-last-e.CFG['guardian_seconds']) if checks else 0;last=tick
    # Wall-clock gap since this guardian's previous check. A gap beyond guardian_gap_grace_seconds means

@@ -73,3 +73,4 @@ CREATE TABLE IF NOT EXISTS adaptive_decision_logs(namespace TEXT NOT NULL,seq IN
 CREATE INDEX IF NOT EXISTS adaptive_logs_corr_idx ON adaptive_decision_logs(namespace,correlation_id,seq);
 CREATE INDEX IF NOT EXISTS adaptive_logs_spawn_idx ON adaptive_decision_logs(namespace,spawn_id,seq);
 CREATE INDEX IF NOT EXISTS adaptive_logs_query_idx ON adaptive_decision_logs(namespace,track,strategy,symbol,category,named_cause);
+CREATE TABLE IF NOT EXISTS paper_outages(namespace TEXT NOT NULL,session_day TEXT NOT NULL,kind TEXT NOT NULL,detected_at TEXT NOT NULL,detail_json TEXT NOT NULL,PRIMARY KEY(namespace,session_day,kind));

@@ -8,7 +8,7 @@ import capital as cap
 import engine as e
 import pauses as pz
 
-SOURCES = ['engine.py', 'automation.py', 'capital.py', 'pauses.py', 'corporate_actions.py', 'reconciliation.py', 'bhavcopy_compare.py', 'prefilter.py', 'guardian.py', 'reference_feeds.py', 'db.mjs', 'fees.mjs', '../../server/capped-ledger.mjs']
+SOURCES = ['engine.py', 'automation.py', 'capital.py', 'pauses.py', 'corporate_actions.py', 'reconciliation.py', 'bhavcopy_compare.py', 'prefilter.py', 'guardian.py', 'reference_feeds.py', 'sessiond.py', 'db.mjs', 'fees.mjs', '../../server/capped-ledger.mjs']
 
 
 def code_only(name):
@@ -84,6 +84,9 @@ class NoMagicNumberTests(unittest.TestCase):
             r'\b(TODO|FIXME|TBD)\b': 'no unfinished markers',
         }
         for name in SOURCES:
+            if name.startswith('../') and not (ROOT / name).exists():
+                # Installed runtime (/workspace/paper-trading) has no repo server/ tree; the repo checkout still audits it.
+                continue
             text = code_only(name)
             if name == 'engine.py':
                 # Strategy 01 is the frozen in-engine signal formula (Track A); its windows are not execution policy.

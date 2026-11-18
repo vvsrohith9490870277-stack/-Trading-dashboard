@@ -215,16 +215,18 @@ class PaperTests(unittest.TestCase):
   repeated=e.quote_from_fyers({'n':'NSE:INFY-EQ','s':'ok','v':{'lp':100,'indicative_price':100,'reference_price':0,'tt':'2026-11-09T10:00:00+05:30'}})
   self.assertNotIn('auction_price',repeated)
   self.assertEqual(e.execution_reference({'price':85,'open':90},stop=True),(85,'LTP_LEGACY'))
-  q=self.quote();q['open']=90;q['auction_price']=80
-  s=self.signal();fed=e.fill(self.db,s,q,T);self.assertTrue(fed['filled']);self.assertEqual(fed['qty'],555);self.assertEqual(fed['execution_path'],'FEED_OPEN');self.assertGreater(fed['price'],90)
+  # Entries take the official open only inside entry_open_fill_window_seconds of the open (Phase 2, item 3d).
+  t0=T.replace(hour=9,minute=16);q=self.quote();q['open']=90;q['auction_price']=80;q['quote_at']=t0.isoformat()
+  self.assertEqual(e.execution_reference(dict(q),at=T),(100,'LTP_LEGACY'))
+  s=self.signal();fed=e.fill(self.db,s,q,t0);self.assertTrue(fed['filled']);self.assertEqual(fed['qty'],555);self.assertEqual(fed['execution_path'],'FEED_OPEN');self.assertGreater(fed['price'],90)
   payload=json.loads(self.db.query('SELECT rule,execution_path,payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,s['id']))[0]['payload_json'])
   decision=self.db.query('SELECT rule,execution_path FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,s['id']))[0]
   self.assertEqual(decision['execution_path'],'FEED_OPEN');self.assertEqual(decision['rule'],'feed_official_open');self.assertEqual(payload['reference_price'],90)
   self.assertEqual(self.db.query('SELECT execution_path FROM paper_fills WHERE namespace=? AND signal_id=?',(e.NS,s['id']))[0]['execution_path'],'FEED_OPEN')
-  aq={'symbol':'TCS-EQ','price':100,'quote_at':T.isoformat(),'auction_price':80}
-  caught=e.fill(self.db,self.signal(symbol='TCS-EQ'),aq,T);self.assertTrue(caught['filled']);self.assertEqual(caught['qty'],625);self.assertEqual(caught['execution_path'],'AUCTION_CAPTURE');self.assertGreater(caught['price'],80)
-  fq={'symbol':'INFY-EQ','price':100,'quote_at':T.isoformat(),'first_trade':95}
-  first=e.fill(self.db,self.signal(symbol='INFY-EQ'),fq,T);self.assertTrue(first['filled']);self.assertEqual(first['qty'],526);self.assertEqual(first['execution_path'],'FALLBACK_OPEN')
+  aq={'symbol':'TCS-EQ','price':100,'quote_at':t0.isoformat(),'auction_price':80}
+  caught=e.fill(self.db,self.signal(symbol='TCS-EQ'),aq,t0);self.assertTrue(caught['filled']);self.assertEqual(caught['qty'],625);self.assertEqual(caught['execution_path'],'AUCTION_CAPTURE');self.assertGreater(caught['price'],80)
+  fq={'symbol':'INFY-EQ','price':100,'quote_at':t0.isoformat(),'first_trade':95}
+  first=e.fill(self.db,self.signal(symbol='INFY-EQ'),fq,t0);self.assertTrue(first['filled']);self.assertEqual(first['qty'],526);self.assertEqual(first['execution_path'],'FALLBACK_OPEN')
   stop=self.signal('SELL',symbol='HDFCBANK-EQ');stop['stop']=True
   skipped=e.fill(self.db,stop,{'symbol':'HDFCBANK-EQ','price':85,'quote_at':T.isoformat(),'open':90},T)
   self.assertFalse(skipped['filled']);self.assertEqual(skipped['execution_path'],'LTP_LEGACY')

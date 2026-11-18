@@ -230,6 +230,8 @@ def _eod(e,db):
   r['missing_eod_warning']=None
  else:
   r['missing_eod_warning']='Last accepted in-session marks, potentially stale; never fabricated official close. Official NSE close used only when the UDiFF CM bhavcopy is available for every open symbol. Missing daily baseline means daily P&L unavailable.'
+ try:r['performance']=performance(e,db,r,str(t.date()))
+ except Exception as ex:r['performance']={'status':'unavailable','reason':safe_error(ex)}
  existing=db.query('SELECT as_of,report_json FROM paper_eod WHERE namespace=? AND day=?',(e.NS,str(t.date())))
  if existing:
   r['previous_snapshot_as_of']=existing[0]['as_of']
@@ -245,6 +247,132 @@ def _eod(e,db):
   except Exception:
    pass
  db.batch([('INSERT INTO paper_eod(namespace,day,as_of,report_json) VALUES(?,?,?,?) ON CONFLICT(namespace,day) DO UPDATE SET as_of=excluded.as_of,report_json=excluded.report_json',(e.NS,str(t.date()),t.isoformat(),e.js(r)))]);return r
+
+def performance(e,db,r,day):
+ """EOD/report metrics from the real ledger (paper_v1 only): closed-trade expectancy, drawdown on EOD snapshots,
+ cost-to-gross and implementation shortfall. Values are None, never guessed, when the inputs do not exist yet."""
+ fills=db.query('SELECT f.id,f.strategy,f.symbol,f.side,f.qty,f.price,f.realized_pnl,f.filled_at,f.execution_path,s.bar_date FROM paper_fills f LEFT JOIN paper_signals s ON s.namespace=f.namespace AND s.id=f.signal_id WHERE f.namespace=? AND f.strategy BETWEEN 1 AND 7 AND substr(f.filled_at,1,10)<=? ORDER BY f.id',(e.NS,day))
+ closed=db.query("SELECT strategy,trade_id,net_pnl_paise,closed_at FROM paper_closed_trades WHERE namespace=? AND book='capped' AND substr(closed_at,1,10)<=?",(e.NS,day))
+ sells=[f for f in fills if f['side']=='SELL'];gross=[cents(f['realized_pnl']) for f in sells];net=[int(c['net_pnl_paise']) for c in closed]
+ exp={'closed_trades':len(sells),'expectancy_gross_paise':round(sum(gross)/len(gross)) if gross else None,'expectancy_net_paise':round(sum(net)/len(net)) if net else None,
+      'win_rate_net':round(sum(x>0 for x in net)/len(net),4) if net else None,'definition':'mean per closed round trip; net uses paper_closed_trades (book=capped, both legs estimated charges)'}
+ series=[]
+ for x in db.query('SELECT day,report_json FROM paper_eod WHERE namespace=? AND day<? ORDER BY day',(e.NS,day)):
+  try:v=json.loads(x['report_json']).get('net_total_accrued_paise')
+  except (TypeError,ValueError):v=None
+  if v is not None:series.append((x['day'],int(v)))
+ if r.get('net_total_accrued_paise') is not None:series.append((day,int(r['net_total_accrued_paise'])))
+ peak=None;peak_day=None;mdd=0;mdd_from=None;mdd_to=None
+ for d,v in series:
+  if peak is None or v>peak:peak,peak_day=v,d
+  if v-peak<mdd:mdd,mdd_from,mdd_to=v-peak,peak_day,d
+ dd={'max_drawdown_net_paise':mdd if series else None,'peak_day':mdd_from,'trough_day':mdd_to,'current_drawdown_net_paise':(series[-1][1]-max(v for _,v in series)) if series else None,
+     'snapshot_days':[d for d,_ in series],'basis':'net_total_accrued_paise on stored EOD snapshots; days without a snapshot are absent, not interpolated'}
+ g=r.get('gross_total_paise');c=r.get('accrued_cost_paise')
+ ctg={'accrued_cost_paise':c,'gross_total_paise':g,'cost_to_gross':round(c/g,4) if (c is not None and g and g>0) else None,'cost_to_abs_gross':round(c/abs(g),4) if (c is not None and g) else None}
+ rows=[];notional=0;wsum_close=0;wsum_open=0;n_open=0
+ for f in fills:
+  sc=db.query('SELECT close FROM daily_ohlcv WHERE symbol=? AND trade_date=?',(f['symbol'],f['bar_date'])) if f['bar_date'] else []
+  op=db.query('SELECT open FROM daily_ohlcv WHERE symbol=? AND trade_date=?',(f['symbol'],f['filled_at'][:10]))
+  sign=1 if f['side']=='BUY' else -1
+  vs_close=round(sign*(f['price']/sc[0]['close']-1)*1e4,2) if sc and sc[0]['close'] else None
+  vs_open=round(sign*(f['price']/op[0]['open']-1)*1e4,2) if op and op[0]['open'] else None
+  rows.append({'fill_id':f['id'],'side':f['side'],'symbol':f['symbol'],'execution_path':f['execution_path'],'bps_vs_signal_close':vs_close,'bps_vs_session_open':vs_open})
+  w=f['qty']*f['price']
+  if vs_close is not None:notional+=w;wsum_close+=w*vs_close
+  if vs_open is not None:n_open+=w;wsum_open+=w*vs_open
+ isf={'fills':len(rows),'weighted_bps_vs_signal_close':round(wsum_close/notional,2) if notional else None,'weighted_bps_vs_session_open':round(wsum_open/n_open,2) if n_open else None,
+      'today':[x for x in rows if any(f['id']==x['fill_id'] and f['filled_at'][:10]==day for f in fills)],'definition':'positive bps = worse than reference (buy above / sell below); reference = signal-bar close, and the fill-day official open from daily_ohlcv'}
+ return {'status':'ok','expectancy':exp,'drawdown':dd,'cost_to_gross':ctg,'implementation_shortfall':isf}
+
+def _preserve_prior(e,day,existing):
+ """Copy an EOD snapshot that is about to be replaced into out/ (never overwritten); returns the path."""
+ out=e.ROOT/'out';out.mkdir(exist_ok=True)
+ stamp=existing['as_of'].replace(':','').replace('/','').replace(' ','')
+ trail=out/('eod-'+str(day)+'-prior-'+stamp+'.json')
+ try:
+  fd=os.open(trail,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
+  with os.fdopen(fd,'w') as f:f.write(existing['report_json']);f.flush();os.fsync(f.fileno())
+ except FileExistsError:pass
+ return str(trail)
+
+def revalue_eod(e,db,day,fetch=None):
+ """Re-value a past (or today's completed) session from the real NSE UDiFF CM bhavcopy close, clearly labelled.
+ Refuses when the ledger changed after that day (fills, corporate-action scales or cash credits), when the official
+ file is not published or misses a symbol, or when a complete near-close snapshot already exists. Never invents a close."""
+ d=date.fromisoformat(str(day));t=e.now();ss=e.session(d)
+ if not ss or d.weekday()>=5:return {'status':'not_a_verified_session','day':str(d),'written':False}
+ if d>t.date() or (d==t.date() and t.timetz().replace(tzinfo=None)<e.COMPLETED_CUTOFF):return {'status':'session_not_completed','day':str(d),'written':False}
+ later=db.query('SELECT COUNT(*) AS n FROM paper_fills WHERE namespace=? AND substr(filled_at,1,10)>?',(e.NS,str(d)))[0]['n']
+ scales=db.query('SELECT COUNT(*) AS n FROM paper_state_scales WHERE namespace=? AND ex_date>?',(e.NS,str(d)))[0]['n']
+ credits=db.query('SELECT COUNT(*) AS n FROM paper_cash_credits WHERE namespace=? AND ex_date>?',(e.NS,str(d)))[0]['n']
+ if later or scales or credits:return {'status':'ledger_changed_after_day_unsupported','day':str(d),'fills_after':later,'scales_after':scales,'credits_after':credits,'written':False}
+ existing=db.query('SELECT as_of,report_json FROM paper_eod WHERE namespace=? AND day=?',(e.NS,str(d)))
+ if existing and json.loads(existing[0]['report_json']).get('closing_valuation_complete'):return {'status':'complete_snapshot_exists','day':str(d),'written':False}
+ symbols=sorted({p['symbol'] for p in db.positions()})
+ fetched=(fetch or oc.closes_for)(e,d,symbols)
+ if fetched.get('status')!='ok' or not set(symbols)<=set(fetched.get('closes') or {}):return {'status':'official_close_unavailable','day':str(d),'reason':fetched.get('reason'),'missing':fetched.get('missing'),'written':False}
+ close=datetime.combine(d,ss[1],tzinfo=e.IST)
+ overlay={sym:{'price':float(px),'at':close.isoformat(),'source':fetched['source']} for sym,px in fetched['closes'].items()}
+ r=finance(e,db,mark_overlay=overlay)
+ r['closing_mark_quality']=_closing_quality(r,close,close,e.CFG['eod_near_close_seconds'],official=True)
+ r['official_close']=True;r['official_close_source']=fetched['source'];r['official_close_status']='applied';r['official_close_reason']=fetched.get('reason')
+ r['closing_valuation_complete']=not r['missing_marks'] and all(x['near_close'] for x in r['closing_mark_quality'])
+ prior=db.query('SELECT day,report_json FROM paper_eod WHERE namespace=? AND day<? ORDER BY day DESC LIMIT 1',(e.NS,str(d)));p=json.loads(prior[0]['report_json']) if prior else None
+ expected=str(e.completed_day(datetime.combine(d,walltime(0),tzinfo=e.IST)));before=db.query('SELECT COUNT(*) AS n FROM paper_fills WHERE namespace=? AND substr(filled_at,1,10)<?',(e.NS,str(d)))[0]['n']
+ known=bool(prior and prior[0]['day']==expected and p.get('closing_valuation_complete')) or (not prior and not before)
+ r['daily_baseline_day']=prior[0]['day'] if prior else None;r['daily_baseline_known']=known;r['daily_gross_paise']=None;r['daily_net_accrued_paise']=None
+ if known and r['closing_valuation_complete']:
+  for key,out in [('gross_total_paise','daily_gross_paise'),('net_total_accrued_paise','daily_net_accrued_paise')]:
+   if r[key] is not None and (p is None or p.get(key) is not None):r[out]=r[key]-(p[key] if p else 0)
+ r.update(day=str(d),revaluation=True,mark_basis='official_close_revaluation',revalued_at=t.isoformat(),missing_eod_warning=None,
+          revaluation_note='Written after the session from the NSE UDiFF CM bhavcopy closing price for every open symbol; positions and accrued charges are the ledger as of that day (no fills or corporate-action changes since). Not a live end-of-day snapshot.')
+ try:r['performance']=performance(e,db,r,str(d))
+ except Exception as ex:r['performance']={'status':'unavailable','reason':safe_error(ex)}
+ if existing:r['previous_snapshot_as_of']=existing[0]['as_of'];r['previous_snapshot_path']=_preserve_prior(e,d,existing[0])
+ db.batch([('INSERT INTO paper_eod(namespace,day,as_of,report_json) VALUES(?,?,?,?) ON CONFLICT(namespace,day) DO UPDATE SET as_of=excluded.as_of,report_json=excluded.report_json',(e.NS,str(d),t.isoformat(),e.js(r)))])
+ al.emit(e,db,'eod_revalued',day=str(d),source=fetched['source'],closing_valuation_complete=r['closing_valuation_complete'],daily_net_accrued_paise=r['daily_net_accrued_paise'],net_total_accrued_paise=r.get('net_total_accrued_paise'),replaced_snapshot=bool(existing))
+ return {'status':'written','day':str(d),'written':True,'closing_valuation_complete':r['closing_valuation_complete'],'daily_gross_paise':r['daily_gross_paise'],'daily_net_accrued_paise':r['daily_net_accrued_paise'],'gross_total_paise':r.get('gross_total_paise'),'net_total_accrued_paise':r.get('net_total_accrued_paise'),'baseline_day':r['daily_baseline_day'],'baseline_known':known,'replaced_snapshot':bool(existing),'previous_snapshot_path':r.get('previous_snapshot_path')}
+
+def _session_days_before(e,day,count):
+ out=[];d=day
+ while len(out)<count:
+  d-=timedelta(days=1);s=e.session(d)
+  if s is None:break
+  if s and d.weekday()<5:out.append(d)
+ return out
+def monitor_coverage(e,db,d):
+ """Share of the 09:15-close session covered by monitor checks (each check credits up to worker_coverage_credit_seconds)."""
+ ss=e.session(d)
+ if not ss:return None
+ o=datetime.combine(d,ss[0],tzinfo=e.IST);c=datetime.combine(d,ss[1],tzinfo=e.IST)
+ ts=[datetime.fromisoformat(x['at']) for x in db.query("SELECT at FROM paper_runs WHERE namespace=? AND kind='monitor' AND substr(at,1,10)=? ORDER BY at",(e.NS,str(d)))]
+ pts=[o]+[x for x in ts if o<=x<=c]+[c];credit=float(e.CFG['worker_coverage_credit_seconds'])
+ covered=sum(min((b-a).total_seconds(),credit) for a,b in zip(pts,pts[1:]))
+ return {'checks':len(pts)-2,'coverage':round(covered/(c-o).total_seconds(),4)}
+OUTAGES_SCHEMA='CREATE TABLE IF NOT EXISTS paper_outages(namespace TEXT NOT NULL,session_day TEXT NOT NULL,kind TEXT NOT NULL,detected_at TEXT NOT NULL,detail_json TEXT NOT NULL,PRIMARY KEY(namespace,session_day,kind))'
+def record_outages(e,db,lookback=None):
+ """Durable day-missing / outage records for recent sessions: no monitoring, low coverage, missing scan, missing EOD.
+ Insert-once per (session, kind); each new row also emits an audit event. Never backfills prices or fills."""
+ db.batch([(OUTAGES_SCHEMA,())])
+ t=e.now();lookback=lookback or int(e.CFG['outage_lookback_sessions']);days=_session_days_before(e,t.date(),lookback)
+ ss=e.session(t.date())
+ if ss and t.weekday()<5 and t.timetz().replace(tzinfo=None)>=e.COMPLETED_CUTOFF:days=[t.date()]+days
+ new=[]
+ for d in days:
+  findings=[];cov=monitor_coverage(e,db,d)
+  if cov is not None:
+   if cov['checks']==0:findings.append(('no_monitoring',cov))
+   elif cov['coverage']<float(e.CFG['outage_min_monitor_coverage']):findings.append(('monitor_coverage_low',cov))
+  if not db.query('SELECT 1 FROM paper_scan_batches WHERE namespace=? AND substr(scanned_at,1,10)=? LIMIT 1',(e.NS,str(d))):findings.append(('scan_missing',{}))
+  if not db.query('SELECT 1 FROM paper_eod WHERE namespace=? AND day=? LIMIT 1',(e.NS,str(d))):findings.append(('eod_missing',{}))
+  for kind,detail in findings:
+   n=db.query('SELECT COUNT(*) AS n FROM paper_outages WHERE namespace=? AND session_day=? AND kind=?',(e.NS,str(d),kind))[0]['n']
+   if n:continue
+   db.batch([('INSERT OR IGNORE INTO paper_outages(namespace,session_day,kind,detected_at,detail_json) VALUES(?,?,?,?,?)',(e.NS,str(d),kind,t.isoformat(),e.js(detail)))])
+   al.emit(e,db,'session_outage_recorded',outcome='failed',severity='ERROR',missed_session=str(d),reason=kind,**({'coverage':detail.get('coverage'),'checks':detail.get('checks')} if detail else {}))
+   new.append({'session_day':str(d),'kind':kind,**detail})
+ return {'status':'ok','checked_sessions':[str(d) for d in days],'new_records':new}
 
 def eod(e,db):
  with al.scope(e,db,'eod'):
@@ -407,9 +535,16 @@ def preflight(e,db):
  al.emit(e,db,info['event'],python_ok=r.get('python_ok'),node_ok=r.get('node_ok'),restored=r.get('restored') or [],outcome='ok' if r.get('ok') else 'failed',severity='INFO' if r.get('ok') else 'ERROR')
  try:audit=al.ensure_daily_export(e,db,str(e.now().date()),force=False)
  except Exception as ex:audit={'status':'unavailable','reason':al.classified_error(ex)}
+ try:
+  day=e.reference_day(e.now());ready=e.surveillance_ready(db,str(day))
+  reference=e.refresh_reference(db,day) if not ready.get('ready') else {'status':'already_loaded','surveillance_status':ready}
+  reference={'trade_day':str(day),'surveillance_status':reference.get('surveillance_status'),'sources':{k:(v or {}).get('status') for k,v in (reference.get('sources') or {}).items()}}
+ except Exception as ex:reference={'status':'unavailable','reason':safe_error(ex)}
+ try:import sessiond as sd;daemon=sd.ensure(e)
+ except Exception as ex:daemon={'status':'unavailable','reason':safe_error(ex)}
  inst=_install_report(e)
  status='ok' if r.get('ok') and inst.get('ok') else ('runtime_deps_restore_incomplete' if not r.get('ok') else 'install_incomplete')
- return {'paper_only':True,'status':status,'runtime_deps':r,'audit_export':audit,'calendar_verified':e.session(e.now().date()) is not None,'at_IST':e.now().isoformat(),'install':inst,'install_ok':bool(inst.get('ok'))}
+ return {'paper_only':True,'status':status,'runtime_deps':r,'audit_export':audit,'reference_feeds':reference,'sessiond':daemon,'calendar_verified':e.session(e.now().date()) is not None,'at_IST':e.now().isoformat(),'install':inst,'install_ok':bool(inst.get('ok'))}
 
 def ensure_monitor(e,db,defer_stale_signal=False):
  if not active(e,e.now()):return {'status':'market_closed_or_calendar_unverified','started':False}

@@ -30,7 +30,9 @@
   "worker_cycle_max_seconds": 90,
   "worker_stop_wait_seconds": 20,
   "worker_backoff_max_seconds": 30,
-  "monitor_session_sticky_skips": ["ADV_FILTER_SKIP"],
+  "monitor_session_sticky_skips": [
+    "ADV_FILTER_SKIP"
+  ],
   "monitor_session_sticky_note": "Entry blocks listed here cannot change within a session (ADV uses lagged completed sessions). The first attempt per signal per session is fully recorded; later polls skip the identical re-check. Exits are never skipped.",
   "history_sync_max_budget_wait_seconds": 1500,
   "history_sync_budget_wait_step_seconds": 5,
@@ -197,5 +199,31 @@
     "cache_dir": "out/official-close",
     "note": "EOD overlay only when live marks are stale. Never invents prices; incomplete or missing bhavcopy leaves daily P&L unavailable. Does not mutate paper_positions.mark_price.",
     "warmup_url": "https://www.nseindia.com/"
-  }
+  },
+  "entry_open_fill_window_seconds": 300,
+  "surveillance_fail_closed": true,
+  "surveillance_fail_closed_in_tests": false,
+  "surveillance_required_sources": [
+    "asm",
+    "gsm",
+    "series"
+  ],
+  "surveillance_status_cache_seconds": 60,
+  "sessiond_enabled": true,
+  "sessiond_tick_seconds": 15,
+  "sessiond_retry_seconds": 900,
+  "sessiond_max_attempts": 3,
+  "sessiond_outage_check_seconds": 1800,
+  "sessiond_reference_from": "08:00",
+  "sessiond_scan_due": "08:45",
+  "sessiond_exit_selftest": true,
+  "sessiond_exit_selftest_from": "09:30",
+  "sessiond_exit_selftest_until": "15:00",
+  "sessiond_eod_due": "16:20",
+  "sessiond_revalue_due": "18:30",
+  "sessiond_sync_due": "18:00",
+  "sessiond_audit_export_due": "20:00",
+  "outage_lookback_sessions": 10,
+  "outage_min_monitor_coverage": 0.8,
+  "worker_coverage_credit_seconds": 90
 }
