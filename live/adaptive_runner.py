@@ -349,30 +349,33 @@ def main(argv=None):
     t0 = time.monotonic()
     a = build_parser().parse_args(argv)
     lock_fd = None
-    if a.phase in ('eod', 'backfill'):
-        assert_not_market_hours(a.phase)
-        lock_fd = acquire_run_lock()
     out, error = None, None
     try:
-        try:
-            if a.phase == 'preflight':
-                out = preflight()
-            elif a.phase == 'eod':
-                if a.catch_up:
-                    out = eod_catch_up(a.frm, a.session, a.force)
-                else:
-                    out = eod(a.session or datetime.now(IST).date().isoformat(), a.no_wait)
-            elif a.phase == 'backfill':
-                if not a.frm or not a.to:
-                    out = {'phase': 'backfill', 'status': 'REFUSED_OR_FAILED', 'error': 'backfill_requires_from_and_to'}
-                else:
-                    out = backfill(a.frm, a.to)
+        # R5: the market-hours refusal and the lock acquisition run INSIDE the
+        # structured-failure handling, so a refusal still writes a
+        # runner-<phase>-FAILED.json report and exits 1 — and still runs no
+        # heavy work (both checks happen before any phase dispatch).
+        if a.phase in ('eod', 'backfill'):
+            assert_not_market_hours(a.phase)
+            lock_fd = acquire_run_lock()
+        if a.phase == 'preflight':
+            out = preflight()
+        elif a.phase == 'eod':
+            if a.catch_up:
+                out = eod_catch_up(a.frm, a.session, a.force)
             else:
-                out = status()
-        except Exception as e:  # noqa: BLE001 — every phase failure becomes a structured FAILED report
-            error = e
-            import traceback
-            traceback.print_exc()
+                out = eod(a.session or datetime.now(IST).date().isoformat(), a.no_wait)
+        elif a.phase == 'backfill':
+            if not a.frm or not a.to:
+                out = {'phase': 'backfill', 'status': 'REFUSED_OR_FAILED', 'error': 'backfill_requires_from_and_to'}
+            else:
+                out = backfill(a.frm, a.to)
+        else:
+            out = status()
+    except Exception as e:  # noqa: BLE001 — every phase failure becomes a structured FAILED report
+        error = e
+        import traceback
+        traceback.print_exc()
     finally:
         if lock_fd is not None:
             try:

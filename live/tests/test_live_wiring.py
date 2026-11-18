@@ -290,5 +290,70 @@ class StructuredFailureReports(unittest.TestCase):
             self.assertFalse((reports / today / 'runner-status-FAILED.json').exists())
 
 
+class MarketHoursAndLockRefusal(unittest.TestCase):
+    """R5: a market-hours refusal and a held sidecar lock must write
+    runner-eod-FAILED.json and exit 1 — never raise uncaught with no report."""
+    def _run_eod_main(self, reports):
+        import adaptive_runner as ar
+        old_env = os.environ.get('ADAPTIVE_REPORT_DIR')
+        os.environ['ADAPTIVE_REPORT_DIR'] = str(reports)
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                ar.main(['eod', '--session', '2026-11-11', '--no-wait'])
+        finally:
+            if old_env is None:
+                os.environ.pop('ADAPTIVE_REPORT_DIR', None)
+            else:
+                os.environ['ADAPTIVE_REPORT_DIR'] = old_env
+        return ctx.exception.code
+
+    def test_market_hours_refusal_writes_failed_report(self):
+        import adaptive_runner as ar
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            old = ar.in_market_quiet_window
+            ar.in_market_quiet_window = lambda now=None: True
+            try:
+                code = self._run_eod_main(reports)
+            finally:
+                ar.in_market_quiet_window = old
+            self.assertEqual(code, 1)
+            failed = reports / '2026-11-11' / 'runner-eod-FAILED.json'
+            self.assertTrue(failed.exists())
+            rep = json.loads(failed.read_text())
+            self.assertEqual(rep['status'], 'FAILED')
+            self.assertEqual(rep['error_code'], 'adaptive_eod_refused_in_market_hours_0900_1535_IST')
+            self.assertFalse(rep['ok'])
+
+    def test_lock_held_writes_failed_report(self):
+        import adaptive_runner as ar
+        import fcntl
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            old = ar.in_market_quiet_window
+            ar.in_market_quiet_window = lambda now=None: False
+            lock_existed = ar.LOCK_PATH.exists()
+            try:
+                ar.LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(ar.LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    code = self._run_eod_main(reports)
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+            finally:
+                ar.in_market_quiet_window = old
+                if not lock_existed:
+                    ar.LOCK_PATH.unlink(missing_ok=True)
+            self.assertEqual(code, 1)
+            failed = reports / '2026-11-11' / 'runner-eod-FAILED.json'
+            self.assertTrue(failed.exists())
+            rep = json.loads(failed.read_text())
+            self.assertEqual(rep['status'], 'FAILED')
+            self.assertEqual(rep['error_code'], 'adaptive_sidecar_already_running')
+            self.assertFalse(rep['ok'])
+
+
 if __name__ == '__main__':
     unittest.main()
