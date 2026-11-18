@@ -226,7 +226,15 @@ def main(argv=None):
                 pass
     rdir = report_dir() / (a.session or datetime.now(IST).date().isoformat()); rdir.mkdir(parents=True, exist_ok=True)
     (rdir / f'runner-{a.phase}.json').write_text(json.dumps(out, indent=2, default=str))
-    print(json.dumps(out, indent=1, default=str))
+    try:
+        print(json.dumps(out, indent=1, default=str))
+    except BrokenPipeError:
+        # The report file above is the durable record; a closed stdout pipe
+        # (seen 11 Nov) must not turn a successful run into a failure.
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
     sys.exit(0 if out.get('ok', out.get('status') in (None, 'OK')) else 1)
 
 
