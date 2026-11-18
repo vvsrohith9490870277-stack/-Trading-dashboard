@@ -90,6 +90,18 @@ class CatchUpTests(unittest.TestCase):
         self.assertEqual(calls, ['2026-11-13', '2026-11-17'])
         self.assertEqual(out['days'][0]['day'], '2026-11-13')
 
+    def test_catch_up_restarts_from_oldest_blocked_day(self):
+        # R7b: marked = {10, 12}, 11 blocked (no done-log row) -> a
+        # catch-up with no --from must re-run 11 only. Starting at
+        # max(marked)+1 = 13 would skip 11 forever.
+        out, calls = self._run(to='2026-11-12', marked_days={'2026-11-10', '2026-11-12'},
+                               ro=FakeRO({'2026-11-11'}))
+        self.assertEqual(out['from'], '2026-11-11')
+        self.assertEqual(calls, ['2026-11-11'])
+        self.assertEqual([(d['day'], d['status']) for d in out['days']],
+                         [('2026-11-11', 'OK'),
+                          ('2026-11-12', 'SKIPPED_ALREADY_MARKED')])
+
     def test_parser_accepts_catch_up_and_force(self):
         a = ar.build_parser().parse_args(['eod', '--catch-up', '--from', '2026-11-13',
                                           '--session', '2026-11-17', '--force'])

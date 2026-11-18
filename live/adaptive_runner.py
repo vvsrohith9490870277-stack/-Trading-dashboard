@@ -240,8 +240,8 @@ def _read_marked_days():
 
 
 def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_days=None, namespace=None, now_fn=None):
-    """Catch-up (Task 7): from the day after the last reconciled adaptive EOD
-    marker (or --from) through --session/today, iterate calendar trading
+    """Catch-up (Task 7): from the day after the earliest SIMULATED day
+    (or --from) through --session/today, iterate calendar trading
     sessions in order. A day runs the normal eod flow only if Track A's
     paper_eod row exists and ledger_reconciled is true; otherwise it is
     recorded SKIPPED_NO_RECONCILED_TRACK_A_EOD and nothing is synthesised.
@@ -252,6 +252,9 @@ def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_da
     R7: a day counts as done only when its simulation_status is 'SIMULATED'
     (a BLOCKED run never marks the day, so a later catch-up re-runs it).
     Every days[] entry carries simulation_status.
+    R7b: start at min(marked)+1, not max(marked)+1 — a BLOCKED day older
+    than the newest marked day (e.g. 11 blocked, 12 SIMULATED) must be
+    re-run; days already marked are skipped anyway as SKIPPED_ALREADY_MARKED.
     """
     ns = namespace or get_track_a_namespace()
     marked = set(marked_days) if marked_days is not None else _read_marked_days()
@@ -259,7 +262,7 @@ def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_da
         start = str(frm)[:10]
     elif marked:
         from datetime import timedelta
-        start = (date.fromisoformat(max(marked)) + timedelta(days=1)).isoformat()
+        start = (date.fromisoformat(min(marked)) + timedelta(days=1)).isoformat()
     else:
         raise RuntimeError('catch_up_needs_from_when_no_markers')
     end = str(to)[:10] if to else datetime.now(IST).date().isoformat()
