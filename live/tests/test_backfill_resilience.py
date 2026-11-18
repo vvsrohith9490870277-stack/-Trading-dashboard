@@ -136,6 +136,42 @@ class BackfillResilienceTests(unittest.TestCase):
             self.assertEqual(out2['detail'], [])
             self.assertEqual(self.calls, [])
 
+    def test_recent_404_is_not_recorded_but_old_404_is(self):
+        # R9b: NSE publishes the Bhavcopy in the evening, so a 404 for
+        # yesterday may just mean "not published yet" — it must NOT be
+        # recorded; a 404 for a date 10 days ago IS recorded. Both still
+        # report no_session for the run itself; only persistence is gated.
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        bb.fetch_official = self._fake_fetch({'udiff': '404', 'legacy_cm': '404', 'sec_bhavdata_full': '404'})
+        today = datetime.now(ZoneInfo('Asia/Kolkata')).date()
+        yesterday = (today - timedelta(days=1)).isoformat()
+        old = (today - timedelta(days=10)).isoformat()
+        with tempfile.TemporaryDirectory() as t:
+            record = Path(t) / 'bhavcopy_no_session.json'
+            old_record = bb.nsr.NO_SESSION_RECORD
+            bb.nsr.NO_SESSION_RECORD = record
+            try:
+                out = bb.main(['--dates', f'{yesterday},{old}', '--probe', '--scratch-dir', t, '--retry-missing'])
+                self.assertEqual([r['status'] for r in out['detail']], ['no_session', 'no_session'])
+                recorded = bb.load_no_session_dates()
+                self.assertNotIn(yesterday, recorded)
+                self.assertIn(old, recorded)
+            finally:
+                bb.nsr.NO_SESSION_RECORD = old_record
+
+    def test_recordable_no_session_date_boundary(self):
+        # R9b boundary: "at least 3 days before today (IST)" — exactly
+        # 3 days before is recordable, 2 days before is not.
+        from datetime import date
+        today = date(2026, 11, 18)
+        self.assertFalse(bb.nsr.recordable_no_session_date('2026-11-18', today=today))
+        self.assertFalse(bb.nsr.recordable_no_session_date('2026-11-17', today=today))
+        self.assertFalse(bb.nsr.recordable_no_session_date('2026-11-16', today=today))
+        self.assertTrue(bb.nsr.recordable_no_session_date('2026-11-15', today=today))
+        self.assertTrue(bb.nsr.recordable_no_session_date('2026-11-08', today=today))
+        self.assertFalse(bb.nsr.recordable_no_session_date('not-a-date', today=today))
+
     def test_all_404_date_makes_zero_fetch_calls_on_second_retry_run(self):
         # R9: an all-404 (no_session) date is persisted under state/ and
         # skipped on the next --retry-missing run — no more NSE calls for it.

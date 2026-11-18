@@ -635,10 +635,17 @@ def main(argv=None):
     # R9: persist today's no_session outcomes so the next --retry-missing
     # run skips them — but only when the run actually asked NSE (an
     # --offline-dir no_session only means "no valid local file", not a 404).
+    # R9b: only record dates old enough to have been published (see
+    # recordable_no_session_date) — a recent 404 stays unrecorded and
+    # retryable, so a session NSE has not published yet is never frozen
+    # in as a holiday. The run still reports it as no_session; only the
+    # persistence is gated.
     # Report already-known ones explicitly (not as failures).
     newly_no_session = [x['date'] for x in out if x.get('status') == 'no_session']
     if newly_no_session and not a.offline_dir:
-        record_no_session_dates(newly_no_session)
+        recordable = [d for d in newly_no_session if nsr.recordable_no_session_date(d)]
+        if recordable:
+            record_no_session_dates(recordable)
     if skipped_known:
         out = [{'date': d, 'status': 'no_session_known'} for d in skipped_known] + out
 
