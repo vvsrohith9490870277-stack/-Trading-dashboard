@@ -115,7 +115,11 @@ class SessionDaemon(Base):
   def now():return times[min(i['n'],1)]
   def sleep(_):i['n']+=1
   e.now=now
-  with __import__('audit').scope(e,self.db,'sessiond'):out=sd.run(e,self.db,sleep=sleep,max_ticks=2)
+  # Use a private lock file: the live runtime's own sessiond holds the real sessiond.lock while tests run.
+  import tempfile;lockdir=tempfile.TemporaryDirectory();saved_lock=sd.LOCK;sd.LOCK=str(Path(lockdir.name)/'sessiond.lock')
+  try:
+   with __import__('audit').scope(e,self.db,'sessiond'):out=sd.run(e,self.db,sleep=sleep,max_ticks=2)
+  finally:sd.LOCK=saved_lock;lockdir.cleanup()
   self.assertEqual(out['ticks'],2)
   self.assertTrue(self.db.query("SELECT 1 FROM paper_events WHERE namespace=? AND event_type='sessiond_wake'",(e.NS,)))
   hb=json.loads(self.db.query("SELECT value FROM paper_meta WHERE namespace=? AND key='sessiond_heartbeat'",(e.NS,))[0]['value']);self.assertEqual(hb['status'],'stopped')
@@ -185,5 +189,18 @@ class Performance(Base):
   for d,v in [('2026-11-05',1000),('2026-11-06',400)]:self.db.batch([('INSERT INTO paper_eod(namespace,day,as_of,report_json) VALUES(?,?,?,?)',(e.NS,d,d,json.dumps({'net_total_accrued_paise':v})))])
   p=au.performance(e,self.db,{'net_total_accrued_paise':700},'2026-11-09')
   self.assertEqual(p['drawdown']['max_drawdown_net_paise'],-600);self.assertEqual(p['drawdown']['current_drawdown_net_paise'],-300)
+
+class AuditExportIsolation(unittest.TestCase):
+ def test_test_namespace_in_runtime_tree_never_writes_production_out(self):
+  import audit as al
+  from types import SimpleNamespace
+  root=Path(al.__file__).resolve().parent
+  self.assertEqual(al.out_dir(SimpleNamespace(ROOT=root,NS='test_iso')),root/'out'/'test-exports'/'test_iso')
+  self.assertEqual(al.out_dir(SimpleNamespace(ROOT=root,NS='paper_v1')),root/'out')
+ def test_temp_root_keeps_plain_out(self):
+  import audit as al,tempfile
+  from types import SimpleNamespace
+  with tempfile.TemporaryDirectory() as d:
+   self.assertEqual(al.out_dir(SimpleNamespace(ROOT=Path(d),NS='test_x')),Path(d)/'out')
 
 if __name__=='__main__':unittest.main()

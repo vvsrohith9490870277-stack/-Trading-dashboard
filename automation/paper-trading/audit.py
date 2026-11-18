@@ -112,8 +112,15 @@ def note(kind,**data):
  ctx=CTX.get()
  if ctx:emit(ctx['engine'],ctx['db'],kind,**data)
 
+RUNTIME_ROOT=Path(__file__).resolve().parent
+def out_dir(e):
+ """Export directory. Test namespaces running inside a real runtime tree write under out/test-exports/<ns>/ so a test
+ run can never overwrite the production out/audit-<day>.jsonl files (Phase 2 item 8)."""
+ out=Path(e.ROOT)/'out';ns=str(getattr(e,'NS','') or '')
+ if ns.startswith('test_') and Path(e.ROOT).resolve()==RUNTIME_ROOT:out=out/'test-exports'/ns
+ out.mkdir(parents=True,exist_ok=True);return out
 def export(e,db,session,fmt='jsonl',max_events=200000):
- date.fromisoformat(session);assert fmt in ['jsonl','csv'];out=e.ROOT/'out';out.mkdir(exist_ok=True);path=out/('audit-'+session+'.'+fmt);temp=out/('audit-'+session+'-'+uuid.uuid4().hex+'.tmp');cursor=('','');count=0;types={};times=[];scan_runs={};successful_eod=False;complete=True
+ date.fromisoformat(session);assert fmt in ['jsonl','csv'];out=out_dir(e);path=out/('audit-'+session+'.'+fmt);temp=out/('audit-'+session+'-'+uuid.uuid4().hex+'.tmp');cursor=('','');count=0;types={};times=[];scan_runs={};successful_eod=False;complete=True
  fd=os.open(temp,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
  with os.fdopen(fd,'w',newline='') as f:
   writer=csv.DictWriter(f,fieldnames=COLUMNS+['persisted_at','source_at_UTC','recorded_at_UTC','persisted_at_UTC','source_at_IST','recorded_at_IST','persisted_at_IST']) if fmt=='csv' else None
@@ -164,7 +171,7 @@ def ensure_daily_export(e,db,session=None,fmt='jsonl',force=False,max_events=200
  session=session or e.now().date().isoformat()
  try:date.fromisoformat(session)
  except ValueError:return {'status':'unavailable','reason':'invalid_session','session':session,'path':None,'rebuilt':False}
- out=e.ROOT/'out';out.mkdir(exist_ok=True);path=out/('audit-'+session+'.'+fmt)
+ out=out_dir(e);path=out/('audit-'+session+'.'+fmt)
  if not force and path.exists():
   return {'status':'ok','reason':'audit_export_ok','session':session,'path':str(path),'events':None,'rebuilt':False,'complete_export':True}
  try:
