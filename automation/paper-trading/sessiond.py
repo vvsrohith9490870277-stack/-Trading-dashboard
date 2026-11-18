@@ -12,6 +12,7 @@ import audit as al
 import guardian as gd
 
 LOCK='sessiond.lock'
+SELFTEST_KEY='sessiond_exit_selftest_launched:'
 def _hm(v):return walltime.fromisoformat(v)
 
 class State:
@@ -47,7 +48,7 @@ def due(e,db,t):
  if _hm(c['sessiond_scan_due'])<=hm<ss[1]:
   if not db.query('SELECT 1 FROM paper_scan_batches WHERE namespace=? AND substr(scanned_at,1,10)=? LIMIT 1',(e.NS,str(d))):out.append('scan')
  if _hm(c['sessiond_exit_selftest_from'])<=hm<_hm(c['sessiond_exit_selftest_until']) and c.get('sessiond_exit_selftest'):
-  if not db.query("SELECT 1 FROM paper_runs WHERE namespace=? AND kind='exit-selftest' AND status='ok' AND substr(at,1,10)=? LIMIT 1",(e.NS,str(d))):out.append('exit_selftest')
+  if not db.query('SELECT 1 FROM paper_meta WHERE namespace=? AND key=? LIMIT 1',(e.NS,SELFTEST_KEY+str(d))):out.append('exit_selftest')
  if hm>=_hm(c['sessiond_eod_due']):
   rows=db.query('SELECT report_json FROM paper_eod WHERE namespace=? AND day=?',(e.NS,str(d)))
   if not rows:out.append('eod')
@@ -76,7 +77,11 @@ def tick(e,db,state,t=None,mono=None,run=spawn):
   elif action=='eod':state.children[key]=run(e,['eod']);acted.append(('eod','started'))
   elif action=='revalue':state.children[key]=run(e,['revalue-eod','--session',str(t.date())]);acted.append(('revalue','started'))
   elif action=='sync':state.children[key]=run(e,['sync-history']);acted.append(('sync','started'))
-  elif action=='exit_selftest':state.children[key]=run(e,['exit-selftest']);acted.append(('exit_selftest','started'))
+  elif action=='exit_selftest':
+   # Once per session day, even across daemon restarts: the marker is written before launch. It runs in the isolated
+   # paper_exit_test_v1 namespace (refuses paper_v1) and cleans its dummy rows up afterwards.
+   db.batch([('INSERT OR IGNORE INTO paper_meta(namespace,key,value) VALUES(?,?,?)',(e.NS,SELFTEST_KEY+str(t.date()),json.dumps({'at':t.isoformat()})))])
+   state.done.add(key);state.children[key]=run(e,['exit-selftest']);acted.append(('exit_selftest','started'))
   elif action=='audit_export':
    r=al.ensure_daily_export(e,db,str(t.date()),force=True);state.done.add(key);acted.append(('audit_export',r.get('status')))
  if state.may('outages',mono,float(c['sessiond_outage_check_seconds']),10**9):

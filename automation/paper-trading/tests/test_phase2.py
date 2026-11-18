@@ -119,6 +119,18 @@ class SessionDaemon(Base):
   self.assertTrue(self.db.query("SELECT 1 FROM paper_events WHERE namespace=? AND event_type='sessiond_wake'",(e.NS,)))
   hb=json.loads(self.db.query("SELECT value FROM paper_meta WHERE namespace=? AND key='sessiond_heartbeat'",(e.NS,))[0]['value']);self.assertEqual(hb['status'],'stopped')
 
+class ExitSelftestScheduling(Base):
+ def test_exit_selftest_launches_once_per_session_day(self):
+  e.CFG['sessiond_exit_selftest']=True;t=datetime(2026,11,9,10,0,tzinfo=e.IST);started=[]
+  self.db.batch([('INSERT INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?)',(e.NS,'2026-11-06',t.isoformat(),'ok','{}'))])
+  class P:
+   def poll(self):return 0
+  saved=gd.ensure;gd.ensure=lambda e_,db:{'started':False}
+  try:
+   for i in range(3):sd.tick(e,self.db,sd.State(),t,mono=i*10**4,run=lambda _,a:started.append(a) or P())
+  finally:gd.ensure=saved
+  self.assertEqual([a for a in started if a==['exit-selftest']],[['exit-selftest']])
+
 class GuardianStoppedOnAbnormalExit(Base):
  def test_exception_writes_stopped_heartbeat(self):
   e.now=lambda:datetime(2026,11,9,10,0,tzinfo=e.IST)
