@@ -111,6 +111,82 @@ def report_dir_default():
     return str(apath.report_dir())
 
 
+HOLIDAYS = set(ENGINE_CFG.get('holidays') or [])
+
+
+def expected_session_days(frm, to):
+    """Expected trading sessions, inclusive: weekdays minus config holidays
+    minus indicator-excluded sessions (same calendar as bhavcopy_backfill.session_days)."""
+    from datetime import date as _date, timedelta as _td
+    d0, d1 = _date.fromisoformat(str(frm)[:10]), _date.fromisoformat(str(to)[:10])
+    out, d = [], d0
+    while d <= d1:
+        iso = d.isoformat()
+        if d.weekday() < 5 and iso not in HOLIDAYS and iso not in EXCLUDED:
+            out.append(iso)
+        d += _td(days=1)
+    return out
+
+
+def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, need_from):
+    """Freshness + PIT coverage decision (Task 5), pure and offline-testable.
+
+    - Stale: the snapshot's latest completed bar is earlier than session_day,
+      or session_day is not a regular trading session -> BLOCKED_STALE_INPUT.
+    - Same-evening Bhavcopy for the session day missing -> BLOCKED_PIT_SERIES_ARCHIVE_P1
+      (even if the percentage would still pass: a session must never be reported
+      without its own official Bhavcopy).
+    - Coverage is over the *expected calendar* (not the snapshot's own index),
+      so a stale snapshot cannot lower the bar. A calendar date with neither an
+      archive row nor an index bar, on/before the latest bar, is a no_session
+      day (unlisted holiday) and is not counted missing. The 99% threshold is
+      untouched and a missing series is never assumed to be EQ.
+    """
+    day = str(session_day)[:10]
+    covered = {str(d)[:10] for d in (covered_dates or [])}
+    index_set = {str(d)[:10] for d in (index_sessions or [])}
+    latest = str(latest_bar)[:10] if latest_bar else None
+    reasons = []
+    regular = aobs.is_regular_session_date(day)
+    bhav_for_day = day in covered
+    latest_bhav = max(covered) if covered else None
+    fresh = True
+    if not regular:
+        fresh = False
+        reasons.append(f'session_day {day} is not a regular trading session')
+    elif latest is None or latest < day:
+        fresh = False
+        reasons.append(f'latest_completed_bar_in_snapshot {latest} is earlier than session_day {day}')
+    if regular and not bhav_for_day:
+        fresh = False
+        reasons.append(f'no_official_bhavcopy_for_session_day {day}')
+    calendar_dates = expected_session_days(need_from, day) if need_from else []
+    no_session = [d for d in calendar_dates
+                  if d not in covered and d not in index_set and (latest is None or d <= latest)]
+    needed = [d for d in calendar_dates if d not in no_session]
+    missing = [d for d in needed if d not in covered]
+    cov = (len(needed) - len(missing)) / len(needed) if needed else 0.0
+    if not regular or latest is None or latest < day:
+        status = 'BLOCKED_STALE_INPUT'
+    elif not bhav_for_day:
+        status = 'BLOCKED_PIT_SERIES_ARCHIVE_P1'
+    elif cov < AP['archive_min_coverage']:
+        status = 'BLOCKED_PIT_SERIES_ARCHIVE_P1'
+    else:
+        status = 'SIMULATED'
+    return {
+        'input_freshness': {'session_day': day, 'latest_completed_bar_in_snapshot': latest,
+                            'latest_index_bar': latest, 'bhavcopy_for_session_day': bhav_for_day,
+                            'latest_bhavcopy_date': latest_bhav, 'fresh': fresh, 'reasons': reasons},
+        'pit_series_coverage': {'needed_sessions': len(needed),
+                                'covered_sessions': len(needed) - len(missing), 'coverage': cov,
+                                'required': AP['archive_min_coverage'], 'from': need_from, 'to': latest,
+                                'missing_dates': missing[:50], 'missing_count': len(missing),
+                                'no_session_dates': no_session},
+        'simulation_status': status,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--session', required=True)
@@ -184,18 +260,19 @@ def main():
     report['spawns'] = spawns
     report['track_c_note'] = 'No Track C champion can exist: promotion is locked (observation-only, calibration P7 and CI proof not done).'
 
-    # 4. PIT Bhavcopy SERIES coverage gate (P1). Without it every new entry is refused (EQ-only, never assumed).
+    # 4. Freshness + PIT Bhavcopy SERIES coverage gate (Task 5, P1). Without the
+    # gate every new entry is refused (EQ-only, never assumed). needed_sessions
+    # now comes from the expected trading calendar, not the snapshot's own index.
     need_from = min(v['warm_start'][0] for v in spawns.values() if 'warm_start' in v)
-    need_dates = [d for d in sessions if d >= need_from]
     covered = {r['trade_date'] for r in db.query('SELECT DISTINCT trade_date FROM bhavcopy_series_archive WHERE trade_date>=? AND source LIKE ?', (need_from, aobs.OFFICIAL_BHAVCOPY_PREFIX + '%'))}
-    cov = len(covered & set(need_dates)) / float(len(need_dates)) if need_dates else 0.0
-    report['pit_series_coverage'] = {'needed_sessions': len(need_dates), 'covered_sessions': len(covered & set(need_dates)), 'coverage': cov,
-                                     'required': AP['archive_min_coverage'], 'from': need_from, 'to': latest_bar}
+    gate = evaluate_freshness(day, latest_bar, covered, sessions, need_from)
+    report['input_freshness'] = gate['input_freshness']
+    report['pit_series_coverage'] = gate['pit_series_coverage']
 
     sims = {}
     report['parity'] = {}
-    if cov < AP['archive_min_coverage']:
-        report['simulation_status'] = 'BLOCKED_PIT_SERIES_ARCHIVE_P1'
+    if gate['simulation_status'] != 'SIMULATED':
+        report['simulation_status'] = gate['simulation_status']
     else:
         # 5. Forward-only evaluation: warm-start ends at the spawn's warm_start_end; eval = sessions after it, up to latest_bar.
         closes = idx.set_index(idx['trade_date'].astype(str))['close'].astype(float)
