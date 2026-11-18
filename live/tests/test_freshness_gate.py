@@ -48,6 +48,20 @@ class FreshnessGateTests(unittest.TestCase):
         self.assertEqual(out['pit_series_coverage']['missing_count'],
                          len(out['pit_series_coverage']['missing_dates']))
 
+    def test_stale_stock_bars_with_fresh_index_is_blocked(self):
+        # R11: index fresh through the session day, but the stock bars end
+        # 2 sessions earlier -> BLOCKED_STALE_INPUT, and the reason names
+        # the stock snapshot.
+        days = calendar('2026-11-02', '2026-11-11')
+        out = ad.evaluate_freshness('2026-11-11', '2026-11-09', set(days), days, '2026-11-02',
+                                    latest_index_bar='2026-11-11')
+        self.assertEqual(out['simulation_status'], 'BLOCKED_STALE_INPUT')
+        self.assertFalse(out['input_freshness']['fresh'])
+        self.assertEqual(out['input_freshness']['latest_completed_bar_in_snapshot'], '2026-11-09')
+        self.assertEqual(out['input_freshness']['latest_index_bar'], '2026-11-11')
+        self.assertTrue(any('stock' in r for r in out['input_freshness']['reasons']),
+                        out['input_freshness']['reasons'])
+
     def test_unlisted_day_with_no_bar_or_archive_counts_missing(self):
         # R10: a weekday with no index bar and no archive row and NO 404
         # record is a missed session, not a holiday — it counts in

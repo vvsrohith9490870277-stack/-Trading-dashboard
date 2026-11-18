@@ -147,8 +147,14 @@ def expected_session_days(frm, to):
     return out
 
 
-def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, need_from, no_session_dates=None):
+def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, need_from, no_session_dates=None, latest_index_bar=None):
     """Freshness + PIT coverage decision (Task 5), pure and offline-testable.
+
+    latest_bar is the stock snapshot's latest completed bar (daily_ohlcv
+    max trade_date); latest_index_bar is the index max (defaults to
+    latest_bar when not supplied, preserving old single-value callers).
+    R11: the input is stale if EITHER is earlier than session_day — a fresh
+    index no longer masks stale stock bars.
 
     - Stale: the snapshot's latest completed bar is earlier than session_day,
       or session_day is not a regular trading session -> BLOCKED_STALE_INPUT.
@@ -169,6 +175,7 @@ def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, n
     covered = {str(d)[:10] for d in (covered_dates or [])}
     index_set = {str(d)[:10] for d in (index_sessions or [])}
     latest = str(latest_bar)[:10] if latest_bar else None
+    index_latest = str(latest_index_bar)[:10] if latest_index_bar else latest
     reasons = []
     regular = aobs.is_regular_session_date(day)
     bhav_for_day = day in covered
@@ -177,21 +184,26 @@ def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, n
     if not regular:
         fresh = False
         reasons.append(f'session_day {day} is not a regular trading session')
-    elif latest is None or latest < day:
-        fresh = False
-        reasons.append(f'latest_completed_bar_in_snapshot {latest} is earlier than session_day {day}')
+    else:
+        if latest is None or latest < day:
+            fresh = False
+            reasons.append(f'stock daily_ohlcv latest_completed_bar {latest} is earlier than session_day {day}')
+        if index_latest is None or index_latest < day:
+            fresh = False
+            reasons.append(f'latest_index_bar {index_latest} is earlier than session_day {day}')
     if regular and not bhav_for_day:
         fresh = False
         reasons.append(f'no_official_bhavcopy_for_session_day {day}')
     calendar_dates = expected_session_days(need_from, day) if need_from else []
     known_no_session = {str(d)[:10] for d in (no_session_dates or [])}
+    latest_any = max([x for x in (latest, index_latest) if x], default=None)
     no_session = [d for d in calendar_dates
-                  if d not in covered and d not in index_set and (latest is None or d <= latest)
+                  if d not in covered and d not in index_set and (latest_any is None or d <= latest_any)
                   and d in known_no_session]
     needed = [d for d in calendar_dates if d not in no_session]
     missing = [d for d in needed if d not in covered]
     cov = (len(needed) - len(missing)) / len(needed) if needed else 0.0
-    if not regular or latest is None or latest < day:
+    if not regular or latest is None or latest < day or index_latest is None or index_latest < day:
         status = 'BLOCKED_STALE_INPUT'
     elif not bhav_for_day:
         status = 'BLOCKED_PIT_SERIES_ARCHIVE_P1'
@@ -201,7 +213,7 @@ def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, n
         status = 'SIMULATED'
     return {
         'input_freshness': {'session_day': day, 'latest_completed_bar_in_snapshot': latest,
-                            'latest_index_bar': latest, 'bhavcopy_for_session_day': bhav_for_day,
+                            'latest_index_bar': index_latest, 'bhavcopy_for_session_day': bhav_for_day,
                             'latest_bhavcopy_date': latest_bhav, 'fresh': fresh, 'reasons': reasons},
         'pit_series_coverage': {'needed_sessions': len(needed),
                                 'covered_sessions': len(needed) - len(missing), 'coverage': cov,
@@ -244,8 +256,13 @@ def main():
     # 2. Market inputs (local snapshot only) and the session list.
     stock, idx, cas, bands_df = market_frames(day)
     sessions = [d for d in sorted(idx['trade_date'].astype(str).unique()) if d not in EXCLUDED]
-    latest_bar = sessions[-1] if sessions else None
-    report['latest_completed_bar_in_snapshot'] = latest_bar
+    # R11: stock max and index max are computed separately — a fresh index
+    # must not mask stale stock bars.
+    stock_dates = sorted(stock['trade_date'].astype(str).unique()) if len(stock) else []
+    latest_stock_bar = stock_dates[-1] if stock_dates else None
+    latest_bar = sessions[-1] if sessions else None  # index max
+    report['latest_completed_bar_in_snapshot'] = latest_stock_bar
+    report['latest_index_bar'] = latest_bar
     report['excluded_sessions_skipped'] = sorted(EXCLUDED & set(stock['trade_date'].astype(str).unique()))
     # Official NSE sec_list already on disk (state/circuit_bands); never fetch Fyers; never invent bands.
     raw_cir = HERE.parent / (CFG.get('circuit_bands') or {}).get('raw_dir', 'state/circuit_bands')
@@ -294,8 +311,9 @@ def main():
     timer.start('coverage_gate')
     need_from = min(v['warm_start'][0] for v in spawns.values() if 'warm_start' in v)
     covered = {r['trade_date'] for r in db.query('SELECT DISTINCT trade_date FROM bhavcopy_series_archive WHERE trade_date>=? AND source LIKE ?', (need_from, aobs.OFFICIAL_BHAVCOPY_PREFIX + '%'))}
-    gate = evaluate_freshness(day, latest_bar, covered, sessions, need_from,
-                              no_session_dates=nsr.load_no_session_dates())
+    gate = evaluate_freshness(day, latest_stock_bar, covered, sessions, need_from,
+                              no_session_dates=nsr.load_no_session_dates(),
+                              latest_index_bar=latest_bar)
     timer.stop('coverage_gate')
     report['input_freshness'] = gate['input_freshness']
     report['pit_series_coverage'] = gate['pit_series_coverage']
