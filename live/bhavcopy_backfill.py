@@ -34,39 +34,11 @@ UA = BF.get('user_agent') or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 REFERER = BF.get('referer') or 'https://www.nseindia.com/'
 CURL = shutil.which('curl')
 
-# R9: local record of dates NSE already answered 404 for on every archive
-# form (a no_session outcome). Kept under state/, never in Turso, so a later
-# --retry-missing run skips those dates instead of re-hitting NSE for them.
-NO_SESSION_RECORD = HERE.parent / 'state' / 'bhavcopy_no_session.json'
-
-
-def load_no_session_dates(record_path=None):
-    """Dates recorded as no_session. Missing/corrupt record => no dates."""
-    p = Path(record_path) if record_path is not None else NO_SESSION_RECORD
-    try:
-        data = json.loads(p.read_text())
-    except Exception:
-        return set()
-    if not isinstance(data, dict):
-        return set()
-    return {str(k) for k, v in data.items() if isinstance(v, dict) and v.get('status') == 'no_session'}
-
-
-def record_no_session_dates(dates, record_path=None):
-    """Persist no_session outcomes (one entry per date) in the local record."""
-    p = Path(record_path) if record_path is not None else NO_SESSION_RECORD
-    try:
-        data = json.loads(p.read_text())
-    except Exception:
-        data = {}
-    if not isinstance(data, dict):
-        data = {}
-    stamp = datetime.now(IST).isoformat()
-    for d in dates:
-        data[str(d)[:10]] = {'status': 'no_session', 'recorded_at': stamp}
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=1, sort_keys=True))
-    return sorted(data)
+import no_session_record as nsr  # noqa: E402 — R9 record (state/, never Turso)
+# Re-exported so existing callers/tests can keep using the bb namespace.
+NO_SESSION_RECORD = nsr.NO_SESSION_RECORD
+load_no_session_dates = nsr.load_no_session_dates
+record_no_session_dates = nsr.record_no_session_dates
 
 
 def session_days(frm, to):

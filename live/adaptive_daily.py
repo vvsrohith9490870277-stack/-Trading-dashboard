@@ -25,6 +25,7 @@ import pit_archive as pit              # noqa: E402
 import prefilter as pf                 # noqa: E402
 import circuit_bands as cb             # noqa: E402
 import parity_record as pr             # noqa: E402
+import no_session_record as nsr        # noqa: E402 — R9 404 record (R10)
 
 IST = ZoneInfo('Asia/Kolkata')
 CFG = json.loads((HERE / 'adaptive_live_config.json').read_text())
@@ -146,7 +147,7 @@ def expected_session_days(frm, to):
     return out
 
 
-def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, need_from):
+def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, need_from, no_session_dates=None):
     """Freshness + PIT coverage decision (Task 5), pure and offline-testable.
 
     - Stale: the snapshot's latest completed bar is earlier than session_day,
@@ -155,10 +156,14 @@ def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, n
       (even if the percentage would still pass: a session must never be reported
       without its own official Bhavcopy).
     - Coverage is over the *expected calendar* (not the snapshot's own index),
-      so a stale snapshot cannot lower the bar. A calendar date with neither an
-      archive row nor an index bar, on/before the latest bar, is a no_session
-      day (unlisted holiday) and is not counted missing. The 99% threshold is
-      untouched and a missing series is never assumed to be EQ.
+      so a stale snapshot cannot lower the bar. R10: a calendar date with
+      neither an archive row nor an index bar is a no_session day ONLY if it
+      is in no_session_dates (the R9 record: NSE answered 404 for every
+      archive form) — config holidays / excluded sessions never reach this
+      function (expected_session_days removes them). Any other such date is
+      a missed session: it stays in `needed`, counts in missing_dates, and
+      can fail the gate. The 99% threshold is untouched and a missing series
+      is never assumed to be EQ.
     """
     day = str(session_day)[:10]
     covered = {str(d)[:10] for d in (covered_dates or [])}
@@ -179,8 +184,10 @@ def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, n
         fresh = False
         reasons.append(f'no_official_bhavcopy_for_session_day {day}')
     calendar_dates = expected_session_days(need_from, day) if need_from else []
+    known_no_session = {str(d)[:10] for d in (no_session_dates or [])}
     no_session = [d for d in calendar_dates
-                  if d not in covered and d not in index_set and (latest is None or d <= latest)]
+                  if d not in covered and d not in index_set and (latest is None or d <= latest)
+                  and d in known_no_session]
     needed = [d for d in calendar_dates if d not in no_session]
     missing = [d for d in needed if d not in covered]
     cov = (len(needed) - len(missing)) / len(needed) if needed else 0.0
@@ -287,7 +294,8 @@ def main():
     timer.start('coverage_gate')
     need_from = min(v['warm_start'][0] for v in spawns.values() if 'warm_start' in v)
     covered = {r['trade_date'] for r in db.query('SELECT DISTINCT trade_date FROM bhavcopy_series_archive WHERE trade_date>=? AND source LIKE ?', (need_from, aobs.OFFICIAL_BHAVCOPY_PREFIX + '%'))}
-    gate = evaluate_freshness(day, latest_bar, covered, sessions, need_from)
+    gate = evaluate_freshness(day, latest_bar, covered, sessions, need_from,
+                              no_session_dates=nsr.load_no_session_dates())
     timer.stop('coverage_gate')
     report['input_freshness'] = gate['input_freshness']
     report['pit_series_coverage'] = gate['pit_series_coverage']

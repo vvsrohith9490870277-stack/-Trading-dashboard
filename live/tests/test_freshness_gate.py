@@ -48,14 +48,28 @@ class FreshnessGateTests(unittest.TestCase):
         self.assertEqual(out['pit_series_coverage']['missing_count'],
                          len(out['pit_series_coverage']['missing_dates']))
 
-    def test_unlisted_no_session_day_is_not_counted_missing(self):
-        # (d) a weekday with no index bar and no archive row, on/before the
-        # latest bar, is a no_session day — not a missing archive day.
+    def test_unlisted_day_with_no_bar_or_archive_counts_missing(self):
+        # R10: a weekday with no index bar and no archive row and NO 404
+        # record is a missed session, not a holiday — it counts in
+        # missing_dates and coverage drops (it must not vanish from the gate).
         days = calendar('2026-11-02', '2026-11-11')
         holiday = '2026-11-05'  # weekday, unlisted in config holidays
         covered = {d for d in days if d != holiday}
         index = [d for d in days if d != holiday]
         out = ad.evaluate_freshness('2026-11-11', '2026-11-11', covered, index, '2026-11-02')
+        self.assertEqual(out['simulation_status'], 'BLOCKED_PIT_SERIES_ARCHIVE_P1')
+        self.assertIn(holiday, out['pit_series_coverage']['missing_dates'])
+        self.assertLess(out['pit_series_coverage']['coverage'], 1.0)
+
+    def test_404_recorded_day_is_no_session(self):
+        # R10: the same fixture, but with an R9 404 record for the day, is
+        # still a genuine no_session day — not counted missing.
+        days = calendar('2026-11-02', '2026-11-11')
+        holiday = '2026-11-05'
+        covered = {d for d in days if d != holiday}
+        index = [d for d in days if d != holiday]
+        out = ad.evaluate_freshness('2026-11-11', '2026-11-11', covered, index, '2026-11-02',
+                                    no_session_dates={'2026-11-05'})
         self.assertEqual(out['simulation_status'], 'SIMULATED')
         self.assertNotIn(holiday, out['pit_series_coverage']['missing_dates'])
         self.assertEqual(out['pit_series_coverage']['coverage'], 1.0)

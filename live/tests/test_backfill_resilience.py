@@ -142,8 +142,8 @@ class BackfillResilienceTests(unittest.TestCase):
         bb.fetch_official = self._fake_fetch({'udiff': '404', 'legacy_cm': '404', 'sec_bhavdata_full': '404'})
         with tempfile.TemporaryDirectory() as t:
             record = Path(t) / 'bhavcopy_no_session.json'
-            old_record = bb.NO_SESSION_RECORD
-            bb.NO_SESSION_RECORD = record
+            old_record = bb.nsr.NO_SESSION_RECORD
+            bb.nsr.NO_SESSION_RECORD = record
             try:
                 out = bb.main(['--dates', '2026-07-23', '--probe', '--scratch-dir', t, '--retry-missing'])
                 self.assertEqual([r['status'] for r in out['detail']], ['no_session'])
@@ -157,7 +157,7 @@ class BackfillResilienceTests(unittest.TestCase):
                 self.assertEqual([r['status'] for r in out2['detail']], ['no_session_known'])
                 self.assertEqual(out2['skipped_known_no_session'], ['2026-07-23'])
             finally:
-                bb.NO_SESSION_RECORD = old_record
+                bb.nsr.NO_SESSION_RECORD = old_record
 
 
 if __name__ == '__main__':
