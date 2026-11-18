@@ -7,11 +7,14 @@ HERE = Path(__file__).resolve().parents[1]
 ROOT = HERE.parent
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(ROOT / 'automation' / 'paper-trading'))
 import adaptive_runner as ar
-import yaml
 
 
 class CiWorkflowTests(unittest.TestCase):
     def test_workflow_parses_with_exactly_three_jobs_and_read_only_permissions(self):
+        try:
+            import yaml
+        except ImportError:
+            self.skipTest('PyYAML not installed')
         p = ROOT / '.github' / 'workflows' / 'adaptive-ci.yml'
         self.assertTrue(p.exists())
         doc = yaml.safe_load(p.read_text())
