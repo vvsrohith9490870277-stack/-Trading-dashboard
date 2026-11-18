@@ -96,6 +96,26 @@ class CatchUpTests(unittest.TestCase):
         self.assertTrue(a.catch_up); self.assertTrue(a.force)
         self.assertEqual(a.frm, '2026-11-13'); self.assertEqual(a.session, '2026-11-17')
 
+    def test_catch_up_stops_when_clock_enters_market_hours(self):
+        # R8: fake clock is outside the window for day 1, inside it for day 2.
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        IST = ZoneInfo('Asia/Kolkata')
+        times = iter([datetime(2026, 11, 13, 18, 0, tzinfo=IST),
+                      datetime(2026, 11, 16, 10, 0, tzinfo=IST)])
+        calls = []
+        def fake_eod(day, no_wait=False):
+            calls.append(day)
+            return {'phase': 'eod', 'session_day': day, 'status': 'OK', 'simulation_status': 'SIMULATED'}
+        ro = FakeRO({'2026-11-13', '2026-11-16'})
+        with self.assertRaises(RuntimeError) as ctx:
+            ar.eod_catch_up(frm='2026-11-13', to='2026-11-16', ro=ro, eod_fn=fake_eod,
+                            marked_days=set(), namespace='paper_v1', now_fn=lambda: next(times))
+        self.assertEqual(calls, ['2026-11-13'])  # day 2 is not run
+        self.assertIn('2026-11-13:OK', str(ctx.exception))  # days already done are listed
+        self.assertIn('adaptive_eod_refused_in_market_hours_0900_1535_IST', str(ctx.exception))
+
+
     def test_marked_days_only_counts_simulated_days(self):
         # R7: a day with a reconciled EOD marker but no completed shadow
         # session (its simulation was BLOCKED) is NOT done.
@@ -154,6 +174,52 @@ class CatchUpTests(unittest.TestCase):
             finally:
                 ar.CFG['adaptive_db'] = old
 
+
+
+class CatchUpMarketHoursMainTests(unittest.TestCase):
+    def test_main_writes_failed_report_when_clock_enters_market_hours(self):
+        # R8 end to end: the refusal inside catch-up becomes a FAILED report
+        # (exit 1) listing day 1 as done, via main()'s structured handling.
+        import os
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            old_env = os.environ.get('ADAPTIVE_REPORT_DIR')
+            os.environ['ADAPTIVE_REPORT_DIR'] = str(reports)
+            old_turso, old_eod, old_assert = ar.TursoRO, ar.eod, ar.assert_not_market_hours
+            old_ns = ar.get_track_a_namespace
+            ar.get_track_a_namespace = lambda: 'paper_v1'
+            calls = {'n': 0}
+            def counting_assert(phase, now=None):
+                calls['n'] += 1
+                if calls['n'] >= 3:  # main's check, day 1's check, then day 2 refuses
+                    raise RuntimeError('adaptive_eod_refused_in_market_hours_0900_1535_IST')
+            eod_calls = []
+            def fake_eod(day, no_wait=False):
+                eod_calls.append(day)
+                return {'phase': 'eod', 'session_day': day, 'status': 'OK', 'simulation_status': 'SIMULATED'}
+            lock_existed = ar.LOCK_PATH.exists()
+            try:
+                ar.TursoRO = lambda: FakeRO({'2026-11-13', '2026-11-16'})
+                ar.eod = fake_eod
+                ar.assert_not_market_hours = counting_assert
+                with self.assertRaises(SystemExit) as ctx:
+                    ar.main(['eod', '--catch-up', '--from', '2026-11-13', '--session', '2026-11-16'])
+            finally:
+                ar.TursoRO, ar.eod, ar.assert_not_market_hours = old_turso, old_eod, old_assert
+                ar.get_track_a_namespace = old_ns
+                if old_env is None:
+                    os.environ.pop('ADAPTIVE_REPORT_DIR', None)
+                else:
+                    os.environ['ADAPTIVE_REPORT_DIR'] = old_env
+                if not lock_existed:
+                    ar.LOCK_PATH.unlink(missing_ok=True)
+            self.assertEqual(ctx.exception.code, 1)
+            self.assertEqual(eod_calls, ['2026-11-13'])
+            failed = reports / '2026-11-16' / 'runner-eod-FAILED.json'
+            self.assertTrue(failed.exists())
+            rep = json.loads(failed.read_text())
+            self.assertEqual(rep['status'], 'FAILED')
+            self.assertIn('2026-11-13:OK', rep['detail'])
 
 if __name__ == '__main__':
     unittest.main()

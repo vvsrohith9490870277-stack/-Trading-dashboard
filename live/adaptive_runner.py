@@ -237,7 +237,7 @@ def _read_marked_days():
         return set()
 
 
-def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_days=None, namespace=None):
+def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_days=None, namespace=None, now_fn=None):
     """Catch-up (Task 7): from the day after the last reconciled adaptive EOD
     marker (or --from) through --session/today, iterate calendar trading
     sessions in order. A day runs the normal eod flow only if Track A's
@@ -273,6 +273,15 @@ def eod_catch_up(frm=None, to=None, force=False, ro=None, eod_fn=None, marked_da
         raise RuntimeError(f'catch_up_failed_at:{day}:{summary}') from exc
 
     for day in days:
+        # R8: the 09:00-15:35 refusal is checked before EVERY day, not only
+        # at start — a multi-hour catch-up can run into market hours. On
+        # refusal, stop at once: the runner writes the FAILED report (via
+        # main()) whose detail lists the days already done.
+        try:
+            assert_not_market_hours('eod', now=now_fn() if now_fn else None)
+        except RuntimeError as e:
+            summary = ';'.join(f"{d['day']}:{d['status']}" for d in out['days'])
+            raise RuntimeError(f'catch_up_stopped_in_market_hours:{day}:{e}:{summary}') from e
         if day in marked and not force:
             # Marked days are SIMULATED by construction (see _read_marked_days).
             out['days'].append({'day': day, 'status': 'SKIPPED_ALREADY_MARKED', 'simulation_status': 'SIMULATED'})
