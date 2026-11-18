@@ -348,7 +348,7 @@ def monitor_coverage(e,db,d):
  o=datetime.combine(d,ss[0],tzinfo=e.IST);c=datetime.combine(d,ss[1],tzinfo=e.IST)
  ts=[datetime.fromisoformat(x['at']) for x in db.query("SELECT at FROM paper_runs WHERE namespace=? AND kind='monitor' AND substr(at,1,10)=? ORDER BY at",(e.NS,str(d)))]
  pts=[o]+[x for x in ts if o<=x<=c]+[c];credit=float(e.CFG['worker_coverage_credit_seconds'])
- covered=sum(min((b-a).total_seconds(),credit) for a,b in zip(pts,pts[1:]))
+ covered=sum(min((b-a).total_seconds(),credit) for a,b in zip(pts,pts[1:])) if ts else 0
  return {'checks':len(pts)-2,'coverage':round(covered/(c-o).total_seconds(),4)}
 OUTAGES_SCHEMA='CREATE TABLE IF NOT EXISTS paper_outages(namespace TEXT NOT NULL,session_day TEXT NOT NULL,kind TEXT NOT NULL,detected_at TEXT NOT NULL,detail_json TEXT NOT NULL,PRIMARY KEY(namespace,session_day,kind))'
 def record_outages(e,db,lookback=None):
@@ -358,6 +358,10 @@ def record_outages(e,db,lookback=None):
  t=e.now();lookback=lookback or int(e.CFG['outage_lookback_sessions']);days=_session_days_before(e,t.date(),lookback)
  ss=e.session(t.date())
  if ss and t.weekday()<5 and t.timetz().replace(tzinfo=None)>=e.COMPLETED_CUTOFF:days=[t.date()]+days
+ # Sessions before this namespace's first scan predate go-live: nothing was expected to run, so they are not outages.
+ first=db.query('SELECT MIN(substr(scanned_at,1,10)) AS d FROM paper_scan_batches WHERE namespace=?',(e.NS,))
+ golive=first[0]['d'] if first and first[0]['d'] else None
+ days=[d for d in days if golive and str(d)>=golive]
  new=[]
  for d in days:
   findings=[];cov=monitor_coverage(e,db,d)

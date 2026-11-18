@@ -132,10 +132,13 @@ class GuardianStoppedOnAbnormalExit(Base):
 class Outages(Base):
  def test_missing_sessions_are_recorded_once(self):
   e.now=lambda:datetime(2026,11,11,17,0,tzinfo=e.IST)
+  self.assertEqual(au.record_outages(e,self.db,lookback=2)['new_records'],[])  # before go-live: nothing expected
+  self.db.batch([('INSERT INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?)',(e.NS,'2026-11-01','2026-11-02T08:45:00+05:30','ok','{}'))])
   r=au.record_outages(e,self.db,lookback=2);kinds={(x['session_day'],x['kind']) for x in r['new_records']}
   self.assertEqual(r['checked_sessions'][0],'2026-11-11');self.assertEqual(len(r['checked_sessions']),3)
   for d in r['checked_sessions']:
    for k in ('no_monitoring','scan_missing','eod_missing'):self.assertIn((d,k),kinds)
+  self.assertTrue(all(x['coverage']==0 for x in r['new_records'] if x['kind']=='no_monitoring'))
   self.assertEqual(au.record_outages(e,self.db,lookback=2)['new_records'],[])
   ev=self.db.query("SELECT COUNT(*) AS n FROM paper_events WHERE namespace=? AND event_type='session_outage_recorded'",(e.NS,))[0]['n'];self.assertEqual(ev,len(kinds))
 
