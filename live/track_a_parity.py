@@ -75,6 +75,12 @@ def adaptive_state(session=None):
         (NS,),
     )]
     returns_n = c.execute('SELECT COUNT(*) n FROM adaptive_daily_returns WHERE namespace=?', (NS,)).fetchone()['n']
+    try:
+        parity_n = c.execute(
+            'SELECT COUNT(*) n FROM adaptive_parity WHERE namespace=? AND trade_date=?',
+            (NS, session or (equity[-1]['trade_date'] if equity else ''))).fetchone()['n']
+    except Exception:
+        parity_n = 0
     archive_days = [r['trade_date'] for r in c.execute('SELECT DISTINCT trade_date FROM bhavcopy_series_archive ORDER BY trade_date')]
     c.close()
     report_path = apath.report_dir() / (session or (equity[-1]['trade_date'] if equity else '')) / 'adaptive-daily.json'
@@ -87,6 +93,7 @@ def adaptive_state(session=None):
         'copied_equity_rows': equity,
         'eod_markers': markers,
         'daily_returns_rows': returns_n,
+        'parity_rows': parity_n,
         'bhavcopy_archive_days': archive_days,
         'daily_report': {
             'session_day': (daily or {}).get('session_day'),
@@ -126,9 +133,12 @@ def compare(live, adaptive):
     if sim == 'BLOCKED_PIT_SERIES_ARCHIVE_P1' or not (adaptive.get('bhavcopy_archive_days')):
         trade_parity = 'not_evaluable'
         reasons.append('Track A replica trades cannot be compared yet: PIT bhavcopy series archive is empty / simulations blocked (P1)')
-    elif (adaptive.get('daily_returns_rows') or 0) == 0:
+    elif not (adaptive.get('parity_rows') or 0):
+        # 'compared' only when a trade-level parity comparison actually ran and
+        # wrote an adaptive_parity row for the session; daily_returns rows alone
+        # are equity marks, not a trade comparison.
         trade_parity = 'not_evaluable'
-        reasons.append('No adaptive_daily_returns rows, so no forward Track A replica marks to compare')
+        reasons.append('No adaptive_parity row for this session, so no trade-level comparison ran')
     else:
         trade_parity = 'compared'
 

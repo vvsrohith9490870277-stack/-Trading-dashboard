@@ -149,6 +149,18 @@ def eod(day, no_wait=False):
         out['status'] = 'SKIPPED_TRACK_A_EOD_NOT_RECONCILED_BY_DEADLINE'
         return out
     eod_path = STATE / f'track_a_eod-{day}.json'; eod_path.write_text(json.dumps(rep))
+    # Task 4: live fills for the session, for the replica-parity comparison in
+    # adaptive_daily.py. Best effort: if Turso cannot be read here, the daily
+    # step reports parity as not_evaluable instead of failing the whole run.
+    fills_path = STATE / f'track_a_live_fills-{day}.json'
+    try:
+        fills = ro.query('SELECT strategy, symbol, side, qty, price, filled_at FROM paper_fills '
+                         'WHERE namespace=? AND substr(filled_at,1,10)=? ORDER BY filled_at',
+                         (get_track_a_namespace(), day))
+        fills_path.write_text(json.dumps(fills, default=str))
+        out['live_fills_written'] = len(fills)
+    except Exception as e:
+        out['live_fills'] = {'status': 'unavailable', 'error_code': str(e).split(':')[0]}
     import market_snapshot
     out['snapshot'] = market_snapshot.refresh(ro)
     before = protected_counts(ro)

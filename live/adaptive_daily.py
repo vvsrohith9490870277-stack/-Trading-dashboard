@@ -24,6 +24,7 @@ import adaptive_policy as apol         # noqa: E402
 import pit_archive as pit              # noqa: E402
 import prefilter as pf                 # noqa: E402
 import circuit_bands as cb             # noqa: E402
+import parity_record as pr             # noqa: E402
 
 IST = ZoneInfo('Asia/Kolkata')
 CFG = json.loads((HERE / 'adaptive_live_config.json').read_text())
@@ -192,6 +193,7 @@ def main():
                                      'required': AP['archive_min_coverage'], 'from': need_from, 'to': latest_bar}
 
     sims = {}
+    report['parity'] = {}
     if cov < AP['archive_min_coverage']:
         report['simulation_status'] = 'BLOCKED_PIT_SERIES_ARCHIVE_P1'
     else:
@@ -225,7 +227,31 @@ def main():
                             'skips': dict(Counter(x['cause'] for x in var['entry_skips']))})
             sims[s] = {'status': 'SIMULATED', 'baseline_replica_closed': len(base['closed_trades']), 'challengers': out, 'sim_tape': tape}
             aobs.log_shadow_session_completed(db, NS, s, day, {'eval_days': len(ev)})
+            # Task 4: real replica parity, only for reconciled EOD + SIMULATED.
+            # Live fills come from state/track_a_live_fills-<day>.json (written by
+            # the runner from Turso, read-only); if that file is absent, record
+            # nothing and report not_evaluable.
+            fills_path = HERE.parent / 'state' / f'track_a_live_fills-{day}.json'
+            live_fills = None
+            if fills_path.exists():
+                try:
+                    live_fills = json.loads(fills_path.read_text())
+                except Exception:
+                    live_fills = None
+            replica_day = [r for r in base['daily_records'] if r['trade_date'] == day]
+            live_sleeve = sleeves.get(str(s)) or sleeves.get(s) or {}
+            live_eq = live_sleeve.get('equity_paise')
+            report['parity'][s] = pr.record_for_session(
+                db, NS, s, day, reconciled=rec, simulated=True, live_fills=live_fills,
+                replica_closed_trades=base['closed_trades'], replica_open_positions=base['open_positions'],
+                replica_entry_skips=base['entry_skips'], warm_start_end=info['warm_start'][1],
+                replica_equity_paise=(replica_day[-1]['equity_paise'] if replica_day else None),
+                live_equity_paise=(int(live_eq) if live_eq is not None else None))
         report['simulation_status'] = 'SIMULATED'
+    for s in sorted(ae.BASELINE_PARAMS):
+        if s not in report['parity']:
+            report['parity'][s] = {'status': 'not_evaluable',
+                                   'reason': 'simulation_not_simulated' if report.get('simulation_status') == 'SIMULATED' else str(report.get('simulation_status') or 'not_simulated')}
     report['simulations'] = sims
     report['hash_chain'] = alog.verify_hash_chain(db, NS)
     report['decision_log_rows'] = db.query('SELECT COUNT(*) n FROM adaptive_decision_logs WHERE namespace=?', (NS,))[0]['n']
