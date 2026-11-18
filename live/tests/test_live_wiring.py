@@ -22,6 +22,26 @@ class ReadOnlyClient(unittest.TestCase):
     def test_python_wrapper_refuses_batch(self):
         from ro_client import TursoRO
         with self.assertRaises(PermissionError): TursoRO().batch([('DELETE FROM paper_fills', ())])
+    def _run(self, outcomes):
+        calls = []
+        def run(*a, **k):
+            calls.append(1); o = outcomes[len(calls) - 1]
+            if o == 'timeout': raise subprocess.TimeoutExpired('node', 1)
+            return subprocess.CompletedProcess(a, 0 if o == 'ok' else 2, stdout='[[{"d":1}]]' if o == 'ok' else '', stderr=json.dumps({'code': o}) if o != 'ok' else '')
+        return run, calls
+    def test_transient_read_failures_are_retried(self):
+        from ro_client import TursoRO
+        run, calls = self._run(['turso_read_failed', 'timeout', 'ok']); slept = []
+        self.assertEqual(TursoRO(run=run, sleep=slept.append).query('SELECT 1'), [{'d': 1}])
+        self.assertEqual(len(calls), 3); self.assertEqual(len(slept), 2)
+    def test_retries_are_bounded_and_guard_refusals_not_retried(self):
+        from ro_client import TursoRO
+        run, calls = self._run(['turso_read_failed'] * 3)
+        with self.assertRaises(RuntimeError): TursoRO(run=run, sleep=lambda s: None).query('SELECT 1')
+        self.assertEqual(len(calls), 3)
+        run, calls = self._run(['ro_write_refused', 'ok'])
+        with self.assertRaises(RuntimeError): TursoRO(run=run, sleep=lambda s: None).query('SELECT 1')
+        self.assertEqual(len(calls), 1)
 
 class Candidates(unittest.TestCase):
     def test_parameter_only_and_capped(self):

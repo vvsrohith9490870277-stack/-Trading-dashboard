@@ -267,8 +267,22 @@ def weekly(e,db):
  complete=bool(values) and set(expected)=={x['day'] for x in rs} and all(x.get('daily_net_accrued_paise') is not None for x in values)
  return {'week_start':str(start),'through':rs[-1]['day'] if rs else None,'requested_through':str(end),'unfinalized_today_excluded':str(end) not in expected,'expected_sessions':expected,'snapshot_days':[x['day'] for x in rs],'complete':complete,'weekly_gross_paise':sum(x['daily_gross_paise'] for x in values) if complete else None,'weekly_net_paise':sum(x['daily_net_accrued_paise'] for x in values) if complete else None,'definition':'Sum verified daily CHANGES, never sum cumulative snapshots; incomplete week/session coverage unavailable.'}
 
+def boot_id():
+ try:return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+ except OSError:return None
+def mono_offset():
+ """Wall clock minus CLOCK_MONOTONIC. Constant while the host runs; grows by exactly the frozen time when the VM is paused (monotonic stops, wall time does not)."""
+ return time.time()-time.monotonic()
+def frozen_since(detail):
+ """Seconds this host was frozen since a heartbeat carrying mono_offset/boot_id was written. 0 when unknown or from another boot."""
+ detail=detail or {}
+ try:off=float(detail.get('mono_offset'))
+ except (TypeError,ValueError):return 0.0
+ if not detail.get('boot_id') or detail.get('boot_id')!=boot_id():return 0.0
+ return max(0.0,mono_offset()-off)
 def heartbeat(e,db,status,**detail):
  detail['process_start']=(Path('/proc')/str(os.getpid())/'stat').read_text().split()[21]
+ detail['mono_offset']=round(mono_offset(),3);detail['boot_id']=boot_id()
  db.batch([('INSERT INTO paper_monitor_health(namespace,pid,heartbeat_at,status,detail_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace) DO UPDATE SET pid=excluded.pid,heartbeat_at=excluded.heartbeat_at,status=excluded.status,detail_json=excluded.detail_json',(e.NS,os.getpid(),e.now().isoformat(),status,e.js(detail)))])
 def stale_budget(e,status):
  """Seconds a heartbeat may age before the worker counts as stale."""
@@ -279,11 +293,15 @@ def heartbeat_is_stale(e,r,now=None):
  """True when the stored heartbeat is older than the status budget, or a polling cycle has already run past that budget."""
  if not r:return True
  now=now or e.now()
- age=(now-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()
+ try:detail=json.loads(r.get('detail_json') or '{}')
+ except (TypeError,ValueError,AttributeError):detail={}
+ if not isinstance(detail,dict):detail={}
+ # Time the whole host was frozen (VM paused) is not worker silence: the worker could not run either.
+ # Only same-boot heartbeats are adjusted, so a worker from before a VM restart still turns stale.
+ age=(now-datetime.fromisoformat(r['heartbeat_at'])).total_seconds()-frozen_since(detail)
  if age>stale_budget(e,r['status']):return True
  if r.get('status')=='polling':
-  try:elapsed=json.loads(r.get('detail_json') or '{}').get('cycle_elapsed_seconds')
-  except (TypeError,ValueError,AttributeError):elapsed=None
+  elapsed=detail.get('cycle_elapsed_seconds')
   if elapsed is not None and elapsed>e.CFG['worker_polling_stale_seconds']:return True
  return False
 class CycleHeartbeat:
@@ -320,6 +338,43 @@ class CycleHeartbeat:
   except Exception:pass
  def __enter__(self):self.thread.start();return self
  def __exit__(self,*exc):self.stop.set();self.thread.join(self.e.CFG['worker_heartbeat_interval_seconds']);return False
+class WakeWatch:
+ """Detects a host freeze from inside the worker: CLOCK_MONOTONIC stops while the VM is paused, wall time does not.
+ On wake it logs the gap (engine.jsonl first, then a durable audit event), resets the Turso helper so a request
+ stranded on a dead connection fails at once instead of after its full timeout, and wakes the worker's sleep so
+ the next quote check (which tests every open position against the session open/low) runs immediately."""
+ def __init__(self,e,db,on_wake=None,offset=None,interval=None,threshold=None):
+  self.e,self.db,self.on_wake=e,db,on_wake;self.offset=offset or mono_offset()
+  self.interval=float(interval if interval is not None else e.CFG['worker_wake_check_seconds'])
+  self.threshold=float(threshold if threshold is not None else e.CFG['worker_wake_threshold_seconds'])
+  self.event=threading.Event();self.stop=threading.Event();self.wakes=0;self.last_gap=None;self.frozen_total=0.0
+  self.thread=threading.Thread(target=self.run,name='worker-wake-watch',daemon=True)
+ def run(self):
+  off=self.offset;wall=self.e.now()
+  while not self.stop.wait(self.interval):
+   cur=mono_offset();now=self.e.now()
+   if cur-off>self.threshold:self.woke(wall,now,cur-off)
+   off,wall=cur,now
+ def woke(self,began,ended,frozen):
+  self.wakes+=1;self.frozen_total+=frozen
+  self.last_gap={'started':began.isoformat(),'stopped':ended.isoformat(),'frozen_seconds':round(frozen,1),'wakes':self.wakes}
+  try:self.e.log('host_freeze_detected',reason='host_vm_paused',**self.last_gap)
+  except Exception:pass
+  if self.on_wake:
+   try:self.on_wake()
+   except Exception:pass
+  self.event.set()
+  gap=dict(self.last_gap);poll=max(1,int(self.e.CFG.get('poll_seconds',30)))
+  def emit():
+   try:al.emit(self.e,self.db,'host_freeze_detected',outcome='failed',severity='WARN',reason='host_vm_paused',started=gap['started'],stopped=gap['stopped'],age_seconds=gap['frozen_seconds'],missed_checks=int(gap['frozen_seconds']//poll),count=gap['wakes'])
+   except Exception:pass
+  threading.Thread(target=emit,name='worker-wake-audit',daemon=True).start()
+ def nap(self,seconds):
+  """Sleep up to seconds; returns early when the host wakes from a freeze."""
+  if seconds>0:self.event.wait(seconds)
+  self.event.clear()
+ def __enter__(self):self.thread.start();return self
+ def __exit__(self,*exc):self.stop.set();self.thread.join(max(1.0,self.interval*2));return False
 _children=[]
 def reap_children():
  """Poll workers this process launched so exited ones never linger as zombies."""
@@ -397,19 +452,27 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
    state['stop']=True;signal.signal(signal.SIGTERM,signal.SIG_DFL)
    if not state['in_cycle']:raise SystemExit(0)
   previous=signal.signal(signal.SIGTERM,on_term) if threading.current_thread() is threading.main_thread() else None
+  watch=WakeWatch(e,db,on_wake=(lambda:db.reset_helper('host_resume')) if hasattr(db,'reset_helper') else None) if e.CFG.get('worker_wake_watch') else None
+  nap=(watch.nap if watch is not None and sleep is time.sleep else sleep);reported=0
+  if watch is not None:watch.__enter__()
   try:
    while active(e,e.now()) and (max_polls is None or polls<max_polls) and not state['stop']:
-    start=time.monotonic();delay=e.CFG['poll_seconds'];full_cooloff=False
+    start=time.monotonic();delay=e.CFG['poll_seconds'];full_cooloff=False;gen=watch.wakes if watch is not None else 0
     with (e.ROOT/'engine.lock').open('a+') as lock:
      try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
      except BlockingIOError:
-      heartbeat(e,db,'waiting_for_engine_lock');al.emit(e,db,'worker_waiting',reason='singleton_busy',poll_seconds=delay);sleep(delay);continue
+      heartbeat(e,db,'waiting_for_engine_lock');al.emit(e,db,'worker_waiting',reason='singleton_busy',poll_seconds=delay);nap(delay);continue
      try:
       state['in_cycle']=True;heartbeat(e,db,'polling',polls=polls)
       with CycleHeartbeat(e,db,polls):
        api=api or factory();r=e.monitor(db,api);polls+=1;failures=0
        if time.monotonic()-last_pnl>=e.CFG['pnl_snapshot_seconds']:e.pnl(db);last_pnl=time.monotonic()
       heartbeat(e,db,'healthy',polls=polls,last_result=r,db_helper=db.helper_stats() if hasattr(db,'helper_stats') else None)
+      if watch is not None and watch.wakes>reported:
+       # First completed check after a host freeze: every open position was tested against this cycle's quote.
+       reported=watch.wakes;gap=watch.last_gap or {}
+       try:e.log('post_wake_check',status=r.get('status'),fills=r.get('fills',0),fresh_quotes=r.get('fresh_quotes'),quotes=r.get('quotes'),frozen_seconds=gap.get('frozen_seconds'),gap_started=gap.get('started'),gap_stopped=gap.get('stopped'),seconds_after_wake=round((e.now()-datetime.fromisoformat(gap['stopped'])).total_seconds(),1) if gap.get('stopped') else None)
+       except Exception:pass
       al.emit(e,db,'worker_check',duration_ms=round((time.monotonic()-start)*1000),poll_seconds=delay,missed_checks=max(0,int((time.monotonic()-start)//delay)-1),status=r.get('status'))
      except Exception as ex:
       reason=al.classified_error(ex);failures+=1;polls+=1
@@ -425,10 +488,16 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
        delay=min(backoff_max,max(int(e.CFG['market_data'].get('rate_limit_cooloff_seconds',180)),min(300,30*2**min(failures,4))));full_cooloff=True
       else:
        delay=min(backoff_max,min(300,30*2**min(failures,4)))
+      if watch is not None and watch.wakes!=gen and 'rate_limit' not in reason:
+       # The failure was a request stranded by a host freeze (dead connection), not a Turso/Fyers fault: retry at once.
+       delay=0;full_cooloff=False
+       try:e.log('post_wake_retry',error_code=reason,failures=failures,frozen_seconds=(watch.last_gap or {}).get('frozen_seconds'))
+       except Exception:pass
      finally:state['in_cycle']=False
     if state['stop']:break
-    sleep(delay if full_cooloff else max(0,delay-(time.monotonic()-start)))
+    nap(delay if full_cooloff else max(0,delay-(time.monotonic()-start)))
   finally:
+   if watch is not None:watch.__exit__(None,None,None)
    if previous is not None and not state['stop']:signal.signal(signal.SIGTERM,previous)
    if not paused:heartbeat(e,db,'stopped',polls=polls,terminated=state['stop'],db_helper=db.helper_stats() if hasattr(db,'helper_stats') else None)
    if hasattr(db,'close_helper'):db.close_helper()

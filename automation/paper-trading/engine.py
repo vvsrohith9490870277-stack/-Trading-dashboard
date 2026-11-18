@@ -50,6 +50,10 @@ class DB:
   h,self.helper=self.helper,None
   if h is not None:h.close()
  def helper_stats(self):return dict(self.helper.stats) if self.helper is not None else None
+ def reset_helper(self,reason='reset'):
+  """Drop the persistent connection (e.g. after a host freeze); the next query/batch starts a fresh helper."""
+  h=self.helper
+  if h is not None:h.reset(reason)
  def call(self,a):
   if self.helper is not None and a.get('action') in ('query','batch'):return self.helper.call(a)
   return self._call_per_process(a)
@@ -419,9 +423,13 @@ def indicator(strategy,g):
  return getattr(strategy_indicators,'strategy_'+str(strategy))(g)
 def universe():
  return sorted(pd.read_csv(ROOT/'universe.csv').db_symbol.tolist())
-def sync(db,api,target,symbols,max_requests=None):
- """Fetch only symbols still missing the target bar. max_requests caps calls (morning fallback). Stops on Fyers budget or rate limit."""
+def sync(db,api,target,symbols,max_requests=None,sleep=time.sleep,wait_budget=False):
+ """Fetch only symbols still missing the target bar. max_requests caps calls (morning fallback). Stops on the day/reserve budget or a Fyers rate limit.
+ The uncapped evening job waits out the shared per-second/per-minute window (bounded by history_sync_max_budget_wait_seconds) instead of
+ stopping after one minute's worth of requests, and defers a symbol on an isolated transport failure instead of aborting the whole sync."""
  cv={x['symbol']:x['dmax'] for x in db.query('SELECT symbol,MAX(trade_date) AS dmax FROM daily_ohlcv GROUP BY symbol')};n=0;invalid=[];pending_sync=[];requests=0;deferred=[];stopped=None
+ waited=0.0;wait_cap=float(CFG.get('history_sync_max_budget_wait_seconds') or 0) if wait_budget and max_requests is None else 0.0;step=float(CFG.get('history_sync_budget_wait_step_seconds') or 5)
+ transport=0;transport_max=int(CFG.get('history_sync_transport_failures_max') or 0);transport_failed=[]
  missing=[sym for sym in symbols if cv.get(sym,'')<str(target)]
  for sym in symbols:
   if cv.get(sym,'')>=str(target):continue
@@ -429,14 +437,21 @@ def sync(db,api,target,symbols,max_requests=None):
   if (max_requests is not None and requests>=max_requests) or stopped:
    deferred.append(sym);continue
   start=max(date.fromisoformat(cv[sym])+timedelta(days=1),target-timedelta(days=CFG['history_sync_lookback_days']))
-  try:
-   candles=api.history(sym,start,target);requests+=1
-  except RuntimeError as e:
-   err=str(e)
-   if err.startswith('market_data_error_') and '300' in err:invalid.append({'symbol':sym,'reason':'invalid_symbol'});requests+=1;continue
-   if 'budget_exhausted' in err or err=='market_data_rate_limit':
-    stopped=err;deferred.append(sym);continue
-   raise
+  candles=None
+  while True:
+   try:
+    candles=api.history(sym,start,target);requests+=1;transport=0;break
+   except RuntimeError as e:
+    err=str(e)
+    if err in ('market_data_budget_exhausted_minute','market_data_budget_exhausted_second') and waited+step<=wait_cap:
+     sleep(step);waited+=step;continue
+    if err.startswith('market_data_error_') and '300' in err:invalid.append({'symbol':sym,'reason':'invalid_symbol'});requests+=1;break
+    if 'budget_exhausted' in err or err=='market_data_rate_limit':
+     stopped=err;deferred.append(sym);break
+    if err=='market_data_transport_failed' and transport+1<transport_max:
+     transport+=1;transport_failed.append(sym);deferred.append(sym);break
+    raise
+  if candles is None:continue
   st=[]
   for c in candles:
    ts,o,h,l,cl,v=c[:6];d=datetime.fromtimestamp(ts,IST).date()
@@ -450,16 +465,27 @@ def sync(db,api,target,symbols,max_requests=None):
   if len(pending_sync)>=150:db.batch(pending_sync);pending_sync=[]
  db.batch(pending_sync)
  budget=api.budget_snapshot() if hasattr(api,'budget_snapshot') else None
- log('history_sync',candidate_candles=n,unavailable=invalid,requests=requests,deferred=len(deferred),stopped=stopped,fyers_budget=budget)
- return {'candidate_candles':n,'unavailable':invalid,'requests':requests,'missing_before':len(missing),'deferred':len(deferred),'stopped':stopped,'fyers_budget':budget}
+ log('history_sync',candidate_candles=n,unavailable=invalid,requests=requests,deferred=len(deferred),stopped=stopped,fyers_budget=budget,budget_wait_seconds=round(waited,1),transport_failed=transport_failed)
+ return {'candidate_candles':n,'unavailable':invalid,'requests':requests,'missing_before':len(missing),'deferred':len(deferred),'stopped':stopped,'fyers_budget':budget,'budget_wait_seconds':round(waited,1),'transport_failed':transport_failed}
 
+def _drain_minute_window(api,sleep=time.sleep):
+ """Let the shared per-minute Fyers window empty (at most ~61s) so the benchmark/repair requests that follow the stock sync are not refused."""
+ if not hasattr(api,'budget_snapshot'):return 0.0
+ step=float(CFG.get('history_sync_budget_wait_step_seconds') or 5);waited=0.0
+ while waited<=60:
+  try:snap=api.budget_snapshot();busy=int(snap['per_minute'])+int(CFG.get('history_sync_post_sync_headroom') or 10)>int(snap['limits']['per_minute'])
+  except Exception:return waited
+  if not busy:break
+  sleep(step);waited+=step
+ return waited
 def sync_history(db,api=None):
  """Evening job: sync completed bars for the universe (and the benchmark) under the shared Fyers budget."""
  e=sys.modules[__name__];api=api or MarketData();t=now()
  if session(t.date()) is None:return {'status':'calendar_unverified','requests':0}
  target=completed_day(t);syms=sorted(set(universe())|{p['symbol'] for p in db.positions()})
  al.emit(e,db,'sync_started',target_completed_bar=str(target),symbols_count=len(syms),job='sync-history')
- stock=sync(db,api,target,syms)
+ stock=sync(db,api,target,syms,wait_budget=True)
+ _drain_minute_window(api)
  try:benchmark=pf.benchmark(e,db,target,api,True);benchmark_error=None
  except RuntimeError:benchmark=__import__('pandas').DataFrame();benchmark_error='benchmark_sync_unavailable'
  repair=hr.repair(e,db,api,target) if len(benchmark)>0 else None
@@ -541,6 +567,11 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
     stm.append(('INSERT INTO paper_watermarks(namespace,strategy,symbol,bar_date) VALUES(?,?,?,?) ON CONFLICT(namespace,strategy,symbol) DO UPDATE SET bar_date=excluded.bar_date',(NS,strategy,sym,bar)));continue
    if previous>=bar:continue
    newbars=f[(f.trade_date>previous)&(f.trade_date>=datetime.fromisoformat(p['entry_at']).date().isoformat())] if p else f.iloc[0:0]
+   miss=missed_trail_touch(p,g,previous) if (p and strategy==7 and len(newbars)) else None
+   if miss:
+    audit_events.append(al.event(sys.modules[__name__],'missed_stop_touch',outcome='failed',severity='ERROR',**miss))
+    try:log('missed_stop_touch',**miss)
+    except Exception:pass
    missed_exit=bool(newbars.exit_condition.any()) if len(newbars) else False
    side='SELL' if p and missed_exit else ('BUY' if gatepass and not p and bool(x.entry_condition) else None)
    if side and (strategy,sym,side) not in pending:
@@ -564,6 +595,14 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  if not NS.startswith('test_'):pd.DataFrame(qual).to_csv(ROOT/'out/latest_qualifiers.csv',index=False)
  report={'input_validation':input_audit,'target_completed_bar':str(target),'bootstrap':bootstrap,'funnel':funnel,'universe_symbols':len(syms),'frozen_universe_symbols':len(universe()),'excluded_audit_symbols':len(exclusions),'original_audit_universe':len(universe())+len(exclusions),'signals_queued':created,'latest_qualifiers':len(qual),'unavailable_current_symbols':skipped,'invalid_rows_excluded':int((~valid).sum()),'sync':sync_report,'no_backlog_fills':True,'screen_only':snapshot_only,'prefilter_policy':pf.POLICY,'prefilter_counts':{k:sum(r['status']==k for r in gates.values()) for k in ['PASS','FAIL','UNAVAILABLE']},'benchmark_sync_error':benchmark_error,'history_repair':repair_report,'reference_feeds':reference_report,'data_refresh_status':repair_report.get('status') if repair_report else 'not_requested'};stm.append(('INSERT INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace,bar_date) DO UPDATE SET scanned_at=excluded.scanned_at,status=excluded.status,report_json=excluded.report_json',(NS,str(target),t.isoformat(),'partial' if skipped else 'ok',js(report))));db.batch(stm);db.run('scan','partial' if skipped else 'ok',**report);return report
 
+def missed_trail_touch(p,g,previous):
+ """Alert only (never a fill, never backdated): a completed bar after `previous` touched the Strategy 07 trail level while the
+ paper position stayed open, i.e. the live monitor never polled between the touch and the close (host freeze or outage)."""
+ if not p or int(p.get('strategy') or 0)!=7 or p.get('pending_exit') or g is None or not len(g):return None
+ lvl=trail_level(p['high_water']);entry=datetime.fromisoformat(p['entry_at']).date().isoformat();td=g.trade_date.astype(str)
+ touched=g[(td>str(previous))&(td>=entry)&(g.low<=lvl)]
+ if not len(touched):return None
+ return {'strategy':7,'symbol':p['symbol'],'bar_date':str(touched.iloc[-1].trade_date),'threshold':lvl,'high_water':p['high_water'],'price':float(touched.low.min()),'reason':'completed_bar_low_at_or_below_trail_with_position_open'}
 def scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  e=sys.modules[__name__];start=time.monotonic()
  with al.scope(e,db,'scan'):
@@ -579,6 +618,15 @@ def entry_priority(day,s):
   rank=2 if s.get('rule')=='trail_touch' else (0 if s.get('stop') else 1)
   return (0,rank,int(s.get('strategy') or 0),str(s.get('id') or ''))
  return (1,cap.slot_rank(day,s.get('symbol') or ''),int(s.get('strategy') or 0),str(s.get('id') or ''))
+# Entry blocks that cannot change inside one session (the ADV floor reads lagged completed sessions only).
+# The first attempt is fully recorded (decision, audit, order_skipped); later polls of the same session skip
+# the identical re-evaluation, which otherwise cost one db.mjs round-trip per blocked signal every poll.
+_SESSION_SKIPS={}
+def _sticky_skip(day,s):return s.get('side')=='BUY' and (day,s.get('id')) in _SESSION_SKIPS
+def _remember_skip(day,s,r):
+ if s.get('side')=='BUY' and s.get('id') and r.get('reason') in set(CFG.get('monitor_session_sticky_skips') or []):
+  for k in [k for k in _SESSION_SKIPS if k[0]!=day]:_SESSION_SKIPS.pop(k,None)
+  _SESSION_SKIPS[(day,s['id'])]=r['reason']
 def _monitor(db,api):
  t=now()
  if not au.active(sys.modules[__name__],t):r={'status':'market_closed_or_calendar_unverified','at_IST':t.isoformat(),'fills':0};db.run('monitor','closed',**r);return r
@@ -610,11 +658,12 @@ def _monitor(db,api):
   if ok and (triggered or carried):
    actions.append({'id':stable_id(p['strategy'],p['symbol'],p['entry_at'],'pending' if carried else stop_rule),'strategy':p['strategy'],'symbol':p['symbol'],'side':'SELL','bar_date':t.date().isoformat(),'eligible_date':t.date().isoformat(),'reason':'pending_exit_carry' if carried else stop_rule,'rule':None if carried else stop_rule,'expected_entry_at':p['entry_at'],'stop':True,'pending_exit':carried,'stop_level':level})
  for i in range(0,len(position_rows),50):al.emit(sys.modules[__name__],db,'position_checks',rows=position_rows[i:i+50],count=len(position_rows[i:i+50]))
- actions+=signals;day=t.date().isoformat();actions.sort(key=lambda s:entry_priority(day,s));full_sleeves=set()
+ actions+=signals;day=t.date().isoformat();actions.sort(key=lambda s:entry_priority(day,s));full_sleeves=set();sticky=0
  for s in actions:
   key=(s['strategy'],s['symbol'])
   if key in used:continue
   if s.get('side')!='SELL' and s.get('strategy') in full_sleeves:continue
+  if _sticky_skip(day,s):sticky+=1;continue
   q=quotes.get(s['symbol'])
   if s.get('stop') and not s.get('pending_exit') and q:
    al.emit(sys.modules[__name__],db,'risk_hit',strategy=7,symbol=s['symbol'],price=q.get('open') if s.get('rule')=='trail_gap' else s.get('stop_level'),quote_at=q.get('quote_at'),threshold=s.get('stop_level'),reason=s.get('rule') or 'observed_stop_crossing',target_defined=False)
@@ -622,6 +671,7 @@ def _monitor(db,api):
   r=fill(db,s,q,t)
   if r['filled']:fills+=1;used.add(key)
   elif r.get('reason')=='SLEEVE_SLOT_FULL':full_sleeves.add(s.get('strategy'))
+  else:_remember_skip(day,s,r)
  # Entry-day stop cannot be hit by the exact same entry LTP; it is checked on subsequent fresh polls.
  # Positions change only through fill(); with no fill attempted this cycle the post-gate snapshot is current.
  # The price band feeds market_guard only for a carried exit's lower-circuit haircut, so it is read only then.
@@ -653,7 +703,9 @@ def _monitor(db,api):
   except Exception:pass
   try:al.emit(sys.modules[__name__],db,'position_marks_stale',outcome='failed',severity='ERROR',**payload)
   except Exception:pass
- report={'status':'ok','fresh_quotes':sum(valid_quote(q,t)[0] for q in quotes.values()),'quotes':len(quotes),'fills':fills,'at_IST':t.isoformat()};db.run('monitor','ok',**report);return report
+ report={'status':'ok','fresh_quotes':sum(valid_quote(q,t)[0] for q in quotes.values()),'quotes':len(quotes),'fills':fills,'at_IST':t.isoformat()}
+ if sticky:report['session_sticky_skips']=sticky
+ db.run('monitor','ok',**report);return report
 
 def monitor(db,api):
  e=sys.modules[__name__];start=time.monotonic()

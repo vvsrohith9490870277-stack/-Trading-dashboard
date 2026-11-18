@@ -135,6 +135,10 @@ class Helper:
    except RuntimeError:
     if attempt==self.cfg['per_call_read_retries']:raise
     self.stats['retries']+=1;self.sleep(self.cfg['retry_backoff_seconds']*(attempt+1))
+ def reset(self,reason='reset'):
+  """Kill the current child so in-flight requests fail now (reads retry, writes report unconfirmed); the next call restarts it."""
+  if self.alive() or self.proc is not None:
+   self.stats['resets']=self.stats.get('resets',0)+1;self.log('db_helper_reset',reason=reason);self._kill(reason)
  def close(self):
   with self.lock:
    self.closed=True;proc=self.proc
