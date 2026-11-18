@@ -64,7 +64,7 @@ def evaluation_window_fills(replica_closed_trades, replica_open_positions, warm_
 
 def compare_session_parity(replica_closed_trades, replica_open_positions, replica_entry_skips,
                            live_fills, warm_start_end, session_day,
-                           replica_equity_paise, live_equity_paise):
+                           replica_equity_paise, live_equity_paise, strategy=None):
     """Pure comparison. live_fills: Turso paper_fills rows for the strategy/day
     (any extra days/strategies are filtered out here)."""
     day = str(session_day)[:10]
@@ -73,6 +73,11 @@ def compare_session_parity(replica_closed_trades, replica_open_positions, replic
     live_day = []
     for f in live_fills or []:
         if str(f.get('filled_at') or '')[:10] != day:
+            continue
+        # R3: a strategy is compared only against its own fills, never against
+        # another strategy's fills from the same day. (Rows without a strategy
+        # key predate the filter and are kept, as before.)
+        if strategy is not None and f.get('strategy') is not None and int(f['strategy']) != int(strategy):
             continue
         live_day.append({'symbol': str(f['symbol']), 'side': str(f['side']).upper(),
                          'qty': int(f['qty']), 'price': _price(f['price'])})
@@ -113,7 +118,7 @@ def record_for_session(db, namespace, strategy, session_day, *, reconciled, simu
         return {'status': 'not_evaluable', 'reason': 'equity_unavailable'}
     cmp = compare_session_parity(replica_closed_trades, replica_open_positions, replica_entry_skips,
                                  live_fills, warm_start_end, day,
-                                 replica_equity_paise, live_equity_paise)
+                                 replica_equity_paise, live_equity_paise, strategy=int(strategy))
     ok = aobs.record_parity(db, namespace, int(strategy), day,
                             cmp['fills_match'], cmp['skips_match'], cmp['qty_match'],
                             cmp['equity_diff_paise'],

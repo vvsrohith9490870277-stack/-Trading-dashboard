@@ -76,6 +76,18 @@ class ParityRecordTests(unittest.TestCase):
         # Streak over the one counted session is 1.
         self.assertEqual(aobs.parity_streak(db, NS, 1, [DAY])['streak'], 1)
 
+    def test_other_strategy_fills_do_not_break_parity(self):
+        # R3: live fills for another strategy on the same day must not be
+        # compared against this strategy's replica fills.
+        db = make_db()
+        fills = live_fills() + [{'strategy': 6, 'symbol': 'ZZZ-EQ', 'side': 'BUY', 'qty': 3,
+                                 'price': 77.0, 'filled_at': '2026-11-11T09:16:00+05:30'}]
+        out = record(db, live_fills=fills)
+        self.assertEqual(out['status'], 'compared')
+        self.assertTrue(out['fills_match'], out)
+        self.assertTrue(out['parity_ok'], out)
+        self.assertEqual(len(out['live_fills']), 2)  # only strategy 1 fills compared
+
     def test_inherited_warm_start_trade_is_not_discordance(self):
         db = make_db()
         trades = replica_trades() + [
