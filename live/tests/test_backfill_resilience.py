@@ -172,6 +172,16 @@ class BackfillResilienceTests(unittest.TestCase):
         self.assertTrue(bb.nsr.recordable_no_session_date('2026-11-08', today=today))
         self.assertFalse(bb.nsr.recordable_no_session_date('not-a-date', today=today))
 
+    def test_session_days_agree_with_expected_session_days(self):
+        # Optional (review 2): the backfill calendar and the freshness
+        # gate's calendar must agree, or R9b/R10 would disagree about
+        # which days are sessions.
+        import adaptive_daily as ad
+        self.assertEqual(bb.session_days('2026-01-01', '2026-12-31'),
+                         ad.expected_session_days('2026-01-01', '2026-12-31'))
+        self.assertEqual(bb.session_days('2026-11-01', '2026-11-30'),
+                         ad.expected_session_days('2026-11-01', '2026-11-30'))
+
     def test_all_404_date_makes_zero_fetch_calls_on_second_retry_run(self):
         # R9: an all-404 (no_session) date is persisted under state/ and
         # skipped on the next --retry-missing run — no more NSE calls for it.
