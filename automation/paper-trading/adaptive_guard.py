@@ -101,7 +101,13 @@ def credential_like_keys(env):
 
 
 def assert_frozen_files(lock_path=None, root=None):
-    """Frozen Track A policy files must match freeze_lock.json digests (H2). Mismatch => refuse to run."""
+    """Frozen Track A policy files must match freeze_lock.json digests (H2). Mismatch => refuse to run.
+
+    The raised RuntimeError keeps the exact message existing tests depend on
+    ('frozen_file_hash_mismatch:<name>'); the mismatch detail (which root, first
+    12 hex chars of expected vs actual digest — digests of frozen policy files
+    are not secrets) is attached as ``err.frozen_mismatch`` for failure reports.
+    """
     base = Path(root) if root else ROOT
     lock = json.loads(Path(lock_path or base / 'freeze_lock.json').read_text(encoding='utf8'))
     files = lock.get('files') or {}
@@ -110,7 +116,10 @@ def assert_frozen_files(lock_path=None, root=None):
     for name, want in files.items():
         got = cap.digest(json.loads((base / name).read_text(encoding='utf8')))
         if got != want:
-            raise RuntimeError(f'frozen_file_hash_mismatch:{name}')
+            err = RuntimeError(f'frozen_file_hash_mismatch:{name}')
+            err.frozen_mismatch = {'name': name, 'root': str(base),
+                                   'expected': str(want)[:12], 'actual': str(got)[:12]}
+            raise err
     return True
 
 

@@ -1,5 +1,5 @@
 """Tests for the adaptive-live sidecar wiring (offline: no Turso, no NSE, no Track A writes)."""
-import io, json, os, subprocess, sys, tempfile, unittest, zipfile
+import io, json, os, subprocess, sys, tempfile, time, unittest, zipfile
 from pathlib import Path
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE)); sys.path.insert(0, str(HERE.parent / 'automation' / 'paper-trading'))
@@ -10,11 +10,21 @@ def node_ro(sql):
     js = f"import('{HERE / 'turso_ro.mjs'}').then(m=>{{try{{m.assertReadOnly({json.dumps(sql)});console.log('ALLOWED')}}catch(e){{console.log(e.message)}}}})"
     return subprocess.run(['node', '-e', js], capture_output=True, text=True, cwd=HERE).stdout.strip()
 
+def libsql_available():
+    """True only if turso_ro.mjs can resolve @libsql/client from this machine."""
+    js = f"import('{HERE / 'turso_ro.mjs'}').then(()=>console.log('OK')).catch(()=>console.log('MISSING'))"
+    r = subprocess.run(['node', '-e', js], capture_output=True, text=True, cwd=HERE)
+    return r.stdout.strip() == 'OK'
+
 class ReadOnlyClient(unittest.TestCase):
     def test_select_allowed(self):
+        if not libsql_available():
+            self.skipTest('@libsql/client not resolvable on this machine (run npm ci in the repo root or automation/paper-trading)')
         self.assertEqual(node_ro('SELECT COUNT(*) FROM paper_fills WHERE namespace=?'), 'ALLOWED')
         self.assertEqual(node_ro("WITH x AS (SELECT 1) SELECT * FROM x"), 'ALLOWED')
     def test_writes_refused(self):
+        if not libsql_available():
+            self.skipTest('@libsql/client not resolvable on this machine (run npm ci in the repo root or automation/paper-trading)')
         for sql in ('DELETE FROM paper_fills', 'INSERT INTO paper_runs VALUES(1)', 'UPDATE paper_positions SET qty=0',
                     'SELECT 1; DROP TABLE paper_fills', 'PRAGMA writable_schema=1', 'ATTACH DATABASE x AS y',
                     'WITH a AS (SELECT 1) DELETE FROM paper_fills', 'REPLACE INTO paper_meta VALUES(1)'):
@@ -34,6 +44,7 @@ class ReadOnlyClient(unittest.TestCase):
         run, calls = self._run(['turso_read_failed', 'timeout', 'ok']); slept = []
         self.assertEqual(TursoRO(run=run, sleep=slept.append).query('SELECT 1'), [{'d': 1}])
         self.assertEqual(len(calls), 3); self.assertEqual(len(slept), 2)
+        self.assertEqual(slept, [3.0, 6.0])
     def test_retries_are_bounded_and_guard_refusals_not_retried(self):
         from ro_client import TursoRO
         run, calls = self._run(['turso_read_failed'] * 3)
@@ -42,6 +53,29 @@ class ReadOnlyClient(unittest.TestCase):
         run, calls = self._run(['ro_write_refused', 'ok'])
         with self.assertRaises(RuntimeError): TursoRO(run=run, sleep=lambda s: None).query('SELECT 1')
         self.assertEqual(len(calls), 1)
+    def test_batch_still_raises_permission_error(self):
+        from ro_client import TursoRO
+        with self.assertRaises(PermissionError): TursoRO().batch([('DELETE FROM paper_fills', ())])
+    def test_broken_pipe_on_final_print_is_not_a_failure(self):
+        import adaptive_runner as ar
+        class BrokenPipeStdout:
+            def write(self, s): raise BrokenPipeError('broken pipe')
+            def flush(self): raise BrokenPipeError('broken pipe')
+        with tempfile.TemporaryDirectory() as t:
+            old_env = os.environ.get('ADAPTIVE_REPORT_DIR')
+            os.environ['ADAPTIVE_REPORT_DIR'] = t
+            old_out = sys.stdout
+            sys.stdout = BrokenPipeStdout()
+            try:
+                with self.assertRaises(SystemExit) as ctx:
+                    ar.main(['status'])
+            finally:
+                sys.stdout = old_out
+                if old_env is None: os.environ.pop('ADAPTIVE_REPORT_DIR', None)
+                else: os.environ['ADAPTIVE_REPORT_DIR'] = old_env
+            self.assertEqual(ctx.exception.code, 0)
+            today = __import__('datetime').date.today().isoformat()
+            self.assertTrue((Path(t) / today / 'runner-status.json').exists())
 
 class Candidates(unittest.TestCase):
     def test_parameter_only_and_capped(self):
@@ -140,6 +174,319 @@ class Backfill(unittest.TestCase):
         self.assertEqual(cmp['missing_in_bhav'], 0)
         self.assertEqual(cmp['missing_in_ohlcv'], 0)
         self.assertEqual(cmp['mismatches'], [])
+
+
+class PortableSidecar(unittest.TestCase):
+    """Task 1: no /workspace assumptions. Import must not crash when the Track A root is missing;
+    TRACK_A_ROOT / ADAPTIVE_REPORT_DIR env overrides must be honoured; defaults unchanged."""
+    def _run_py(self, code, env_extra=None, cwd=None):
+        env = dict(os.environ)
+        env.pop('TRACK_A_ROOT', None); env.pop('ADAPTIVE_REPORT_DIR', None)
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run([sys.executable, '-c', code], capture_output=True, text=True,
+                              cwd=cwd or HERE, env=env)
+
+    def test_import_with_fake_track_a_root(self):
+        with tempfile.TemporaryDirectory() as t:
+            Path(t, 'config.json').write_text(json.dumps({'namespace': 'paper_v1'}))
+            r = self._run_py("import adaptive_runner as ar; print(ar.get_track_a_namespace())",
+                             env_extra={'TRACK_A_ROOT': t})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), 'paper_v1')
+
+    def test_import_with_missing_track_a_root_and_preflight_error(self):
+        missing = '/nonexistent-track-a-root-xyz'
+        r = self._run_py("import adaptive_runner as ar; print('imported', ar.TRACK_A)",
+                         env_extra={'TRACK_A_ROOT': missing})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('imported', r.stdout)
+        r = self._run_py("import adaptive_runner as ar; ar.preflight()",
+                         env_extra={'TRACK_A_ROOT': missing})
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn('track_a_root_not_found', r.stderr)
+
+    def test_report_dir_env_override_and_default(self):
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t) / 'reports'
+            r = self._run_py(
+                "import adaptive_runner as ar; print(ar.report_dir())",
+                env_extra={'ADAPTIVE_REPORT_DIR': str(out)})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), str(out))
+            r = self._run_py("import adaptive_runner as ar; print(ar.report_dir())")
+            self.assertEqual(r.stdout.strip(), '/workspace/reports/adaptive')
+            # A real `status` run honours the override (writes runner-status.json under it).
+            r = self._run_py("import adaptive_runner as ar; ar.main(['status'])",
+                             env_extra={'ADAPTIVE_REPORT_DIR': str(out)})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            today = __import__('datetime').date.today().isoformat()
+            self.assertTrue((out / today / 'runner-status.json').exists())
+
+    def test_adaptive_daily_report_dir_default_uses_env(self):
+        with tempfile.TemporaryDirectory() as t:
+            out = Path(t) / 'reports'
+            r = self._run_py(
+                "import adaptive_daily as ad; print(ad.report_dir_default())",
+                env_extra={'ADAPTIVE_REPORT_DIR': str(out)})
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), str(out))
+
+
+class StructuredFailureReports(unittest.TestCase):
+    """Task 3: any phase failure writes runner-<phase>-FAILED.json with a short
+    error_code and a non-secret detail; a clean run writes no FAILED file."""
+    def _track_a_root(self, t, alter=False):
+        root = Path(t) / 'track-a'
+        root.mkdir()
+        lib = HERE.parent / 'automation' / 'paper-trading'
+        (root / 'config.json').write_text((lib / 'config.json').read_text())
+        for name in ('capital_policy.json', 'charge_policy.json', 'charge_rates.json'):
+            (root / name).write_text((lib / name).read_text())
+        if alter:
+            p = root / 'capital_policy.json'
+            data = json.loads(p.read_text()); data['master_capital_inr'] = int(data['master_capital_inr']) + 1
+            p.write_text(json.dumps(data))
+        return root
+
+    def _run_main(self, args, env_extra):
+        env = dict(os.environ)
+        env.pop('TRACK_A_ROOT', None); env.pop('ADAPTIVE_REPORT_DIR', None)
+        env.update(env_extra)
+        return subprocess.run([sys.executable, str(HERE / 'adaptive_runner.py')] + args,
+                              capture_output=True, text=True, cwd=HERE, env=env)
+
+    def test_preflight_frozen_mismatch_writes_failed_report(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self._track_a_root(t, alter=True)
+            reports = Path(t) / 'reports'
+            secret = 's3cr3t-marker-xyz-123'
+            r = self._run_main(['preflight'], {'TRACK_A_ROOT': str(root),
+                                               'ADAPTIVE_REPORT_DIR': str(reports),
+                                               'ADAPTIVE_TEST_SECRET': secret})
+            self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+            today = __import__('datetime').date.today().isoformat()
+            failed = reports / today / 'runner-preflight-FAILED.json'
+            self.assertTrue(failed.exists(), r.stdout + r.stderr)
+            rep = json.loads(failed.read_text())
+            self.assertEqual(rep['phase'], 'preflight')
+            self.assertEqual(rep['status'], 'FAILED')
+            self.assertEqual(rep['error_code'], 'frozen_file_hash_mismatch')
+            self.assertFalse(rep['ok'])
+            self.assertIn('capital_policy.json', rep['detail'])
+            self.assertIn('installed', rep['detail'])
+            self.assertIn('expected=', rep['detail'])
+            self.assertIn('actual=', rep['detail'])
+            self.assertNotIn(secret, failed.read_text())
+            self.assertNotIn('traceback', failed.read_text().lower())
+
+    def test_clean_status_run_writes_normal_report_and_no_failed(self):
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            r = self._run_main(['status'], {'ADAPTIVE_REPORT_DIR': str(reports)})
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            today = __import__('datetime').date.today().isoformat()
+            self.assertTrue((reports / today / 'runner-status.json').exists())
+            self.assertFalse((reports / today / 'runner-status-FAILED.json').exists())
+
+
+class MarketHoursAndLockRefusal(unittest.TestCase):
+    """R5: a market-hours refusal and a held sidecar lock must write
+    runner-eod-FAILED.json and exit 1 — never raise uncaught with no report."""
+    def _run_eod_main(self, reports):
+        import adaptive_runner as ar
+        old_env = os.environ.get('ADAPTIVE_REPORT_DIR')
+        os.environ['ADAPTIVE_REPORT_DIR'] = str(reports)
+        try:
+            with self.assertRaises(SystemExit) as ctx:
+                ar.main(['eod', '--session', '2026-11-11', '--no-wait'])
+        finally:
+            if old_env is None:
+                os.environ.pop('ADAPTIVE_REPORT_DIR', None)
+            else:
+                os.environ['ADAPTIVE_REPORT_DIR'] = old_env
+        return ctx.exception.code
+
+    def test_market_hours_refusal_writes_failed_report(self):
+        import adaptive_runner as ar
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            old = ar.in_market_quiet_window
+            ar.in_market_quiet_window = lambda now=None: True
+            try:
+                code = self._run_eod_main(reports)
+            finally:
+                ar.in_market_quiet_window = old
+            self.assertEqual(code, 1)
+            failed = reports / '2026-11-11' / 'runner-eod-FAILED.json'
+            self.assertTrue(failed.exists())
+            rep = json.loads(failed.read_text())
+            self.assertEqual(rep['status'], 'FAILED')
+            self.assertEqual(rep['error_code'], 'adaptive_eod_refused_in_market_hours_0900_1535_IST')
+            self.assertFalse(rep['ok'])
+
+    def test_lock_held_writes_failed_report(self):
+        import adaptive_runner as ar
+        import fcntl
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            old = ar.in_market_quiet_window
+            ar.in_market_quiet_window = lambda now=None: False
+            lock_existed = ar.LOCK_PATH.exists()
+            try:
+                ar.LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+                fd = os.open(ar.LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    code = self._run_eod_main(reports)
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    os.close(fd)
+            finally:
+                ar.in_market_quiet_window = old
+                if not lock_existed:
+                    ar.LOCK_PATH.unlink(missing_ok=True)
+            self.assertEqual(code, 1)
+            failed = reports / '2026-11-11' / 'runner-eod-FAILED.json'
+            self.assertTrue(failed.exists())
+            rep = json.loads(failed.read_text())
+            self.assertEqual(rep['status'], 'FAILED')
+            self.assertEqual(rep['error_code'], 'adaptive_sidecar_already_running')
+            self.assertFalse(rep['ok'])
+
+
+def _newest_mtime_under(root):
+    """Newest mtime of any file under root, or None if root has no files
+    (or does not exist). T1: read-only snapshot of /workspace state."""
+    newest = None
+    try:
+        for p in Path(root).rglob('*'):
+            try:
+                if p.is_file():
+                    m = p.stat().st_mtime
+                    if newest is None or m > newest:
+                        newest = m
+            except OSError:
+                pass
+    except OSError:
+        pass
+    return newest
+
+
+def _safe_mtime(path):
+    """mtime of path, or None if it cannot be statted (absent, or gone
+    between the exists() check and the stat — the snapshot must not crash
+    the test over external state)."""
+    try:
+        return Path(path).stat().st_mtime
+    except OSError:
+        return None
+
+
+class EodReportDirPassthrough(unittest.TestCase):
+    """R6: eod() must launch adaptive_daily.py with --report-dir <override>,
+    so the child writes to ADAPTIVE_REPORT_DIR, not to /workspace."""
+    def test_daily_child_gets_report_dir_override(self):
+        import adaptive_runner as ar
+        import types
+        from unittest import mock
+        day = '2026-11-11'
+        # T1: machine-independent — a real 11 Nov report may already exist
+        # (Grok's box has one), so asserting the dir "does not exist" fails
+        # although the code is right. Snapshot the /workspace state first
+        # and assert it is unchanged at the end; nothing is created or
+        # deleted under /workspace by this test.
+        ws_root = Path('/workspace/reports/adaptive')
+        ws_day = ws_root / day
+        started = time.time()
+        before_exists = ws_day.exists()
+        before_mtime = _safe_mtime(ws_day) if before_exists else None
+        before_newest = _newest_mtime_under(ws_root)
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            state = Path(t) / 'state'
+            old_state, old_env = ar.STATE, os.environ.get('ADAPTIVE_REPORT_DIR')
+            os.environ['ADAPTIVE_REPORT_DIR'] = str(reports)
+            ar.STATE = state
+            stub = types.ModuleType('market_snapshot')
+            stub.refresh = lambda ro: {'stubbed': True}
+            old_ms = sys.modules.get('market_snapshot')
+            sys.modules['market_snapshot'] = stub
+            old_runnable = ar.ag.assert_runnable
+            ar.ag.assert_runnable = lambda **kw: True
+            old_counts = ar.protected_counts
+            ar.protected_counts = lambda ro: {}
+            old_ns = ar.get_track_a_namespace
+            ar.get_track_a_namespace = lambda: 'paper_v1'
+            calls = []
+            def fake_run(argv, **kw):
+                calls.append(list(argv))
+                return subprocess.CompletedProcess(argv, 0, stdout='{"session_day": "%s"}\n' % day, stderr='')
+            class FakeRO:
+                def query(self, sql, args=()):
+                    if 'paper_eod' in sql:
+                        return [{'report_json': json.dumps({'ledger_reconciled': True})}]
+                    return []
+                def many(self, qs):
+                    return [[{'n': 0}] for _ in qs]
+            try:
+                with mock.patch('subprocess.run', side_effect=fake_run):
+                    out = ar.eod(day, no_wait=True, ro=FakeRO())
+            finally:
+                ar.STATE = old_state
+                ar.ag.assert_runnable = old_runnable
+                ar.protected_counts = old_counts
+                ar.get_track_a_namespace = old_ns
+                if old_ms is None:
+                    sys.modules.pop('market_snapshot', None)
+                else:
+                    sys.modules['market_snapshot'] = old_ms
+                if old_env is None:
+                    os.environ.pop('ADAPTIVE_REPORT_DIR', None)
+                else:
+                    os.environ['ADAPTIVE_REPORT_DIR'] = old_env
+            self.assertEqual(out['status'], 'OK')
+            self.assertEqual(len(calls), 1)
+            argv = calls[0]
+            self.assertIn('--report-dir', argv)
+            self.assertEqual(argv[argv.index('--report-dir') + 1], str(reports))
+            # T1: the /workspace state must be exactly as before the run —
+            # and no file under it may be newer than the test start.
+            self.assertEqual(ws_day.exists(), before_exists,
+                             '/workspace report dir must be unchanged by the run')
+            if before_exists:
+                self.assertEqual(_safe_mtime(ws_day), before_mtime)
+            self.assertEqual(_newest_mtime_under(ws_root), before_newest,
+                             'no file under /workspace/reports/adaptive may be written')
+            after_newest = _newest_mtime_under(ws_root)
+            self.assertTrue(after_newest is None or after_newest <= started,
+                            'no file under /workspace/reports/adaptive may be newer than the test start')
+
+
+class BackfillRetryPassthrough(unittest.TestCase):
+    """R9: run_adaptive.sh backfill can pass --retry-missing through the runner."""
+    def test_parser_accepts_retry_missing(self):
+        import adaptive_runner as ar
+        a = ar.build_parser().parse_args(['backfill', '--from', '2026-07-23', '--to', '2026-07-24',
+                                          '--retry-missing'])
+        self.assertTrue(a.retry_missing)
+
+    def test_backfill_passes_retry_missing_to_child(self):
+        import adaptive_runner as ar
+        from unittest import mock
+        calls = []
+        def fake_run(argv, **kw):
+            calls.append(list(argv))
+            return subprocess.CompletedProcess(argv, 0, stdout='{"days_requested": 0}\n', stderr='')
+        with mock.patch('subprocess.run', side_effect=fake_run):
+            out = ar.backfill('2026-07-23', '2026-07-24', retry_missing=True)
+        self.assertEqual(len(calls), 1)
+        self.assertIn('--retry-missing', calls[0])
+        self.assertEqual(out['status'], 'OK')
+        with mock.patch('subprocess.run', side_effect=fake_run):
+            calls.clear()
+            ar.backfill('2026-07-23', '2026-07-24')
+        self.assertNotIn('--retry-missing', calls[0])
 
 
 if __name__ == '__main__':

@@ -4,7 +4,7 @@ and touches ONLY local SQLite files: reads state/market.sqlite + state/track_a_e
 
 Usage: adaptive_daily.py --session YYYY-MM-DD --eod-json PATH [--report-dir DIR]
 """
-import argparse, hashlib, json, sqlite3, sys
+import argparse, hashlib, json, os, sqlite3, sys, time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
@@ -12,7 +12,8 @@ from zoneinfo import ZoneInfo
 
 HERE = Path(__file__).resolve().parent
 LIB = HERE.parent / 'automation' / 'paper-trading'
-sys.path.insert(0, str(LIB))
+sys.path.insert(0, str(LIB)); sys.path.insert(0, str(HERE))
+import adaptive_paths as apath          # noqa: E402
 import pandas as pd                    # noqa: E402
 import adaptive_engine as ae           # noqa: E402
 import adaptive_sim_trades as ast      # noqa: E402
@@ -23,6 +24,8 @@ import adaptive_policy as apol         # noqa: E402
 import pit_archive as pit              # noqa: E402
 import prefilter as pf                 # noqa: E402
 import circuit_bands as cb             # noqa: E402
+import parity_record as pr             # noqa: E402
+import no_session_record as nsr        # noqa: E402 — R9 404 record (R10)
 
 IST = ZoneInfo('Asia/Kolkata')
 CFG = json.loads((HERE / 'adaptive_live_config.json').read_text())
@@ -104,11 +107,128 @@ def snapshot_hash(stock, start):
     return h.hexdigest()
 
 
+class PhaseTimer:
+    """Monotonic-clock phase timings (Task 8). Accumulates seconds per key;
+    never touches simulation inputs or outputs."""
+
+    def __init__(self):
+        self.timings = {}
+        self._started = {}
+
+    def start(self, key):
+        self._started[key] = time.monotonic()
+
+    def stop(self, key):
+        t0 = self._started.pop(key, None)
+        if t0 is None:
+            return
+        self.timings[key] = self.timings.get(key, 0.0) + max(0.0, time.monotonic() - t0)
+
+
+def report_dir_default():
+    """Report directory: ADAPTIVE_REPORT_DIR env override, else /workspace/reports/adaptive."""
+    return str(apath.report_dir())
+
+
+HOLIDAYS = set(ENGINE_CFG.get('holidays') or [])
+
+
+def expected_session_days(frm, to):
+    """Expected trading sessions, inclusive: weekdays minus config holidays
+    minus indicator-excluded sessions (same calendar as bhavcopy_backfill.session_days)."""
+    from datetime import date as _date, timedelta as _td
+    d0, d1 = _date.fromisoformat(str(frm)[:10]), _date.fromisoformat(str(to)[:10])
+    out, d = [], d0
+    while d <= d1:
+        iso = d.isoformat()
+        if d.weekday() < 5 and iso not in HOLIDAYS and iso not in EXCLUDED:
+            out.append(iso)
+        d += _td(days=1)
+    return out
+
+
+def evaluate_freshness(session_day, latest_bar, covered_dates, index_sessions, need_from, no_session_dates=None, latest_index_bar=None):
+    """Freshness + PIT coverage decision (Task 5), pure and offline-testable.
+
+    latest_bar is the stock snapshot's latest completed bar (daily_ohlcv
+    max trade_date); latest_index_bar is the index max (defaults to
+    latest_bar when not supplied, preserving old single-value callers).
+    R11: the input is stale if EITHER is earlier than session_day — a fresh
+    index no longer masks stale stock bars.
+
+    - Stale: the snapshot's latest completed bar is earlier than session_day,
+      or session_day is not a regular trading session -> BLOCKED_STALE_INPUT.
+    - Same-evening Bhavcopy for the session day missing -> BLOCKED_PIT_SERIES_ARCHIVE_P1
+      (even if the percentage would still pass: a session must never be reported
+      without its own official Bhavcopy).
+    - Coverage is over the *expected calendar* (not the snapshot's own index),
+      so a stale snapshot cannot lower the bar. R10: a calendar date with
+      neither an archive row nor an index bar is a no_session day ONLY if it
+      is in no_session_dates (the R9 record: NSE answered 404 for every
+      archive form) — config holidays / excluded sessions never reach this
+      function (expected_session_days removes them). Any other such date is
+      a missed session: it stays in `needed`, counts in missing_dates, and
+      can fail the gate. The 99% threshold is untouched and a missing series
+      is never assumed to be EQ.
+    """
+    day = str(session_day)[:10]
+    covered = {str(d)[:10] for d in (covered_dates or [])}
+    index_set = {str(d)[:10] for d in (index_sessions or [])}
+    latest = str(latest_bar)[:10] if latest_bar else None
+    index_latest = str(latest_index_bar)[:10] if latest_index_bar else latest
+    reasons = []
+    regular = aobs.is_regular_session_date(day)
+    bhav_for_day = day in covered
+    latest_bhav = max(covered) if covered else None
+    fresh = True
+    if not regular:
+        fresh = False
+        reasons.append(f'session_day {day} is not a regular trading session')
+    else:
+        if latest is None or latest < day:
+            fresh = False
+            reasons.append(f'stock daily_ohlcv latest_completed_bar {latest} is earlier than session_day {day}')
+        if index_latest is None or index_latest < day:
+            fresh = False
+            reasons.append(f'latest_index_bar {index_latest} is earlier than session_day {day}')
+    if regular and not bhav_for_day:
+        fresh = False
+        reasons.append(f'no_official_bhavcopy_for_session_day {day}')
+    calendar_dates = expected_session_days(need_from, day) if need_from else []
+    known_no_session = {str(d)[:10] for d in (no_session_dates or [])}
+    latest_any = max([x for x in (latest, index_latest) if x], default=None)
+    no_session = [d for d in calendar_dates
+                  if d not in covered and d not in index_set and (latest_any is None or d <= latest_any)
+                  and d in known_no_session]
+    needed = [d for d in calendar_dates if d not in no_session]
+    missing = [d for d in needed if d not in covered]
+    cov = (len(needed) - len(missing)) / len(needed) if needed else 0.0
+    if not regular or latest is None or latest < day or index_latest is None or index_latest < day:
+        status = 'BLOCKED_STALE_INPUT'
+    elif not bhav_for_day:
+        status = 'BLOCKED_PIT_SERIES_ARCHIVE_P1'
+    elif cov < AP['archive_min_coverage']:
+        status = 'BLOCKED_PIT_SERIES_ARCHIVE_P1'
+    else:
+        status = 'SIMULATED'
+    return {
+        'input_freshness': {'session_day': day, 'latest_completed_bar_in_snapshot': latest,
+                            'latest_index_bar': index_latest, 'bhavcopy_for_session_day': bhav_for_day,
+                            'latest_bhavcopy_date': latest_bhav, 'fresh': fresh, 'reasons': reasons},
+        'pit_series_coverage': {'needed_sessions': len(needed),
+                                'covered_sessions': len(needed) - len(missing), 'coverage': cov,
+                                'required': AP['archive_min_coverage'], 'from': need_from, 'to': latest,
+                                'missing_dates': missing[:50], 'missing_count': len(missing),
+                                'no_session_dates': no_session},
+        'simulation_status': status,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--session', required=True)
     ap.add_argument('--eod-json', required=True)
-    ap.add_argument('--report-dir', default='/workspace/reports/adaptive')
+    ap.add_argument('--report-dir', default=None)
     a = ap.parse_args()
     day = str(a.session)[:10]
     ag.assert_runnable(heavy=True)
@@ -121,6 +241,7 @@ def main():
     eod = json.loads(Path(a.eod_json).read_text())
     report = {'session_day': day, 'namespace': NS, 'started_at_ist': stamp, 'observation_only': bool(ENGINE_CFG.get('adaptive_observation_only', True)),
               'harness_hash': ae.compute_harness_hash()}
+    timer = PhaseTimer()
 
     # 1. Reconciled Track A EOD marker (session-truth rule input) and the forward Track A arm per strategy.
     rec = bool(eod.get('ledger_reconciled'))
@@ -135,14 +256,20 @@ def main():
     # 2. Market inputs (local snapshot only) and the session list.
     stock, idx, cas, bands_df = market_frames(day)
     sessions = [d for d in sorted(idx['trade_date'].astype(str).unique()) if d not in EXCLUDED]
-    latest_bar = sessions[-1] if sessions else None
-    report['latest_completed_bar_in_snapshot'] = latest_bar
+    # R11: stock max and index max are computed separately — a fresh index
+    # must not mask stale stock bars.
+    stock_dates = sorted(stock['trade_date'].astype(str).unique()) if len(stock) else []
+    latest_stock_bar = stock_dates[-1] if stock_dates else None
+    latest_bar = sessions[-1] if sessions else None  # index max
+    report['latest_completed_bar_in_snapshot'] = latest_stock_bar
+    report['latest_index_bar'] = latest_bar
     report['excluded_sessions_skipped'] = sorted(EXCLUDED & set(stock['trade_date'].astype(str).unique()))
     # Official NSE sec_list already on disk (state/circuit_bands); never fetch Fyers; never invent bands.
     raw_cir = HERE.parent / (CFG.get('circuit_bands') or {}).get('raw_dir', 'state/circuit_bands')
     report['circuit_ingest'] = cb.ingest_raw_dir(db, raw_cir, as_of=day)
 
     # 3. Spawns: Track A replica arm + up to max_track_b_challengers Track B challengers per strategy (idempotent).
+    timer.start('spawn')
     spawns = {}
     for s in sorted(ae.BASELINE_PARAMS):
         live = db.query("SELECT track,slot_index,spawn_id,params_json,status FROM adaptive_tracks WHERE namespace=? AND strategy=? AND status IN ('active','challenger','champion','probation') ORDER BY track,slot_index", (NS, s))
@@ -175,19 +302,26 @@ def main():
                      'ledger': [{'track': r['track'], 'slot': r['slot_index'], 'cash_paise': r['cash_paise'], 'allocated_paise': r['allocated_capital_paise'],
                                  'reconciled': int(r['cash_paise']) == int(r['allocated_capital_paise']) == int(r['starting_equity_net_haircut_paise'])} for r in rows]}
     report['spawns'] = spawns
+    timer.stop('spawn')
     report['track_c_note'] = 'No Track C champion can exist: promotion is locked (observation-only, calibration P7 and CI proof not done).'
 
-    # 4. PIT Bhavcopy SERIES coverage gate (P1). Without it every new entry is refused (EQ-only, never assumed).
+    # 4. Freshness + PIT Bhavcopy SERIES coverage gate (Task 5, P1). Without the
+    # gate every new entry is refused (EQ-only, never assumed). needed_sessions
+    # now comes from the expected trading calendar, not the snapshot's own index.
+    timer.start('coverage_gate')
     need_from = min(v['warm_start'][0] for v in spawns.values() if 'warm_start' in v)
-    need_dates = [d for d in sessions if d >= need_from]
     covered = {r['trade_date'] for r in db.query('SELECT DISTINCT trade_date FROM bhavcopy_series_archive WHERE trade_date>=? AND source LIKE ?', (need_from, aobs.OFFICIAL_BHAVCOPY_PREFIX + '%'))}
-    cov = len(covered & set(need_dates)) / float(len(need_dates)) if need_dates else 0.0
-    report['pit_series_coverage'] = {'needed_sessions': len(need_dates), 'covered_sessions': len(covered & set(need_dates)), 'coverage': cov,
-                                     'required': AP['archive_min_coverage'], 'from': need_from, 'to': latest_bar}
+    gate = evaluate_freshness(day, latest_stock_bar, covered, sessions, need_from,
+                              no_session_dates=nsr.load_no_session_dates(),
+                              latest_index_bar=latest_bar)
+    timer.stop('coverage_gate')
+    report['input_freshness'] = gate['input_freshness']
+    report['pit_series_coverage'] = gate['pit_series_coverage']
 
     sims = {}
-    if cov < AP['archive_min_coverage']:
-        report['simulation_status'] = 'BLOCKED_PIT_SERIES_ARCHIVE_P1'
+    report['parity'] = {}
+    if gate['simulation_status'] != 'SIMULATED':
+        report['simulation_status'] = gate['simulation_status']
     else:
         # 5. Forward-only evaluation: warm-start ends at the spawn's warm_start_end; eval = sessions after it, up to latest_bar.
         closes = idx.set_index(idx['trade_date'].astype(str))['close'].astype(float)
@@ -201,31 +335,70 @@ def main():
             ev = [d for d in sessions if d > info['warm_start'][1]]
             if not ev:
                 sims[s] = {'status': 'WARM_START_ONLY_NO_FORWARD_SESSION_YET'}; continue
+            timer.start(f'simulate_{s}')
             base = ae.simulate_track_window(db, NS, s, ae.BASELINE_PARAMS[s], stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands)
+            timer.stop(f'simulate_{s}')
             out = []
             tape = {}
+            timer.start('persist')
             for sid in info.get('track_a_replica') or []:
                 tape[sid] = ast.persist_sim_trades(db, NS, sid, s, day, base['closed_trades'], stamp, track='A')
+            timer.stop('persist')
             for ch in info['track_b_challengers']:
                 params = {**ae.BASELINE_PARAMS[s], **ch['params_changed']}
+                timer.start(f'simulate_{s}')
                 var = ae.simulate_track_window(db, NS, s, params, stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands)
+                timer.stop(f'simulate_{s}')
                 rows = []
                 for rv, rb in zip(var['daily_records'], base['daily_records']):
                     rows.append(('INSERT OR REPLACE INTO adaptive_daily_returns(namespace,spawn_id,strategy,trade_date,r_var,r_base,d_t,r_index,equity_var_paise,equity_base_paise,cash_var_paise,cash_base_paise,open_positions_var,open_positions_base,recorded_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
                                  (NS, ch['spawn_id'], s, rv['trade_date'], rv['return'], rb['return'], rv['return'] - rb['return'], float(r_idx.get(rv['trade_date']) or 0.0), rv['equity_paise'], rb['equity_paise'], rv['cash_paise'], rb['cash_paise'], rv['open_positions'], rb['open_positions'], stamp)))
+                timer.start('persist')
                 db.batch(rows)
                 tape[ch['spawn_id']] = ast.persist_sim_trades(db, NS, ch['spawn_id'], s, day, var['closed_trades'], stamp, track='B')
+                timer.stop('persist')
                 out.append({'spawn_id': ch['spawn_id'], 'eval_days': len(ev), 'closed_trades': len(var['closed_trades']), 'open_positions': len(var['open_positions']),
                             'skips': dict(Counter(x['cause'] for x in var['entry_skips']))})
             sims[s] = {'status': 'SIMULATED', 'baseline_replica_closed': len(base['closed_trades']), 'challengers': out, 'sim_tape': tape}
             aobs.log_shadow_session_completed(db, NS, s, day, {'eval_days': len(ev)})
+            # Task 4: real replica parity, only for reconciled EOD + SIMULATED.
+            # Live fills come from state/track_a_live_fills-<day>.json (written by
+            # the runner from Turso, read-only); if that file is absent, record
+            # nothing and report not_evaluable.
+            fills_path = HERE.parent / 'state' / f'track_a_live_fills-{day}.json'
+            live_fills = None
+            if fills_path.exists():
+                try:
+                    live_fills = json.loads(fills_path.read_text())
+                except Exception:
+                    live_fills = None
+            replica_day = [r for r in base['daily_records'] if r['trade_date'] == day]
+            live_sleeve = sleeves.get(str(s)) or sleeves.get(s) or {}
+            live_eq = live_sleeve.get('equity_paise')
+            report['parity'][s] = pr.record_for_session(
+                db, NS, s, day, reconciled=rec, simulated=True, live_fills=live_fills,
+                replica_closed_trades=base['closed_trades'], replica_open_positions=base['open_positions'],
+                replica_entry_skips=base['entry_skips'], warm_start_end=info['warm_start'][1],
+                replica_equity_paise=(replica_day[-1]['equity_paise'] if replica_day else None),
+                live_equity_paise=(int(live_eq) if live_eq is not None else None))
         report['simulation_status'] = 'SIMULATED'
+    for s in sorted(ae.BASELINE_PARAMS):
+        if s not in report['parity']:
+            report['parity'][s] = {'status': 'not_evaluable',
+                                   'reason': 'simulation_not_simulated' if report.get('simulation_status') == 'SIMULATED' else str(report.get('simulation_status') or 'not_simulated')}
     report['simulations'] = sims
+    timer.start('after')
+    timer.start('hash_chain')
     report['hash_chain'] = alog.verify_hash_chain(db, NS)
+    timer.stop('hash_chain')
     report['decision_log_rows'] = db.query('SELECT COUNT(*) n FROM adaptive_decision_logs WHERE namespace=?', (NS,))[0]['n']
     report['observation'] = {s: {k: v for k, v in aobs.observation_status(db, NS, s).items() if k in ('sessions', 'parity_streak', 'completed', 'min_sessions')} for s in sorted(ae.BASELINE_PARAMS)}
     report['finished_at_ist'] = datetime.now(IST).isoformat()
-    out_dir = Path(a.report_dir) / day; out_dir.mkdir(parents=True, exist_ok=True)
+    timer.stop('after')
+    # 'after' is finalisation time excluding the hash-chain check itself.
+    timer.timings['after'] = max(0.0, timer.timings.get('after', 0.0) - timer.timings.get('hash_chain', 0.0))
+    report['timings_seconds'] = timer.timings
+    out_dir = Path(a.report_dir or report_dir_default()) / day; out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / 'adaptive-daily.json').write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report, default=str))
 

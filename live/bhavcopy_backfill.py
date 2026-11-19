@@ -34,6 +34,12 @@ UA = BF.get('user_agent') or 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWeb
 REFERER = BF.get('referer') or 'https://www.nseindia.com/'
 CURL = shutil.which('curl')
 
+import no_session_record as nsr  # noqa: E402 — R9 record (state/, never Turso)
+# Re-exported so existing callers/tests can keep using the bb namespace.
+NO_SESSION_RECORD = nsr.NO_SESSION_RECORD
+load_no_session_dates = nsr.load_no_session_dates
+record_no_session_dates = nsr.record_no_session_dates
+
 
 def session_days(frm, to):
     """Weekdays minus config holidays minus indicator-excluded sessions (Muhurat).
@@ -372,24 +378,34 @@ def local_candidates(raw_dir, trade_date):
 
 
 def obtain_session_file(trade_date, raw_dir, session=None, offline=False, timeout=30, retries=3, gap=1.0):
-    """Locate or fetch an official NSE archive for trade_date. Never synthesizes a session."""
+    """Locate or fetch an official NSE archive for trade_date. Never synthesizes a session.
+
+    Returns a dict that always carries 'attempts': one entry per archive form
+    tried, in order, with the HTTP status of each attempt (None for a local
+    cache read), which form succeeded, and the final status.
+    """
     raw_dir = Path(raw_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
     errors = []
+    attempts = []
     # Prefer an existing local file of any official form.
     for form, path in local_candidates(raw_dir, trade_date):
         try:
             rows, raw_n, form2, source = parse_official_file(path, trade_date)
             return {'status': 'ok', 'form': form2, 'source': source, 'path': str(path),
-                    'rows': rows, 'rows_kept': len(rows), 'raw_rows': raw_n, 'from_cache': True}
+                    'rows': rows, 'rows_kept': len(rows), 'raw_rows': raw_n, 'from_cache': True,
+                    'attempts': attempts + [{'form': form, 'http_status': None, 'outcome': 'local_cache_ok'}]}
         except ValueError as e:
             if 'mismatch' in str(e):
                 return {'status': 'no_session', 'error': str(e),
                         'note': 'file date did not match requested session (holiday/weekend placeholder)',
-                        'path': str(path), 'form': form}
+                        'path': str(path), 'form': form,
+                        'attempts': attempts + [{'form': form, 'http_status': None, 'outcome': 'date_mismatch', 'error': str(e)}]}
+            attempts.append({'form': form, 'http_status': None, 'outcome': 'parse_error', 'error': str(e)})
             errors.append(f'local:{form}:{e}')
     if offline:
-        return {'status': 'missing_offline', 'error': ';'.join(errors) or 'no local official file'}
+        return {'status': 'missing_offline', 'error': ';'.join(errors) or 'no local official file',
+                'attempts': attempts}
 
     last_http = None
     any_403 = False
@@ -407,10 +423,13 @@ def obtain_session_file(trade_date, raw_dir, session=None, offline=False, timeou
                 any_404 = True
             else:
                 any_403 = any_403 or e.code in (403, 429)
+            attempts.append({'form': form, 'http_status': e.code, 'outcome': f'http_{e.code}'})
             errors.append(f'{form}:HTTPError:{e.code}')
             time.sleep(gap)
             continue
         except Exception as e:
+            attempts.append({'form': form, 'http_status': None, 'outcome': 'error',
+                             'error': str(getattr(e, 'code', '') or e)[:160]})
             errors.append(f'{form}:{type(e).__name__}:{str(getattr(e, "code", "") or e)[:160]}')
             time.sleep(gap)
             continue
@@ -424,16 +443,22 @@ def obtain_session_file(trade_date, raw_dir, session=None, offline=False, timeou
             if 'mismatch' in str(e):
                 return {'status': 'no_session', 'error': str(e),
                         'note': 'file date did not match requested session (holiday/weekend placeholder)',
-                        'path': str(dest), 'form': form, 'attempts': errors + [str(e)]}
+                        'path': str(dest), 'form': form,
+                        'attempts': attempts + [{'form': form, 'http_status': 200, 'outcome': 'date_mismatch', 'error': str(e)}]}
+            attempts.append({'form': form, 'http_status': 200, 'outcome': 'parse_error', 'error': str(e)})
             errors.append(f'{form}:parse:{e}')
             time.sleep(gap)
             continue
         time.sleep(gap)
+        attempts.append({'form': form, 'http_status': 200, 'outcome': 'success'})
         return {'status': 'ok', 'form': form2, 'source': source, 'path': str(dest),
-                'rows': rows, 'rows_kept': len(rows), 'raw_rows': raw_n, 'from_cache': False, 'url': url}
+                'rows': rows, 'rows_kept': len(rows), 'raw_rows': raw_n, 'from_cache': False, 'url': url,
+                'attempts': attempts}
     if any_404 and not any_403 and last_http == 404:
-        return {'status': 'no_session', 'error': ';'.join(errors), 'note': 'official archives returned 404'}
-    return {'status': 'fetch_failed', 'error': ';'.join(errors) or f'HTTPError:{last_http}'}
+        return {'status': 'no_session', 'error': ';'.join(errors), 'note': 'official archives returned 404',
+                'attempts': attempts}
+    return {'status': 'fetch_failed', 'error': ';'.join(errors) or f'HTTPError:{last_http}',
+            'attempts': attempts}
 
 
 def compare_to_ohlcv(rows, trade_date, ohlcv_by_symbol):
@@ -502,6 +527,25 @@ def load_local_ohlcv(trade_date):
     return {r[0]: {'open': r[1], 'high': r[2], 'low': r[3], 'close': r[4], 'volume': r[5]} for r in rows}
 
 
+def date_is_missing(trade_date, raw_dir, db=None):
+    """True only when a date has no valid local official file and (when a DB is
+    available) no archive rows for it. Used by --retry-missing."""
+    for form, path in local_candidates(raw_dir, trade_date):
+        try:
+            parse_official_file(path, trade_date)
+            return False
+        except Exception:
+            continue
+    if db is not None:
+        try:
+            n = db.query('SELECT COUNT(*) n FROM bhavcopy_series_archive WHERE trade_date=?', (trade_date,))[0]['n']
+            if int(n):
+                return False
+        except Exception:
+            pass
+    return True
+
+
 def main(argv=None):
     a = argparse.ArgumentParser()
     a.add_argument('--from', dest='frm', default=None)
@@ -510,6 +554,8 @@ def main(argv=None):
     a.add_argument('--offline-dir', default=None)
     a.add_argument('--scratch-dir', default=None)
     a.add_argument('--no-ingest', action='store_true')
+    a.add_argument('--retry-missing', action='store_true',
+                   help='re-attempt only dates without a valid local file or archive rows; dates NSE already 404\'d are recorded under state/ and skipped; a second run is a no-op when nothing is missing')
     a.add_argument('--probe', action='store_true', help='scratch-only; skip EOD/window gates; never ingest')
     a = a.parse_args(argv)
 
@@ -534,8 +580,16 @@ def main(argv=None):
     fails = 0
     out = []
     db = None if a.no_ingest else ad.open_adaptive_db()
+    if a.retry_missing:
+        # R9: skip dates already recorded as no_session (NSE 404'd every
+        # form) — a second --retry-missing run makes no fetch calls for them.
+        known = load_no_session_dates()
+        skipped_known = [d for d in days if d in known]
+        days = [d for d in days if d not in known and date_is_missing(d, raw_dir, db)]
+    else:
+        skipped_known = []
     session = None if a.offline_dir else NseBrowserSession(timeout=BF['request_timeout_seconds'])
-    if session is not None:
+    if session is not None and days:
         session.warmup()
         time.sleep(gap)
 
@@ -558,7 +612,8 @@ def main(argv=None):
             continue
         fails = 0
         rec = {'date': d, 'status': 'parsed', 'rows': got['rows_kept'], 'raw_rows': got['raw_rows'],
-               'path': got['path'], 'form': got['form'], 'source': got['source']}
+               'path': got['path'], 'form': got['form'], 'source': got['source'],
+               'attempts': got.get('attempts') or []}
         local = load_local_ohlcv(d)
         if local:
             rec['vs_local_ohlcv'] = compare_to_ohlcv(got['rows'], d, local)
@@ -577,6 +632,23 @@ def main(argv=None):
         )
         out.append(rec)
 
+    # R9: persist today's no_session outcomes so the next --retry-missing
+    # run skips them — but only when the run actually asked NSE (an
+    # --offline-dir no_session only means "no valid local file", not a 404).
+    # R9b: only record dates old enough to have been published (see
+    # recordable_no_session_date) — a recent 404 stays unrecorded and
+    # retryable, so a session NSE has not published yet is never frozen
+    # in as a holiday. The run still reports it as no_session; only the
+    # persistence is gated.
+    # Report already-known ones explicitly (not as failures).
+    newly_no_session = [x['date'] for x in out if x.get('status') == 'no_session']
+    if newly_no_session and not a.offline_dir:
+        recordable = [d for d in newly_no_session if nsr.recordable_no_session_date(d)]
+        if recordable:
+            record_no_session_dates(recordable)
+    if skipped_known:
+        out = [{'date': d, 'status': 'no_session_known'} for d in skipped_known] + out
+
     ingested = [x for x in out if x.get('status') in ('ingested', 'parsed')]
     result = {
         'days_requested': len(days),
@@ -584,10 +656,12 @@ def main(argv=None):
         'parsed_days': len(ingested),
         'coverage': len(ingested) / len(days) if days else 0,
         'required': AP['archive_min_coverage'],
+        'retry_missing': bool(a.retry_missing),
+        'skipped_known_no_session': skipped_known,
         'probe': probe,
         'scratch_dir': str(raw_dir),
         'detail': out,
-        'failures': [x for x in out if x.get('status') not in ('ingested', 'parsed', 'no_session')],
+        'failures': [x for x in out if x.get('status') not in ('ingested', 'parsed', 'no_session', 'no_session_known')],
         'no_session': [x for x in out if x.get('status') == 'no_session'],
     }
     print(json.dumps(result, indent=1, default=str))

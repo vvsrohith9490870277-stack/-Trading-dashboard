@@ -6,5 +6,6 @@ export TZ=Asia/Kolkata
 # Resolve @libsql/client from the Track A install (read-only). Do not write there.
 export NODE_PATH="${TRACK_A_ROOT:-/workspace/paper-trading}/node_modules${NODE_PATH:+:$NODE_PATH}"
 PY="${ADAPTIVE_PYTHON:-/workspace/sahil-fyers-turso/.venv/bin/python}"
+if [ ! -x "$PY" ]; then PY="$(command -v python3 || echo python3)"; fi
 mkdir -p "$ROOT/logs"
 exec "$PY" "$ROOT/live/adaptive_runner.py" "$@" 2>>"$ROOT/logs/adaptive-$(date +%F).err"
