@@ -1006,10 +1006,58 @@ def _db():
  PAPER_RUNTIME=render, so a stray value can never redirect the box engine.
  Unset (or on the box) it behaves exactly as before."""
  return DB(os.environ.get('PAPER_TEST_DATABASE')) if rm.is_render() else DB()
+
+# Commands that mutate state and must be refused when another runner is active.
+MUTATING_COMMANDS = ('worker', 'scan', 'bootstrap', 'eod', 'revalue-eod',
+                     'sync-history', 'monitor-once', 'repair-history',
+                     'weekly', 'sessiond', 'guardian', 'ensure-monitor',
+                     'ensure-session', 'ensure-sessiond')
+
+def runner_guard(command):
+ """Refuse a mutating command when another runner is active (Task 4).
+
+ Returns None when the command may run, or {'status':'runner_not_active'}
+ (plus 'reason' for the unreachable-store case). Read-only commands are
+ never blocked. The guard is enforced on Render always, and on the box only
+ when PAPER_RUNNER_ENFORCE=1. A box process fails open when the store is
+ unreachable; a Render process fails closed.
+ """
+ if command not in MUTATING_COMMANDS:
+  return None
+ enforce = rm.is_render() or os.environ.get('PAPER_RUNNER_ENFORCE') == '1'
+ if not enforce:
+  return None
+ try:
+  import render_lease as rl
+  import render_state as rs
+  store = rs.open_store_from_env()
+  flag = rl.get_active_runner(store, NS)
+  if flag == 'render' and not rm.is_render():
+   return {'status': 'runner_not_active'}
+  if flag != 'render' and rm.is_render():
+   return {'status': 'runner_not_active'}
+  lease = rl.get_lease(store, NS)
+  if lease and int(lease['expires_unix']) > store.server_time():
+   mine = os.environ.get('RENDER_OWNER_ID')
+   if not mine or lease['owner_id'] != mine:
+    return {'status': 'runner_not_active'}
+ except Exception as ex:
+  if rm.is_render():
+   return {'status': 'runner_not_active',
+           'reason': 'render_store_unreachable'}
+  try:
+   log('runner_guard_store_unreachable', error=type(ex).__name__)
+  except Exception:
+   pass
+ return None
+
 def main():
  parser=argparse.ArgumentParser(description='Paper-only Fyers-data/Turso-ledger engine; never broker orders.')
  parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history','exit-selftest','sessiond','ensure-sessiond','record-outages','revalue-eod']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);parser.add_argument('--cleanup-only',action='store_true');parser.add_argument('--keep',action='store_true');parser.add_argument('--max-seconds',type=int,default=1200);parser.add_argument('--max-quotes',type=int,default=40);args=parser.parse_args()
  if not 1<=args.max_history_requests<=1100 or not 1<=args.max_history_seconds<=1080:parser.error('historical repair budget outside safe bounds')
+ guard = runner_guard(args.command)
+ if guard is not None:
+  print(js(guard));sys.exit(3)
  if args.command in SUPERVISION_COMMANDS:
   # Supervision must remain reachable even while a worker/scan holds engine.lock.
   try:

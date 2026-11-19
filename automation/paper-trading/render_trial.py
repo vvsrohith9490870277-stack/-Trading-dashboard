@@ -51,6 +51,11 @@ def resolve(mode, cfg_namespace, override, runtime_is_render):
         if is_trial_namespace(cfg_namespace):
             raise NamespaceRefused(
                 'live mode refuses trial namespace %s' % cfg_namespace)
+        if cfg_namespace in ('paper_v1', 'paper_demo_v1'):
+            # A Render deploy of a main that still carries the archive
+            # namespace must never start (brief section 3).
+            raise NamespaceRefused(
+                'live mode refuses archived namespace %s' % cfg_namespace)
         return cfg_namespace
     if mode == 'trial':
         if not override:
@@ -88,8 +93,9 @@ def trial_caps(env=None):
         day = int(env.get('RENDER_TRIAL_DAY_CAP') or TRIAL_DAY_CAP)
     except (TypeError, ValueError):
         day = TRIAL_DAY_CAP
+    # Literal 1000 (= TRIAL_DAY_CAP): the hard maximum, never raisable by env.
     return {
-        'day': min(TRIAL_DAY_CAP, max(0, day)),
+        'day': min(1000, max(0, day)),
         'minute': TRIAL_MINUTE_CAP,
         'second': TRIAL_SECOND_CAP,
         'reserve': 0,
