@@ -61,6 +61,12 @@ class DepthQuoteFreshness(unittest.TestCase):
   q=self.api({'NSE:A-EQ':row},quotes_first=False).quotes(['A-EQ'])['A-EQ'];self.assertEqual(e.market_guard(q)['circuit'],'UPPER')
   row.update(bids=[{'price':0,'volume':0,'ord':0}],ask=[{'price':90.0,'volume':900,'ord':9}],ltp=90.0)
   q=self.api({'NSE:A-EQ':row},quotes_first=False).quotes(['A-EQ'])['A-EQ'];self.assertEqual(e.market_guard(q)['circuit'],'LOWER')
+ def test_depth_empty_ask_side_inside_band_is_not_a_lock(self):
+  # Empty ask side, but the depth band puts the price well inside: NOT a lock (the band confirms).
+  stamp=int((T-timedelta(seconds=3)).timestamp())
+  row={'ltp':100.0,'ltt':stamp,'o':100.0,'h':101.0,'l':99.0,'upper_ckt':110.0,'lower_ckt':90.0,'bids':[{'price':100.0,'volume':900,'ord':9}],'ask':[{'price':0,'volume':0,'ord':0}]}
+  q=self.api({'NSE:A-EQ':row},quotes_first=False).quotes(['A-EQ'])['A-EQ']
+  self.assertEqual(e.market_guard(q)['circuit'],'NONE');self.assertEqual(e.market_guard(q)['circuit_source'],'depth_band')
  def test_depth_missing_ohlc_and_book_are_none_not_zero_price(self):
   q=self.api({'NSE:A-EQ':{'ltp':50.0,'ltt':int(T.timestamp()),'o':0,'bids':[],'upper_ckt':0}},quotes_first=False).quotes(['A-EQ'])['A-EQ']
   self.assertIsNone(q['open']);self.assertIsNone(q['bid']);self.assertIsNone(q['ask']);self.assertNotIn('upper_band',q)
