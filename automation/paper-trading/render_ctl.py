@@ -6,9 +6,9 @@ budget check; Task 7 adds migrate/status/handoff/keys/token/net-check/
 dry-run/footprint.
 
 Usage: python render_ctl.py <command> [args]
-  trial-init --namespace paper_render_trial_v1
-  trial-compare --namespace paper_render_trial_v1 [--live paper_v2] [--day YYYY-MM-DD]
-  trial-purge --namespace paper_render_trial_v1 [--state-only]
+  trial-init [--namespace paper_render_trial_v1] [--bar YYYY-MM-DD] [--fixture]
+  trial-compare [--namespace paper_render_trial_v1] [--live paper_v2] [--day YYYY-MM-DD] [--session D] [--fixture]
+  trial-purge [--namespace paper_render_trial_v1] [--state-only] [--yes] [--fixture]
   budget-check
 """
 import argparse
@@ -177,10 +177,23 @@ def _count_all_namespaces(store, db):
     return out
 
 
+def _trial_namespace(args):
+    """The trial namespace for a trial command: --namespace when given,
+    else PAPER_NAMESPACE_OVERRIDE when it is a trial namespace, else the
+    default trial namespace. The gate's trial-init/compare commands do
+    not pass --namespace."""
+    if getattr(args, 'namespace', None):
+        return args.namespace
+    override = os.environ.get('PAPER_NAMESPACE_OVERRIDE', '')
+    if override and rt.is_trial_namespace(override):
+        return override
+    return 'paper_render_trial_v1'
+
+
 def cmd_trial_init(args):
     if getattr(args, 'fixture', False):
         return _cmd_trial_init_fixture(args)
-    out = rt.init_trial(_store(), args.namespace)
+    out = rt.init_trial(_store(), _trial_namespace(args))
     _print(out)
     return 0
 
@@ -190,6 +203,7 @@ def _cmd_trial_init_fixture(args):
     FIXTURE_COMPLETED_DAY. Copies the paper_v2 watermarks into the trial
     namespace and verifies they match. A bar later than the fixture's
     latest completed day is refused (non-zero exit)."""
+    namespace = _trial_namespace(args)
     bar = args.bar or FIXTURE_COMPLETED_DAY
     if bar > FIXTURE_COMPLETED_DAY:
         print('trial-init refuses bar %s: later than the latest completed'
@@ -197,7 +211,7 @@ def _cmd_trial_init_fixture(args):
         return 1
     store, _db, _path = _fixture_db()
     try:
-        out = rt.init_trial(store, args.namespace)
+        out = rt.init_trial(store, namespace)
         watermarks = {}
         for row in store.execute(
                 "SELECT key, value FROM paper_runtime_kv"
@@ -211,10 +225,10 @@ def _cmd_trial_init_fixture(args):
                 ' VALUES(?, ?, ?, ?)'
                 ' ON CONFLICT(scope, key) DO UPDATE SET value=excluded.value,'
                 ' updated_at=excluded.updated_at',
-                (args.namespace, key, value, now))
+                (namespace, key, value, now))
         back = {row['key']: row['value'] for row in store.execute(
             "SELECT key, value FROM paper_runtime_kv"
-            " WHERE scope=? AND key LIKE 'watermark:%'", (args.namespace,))}
+            " WHERE scope=? AND key LIKE 'watermark:%'", (namespace,))}
         out.update({'bar': bar, 'watermarks': watermarks,
                     'watermarks_match_paper_v2': back == watermarks})
         _print(out)
@@ -230,13 +244,13 @@ def cmd_trial_compare(args):
     if getattr(args, 'fixture', False):
         store, db, _path = _fixture_db()
         try:
-            out = rt.compare_trial(db, args.namespace,
+            out = rt.compare_trial(db, _trial_namespace(args),
                                    args.live or 'paper_v2', day)
         finally:
             _close_fixture(store, db, _path)
         _print(out)
         return 0
-    out = rt.compare_trial(_trading_db(), args.namespace,
+    out = rt.compare_trial(_trading_db(), _trial_namespace(args),
                            args.live or 'paper_v2', day)
     _print(out)
     return 0
@@ -246,7 +260,7 @@ def cmd_trial_purge(args):
     if getattr(args, 'fixture', False):
         return _cmd_trial_purge_fixture(args)
     db = None if args.state_only else _trading_db()
-    out = rt.purge_trial(_store(), args.namespace, db=db)
+    out = rt.purge_trial(_store(), _trial_namespace(args), db=db)
     _print(out)
     return 0
 
@@ -255,21 +269,22 @@ def _cmd_trial_purge_fixture(args):
     """Purge against the gate fixture. Without --yes this is a dry run
     (nothing is deleted); with --yes it purges the trial namespace and
     proves no other namespace changed."""
+    namespace = _trial_namespace(args)
     store, db, _path = _fixture_db()
     try:
         if not args.yes:
-            counts = _count_namespace_rows(store, db, args.namespace)
-            _print({'dry_run': True, 'namespace': args.namespace,
+            counts = _count_namespace_rows(store, db, namespace)
+            _print({'dry_run': True, 'namespace': namespace,
                     'would_delete': counts})
             return 0
         before = _count_all_namespaces(store, db)
-        out = rt.purge_trial(store, args.namespace, db=db)
+        out = rt.purge_trial(store, namespace, db=db)
         after = _count_all_namespaces(store, db)
         changed = sum(abs(after[ns] - before.get(ns, 0))
-                      for ns in after if ns != args.namespace)
+                      for ns in after if ns != namespace)
         changed += sum(before.get(ns, 0)
                        for ns in before if ns not in after
-                       and ns != args.namespace)
+                       and ns != namespace)
         out.update({'dry_run': False,
                     'other_namespaces_changed': changed})
         _print(out)
@@ -1225,19 +1240,19 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description='Render control CLI')
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('trial-init')
-    p.add_argument('--namespace', required=True)
+    p.add_argument('--namespace', default=None)
     p.add_argument('--bar', default=None)
     p.add_argument('--fixture', action='store_true')
     p.set_defaults(fn=cmd_trial_init)
     p = sub.add_parser('trial-compare')
-    p.add_argument('--namespace', required=True)
+    p.add_argument('--namespace', default=None)
     p.add_argument('--live', default='paper_v2')
     p.add_argument('--day', default=None)
     p.add_argument('--session', dest='day', default=None)
     p.add_argument('--fixture', action='store_true')
     p.set_defaults(fn=cmd_trial_compare)
     p = sub.add_parser('trial-purge')
-    p.add_argument('--namespace', required=True)
+    p.add_argument('--namespace', default=None)
     p.add_argument('--state-only', action='store_true')
     p.add_argument('--yes', action='store_true')
     p.add_argument('--fixture', action='store_true')
