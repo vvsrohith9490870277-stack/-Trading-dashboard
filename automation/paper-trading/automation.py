@@ -236,7 +236,7 @@ def _eod(e,db):
  if existing:
   r['previous_snapshot_as_of']=existing[0]['as_of']
   try:
-   out=e.ROOT/'out';out.mkdir(exist_ok=True)
+   out=al.out_dir(e)
    stamp=existing[0]['as_of'].replace(':','').replace('/','').replace(' ','')
    trail=out/('eod-'+str(t.date())+'-prior-'+stamp+'.json')
    fd=os.open(trail,os.O_WRONLY|os.O_CREAT|os.O_EXCL,0o600)
@@ -286,8 +286,10 @@ def performance(e,db,r,day):
  return {'status':'ok','expectancy':exp,'drawdown':dd,'cost_to_gross':ctg,'implementation_shortfall':isf}
 
 def _preserve_prior(e,day,existing):
- """Copy an EOD snapshot that is about to be replaced into out/ (never overwritten); returns the path."""
- out=e.ROOT/'out';out.mkdir(exist_ok=True)
+ """Copy an EOD snapshot that is about to be replaced into out/ (never overwritten); returns the path.
+ Test namespaces write under out/test-exports/<namespace>/ (the audit.out_dir pattern), so a test
+ run can never leave a prior snapshot in the production out/ directory."""
+ out=al.out_dir(e)
  stamp=existing['as_of'].replace(':','').replace('/','').replace(' ','')
  trail=out/('eod-'+str(day)+'-prior-'+stamp+'.json')
  try:

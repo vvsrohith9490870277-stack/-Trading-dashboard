@@ -75,6 +75,9 @@ class OfficialCloseEodTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         fixtures.PaperTests.setUpClass.__func__(cls)
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.PaperTests.tearDownClass.__func__(cls)
     def setUp(self):
         fixtures.PaperTests.setUp(self)
     seed_adv=fixtures.PaperTests.seed_adv
