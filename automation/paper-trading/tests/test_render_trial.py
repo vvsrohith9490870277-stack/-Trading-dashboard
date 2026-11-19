@@ -2,15 +2,23 @@
 
 The budget/token/init/compare/purge tests land with the Task 10 wiring.
 """
+import csv
+import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import render_ctl as ctl
 import render_state as rs
 import render_trial as t
+
+BAR = '2026-11-18'
+TRIAL_NS = 'paper_render_trial_v1'
+LIVE_NS = 'paper_v2'
 
 
 class ResolveTableTests(unittest.TestCase):
@@ -161,19 +169,40 @@ class TrialLifecycleTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_trial_init(self):
-        out = t.init_trial(self.store, 'paper_render_trial_v1')
-        self.assertEqual(out['namespace'], 'paper_render_trial_v1')
-        self.assertTrue(out['ok'])
-        rows = self.store.execute(
-            "SELECT value FROM paper_runtime_kv WHERE scope=?"
-            " AND key='trial_init'", ('paper_render_trial_v1',))
-        self.assertEqual(len(rows), 1)
+        # The real path: baseline the trial at BAR on a paper_v2-baselined
+        # DB, then the marker row and the watermark match are both present.
+        store, db, path = self._baselined_db()
+        try:
+            out = t.init_trial(store, db, TRIAL_NS, BAR)
+            self.assertEqual(out['namespace'], TRIAL_NS)
+            self.assertTrue(out['bootstrapped'])
+            self.assertTrue(out['watermarks_match_paper_v2'])
+            rows = store.execute(
+                "SELECT value FROM paper_runtime_kv WHERE scope=?"
+                " AND key='trial_init'", (TRIAL_NS,))
+            self.assertEqual(len(rows), 1)
+        finally:
+            ctl.close_baselined_db(store, path)
+
+    def _baselined_db(self):
+        """A local SQLite DB with a paper_v2 baseline at BAR.
+
+        The file must live under tests/ as test_*.sqlite (db.mjs rejects
+        any other test-database path)."""
+        fd, raw = tempfile.mkstemp(dir=Path(__file__).resolve().parent,
+                                   prefix='test_trial_init_',
+                                   suffix='.sqlite')
+        os.close(fd)
+        path = Path(raw)
+        return (*ctl.build_baselined_db(path, BAR, self.tmp.name), path)
 
     def test_trial_init_refuses_non_trial(self):
+        # Refusal happens before any DB access: db=None must still raise
+        # NamespaceRefused, never an AttributeError from touching the DB.
         with self.assertRaises(t.NamespaceRefused):
-            t.init_trial(self.store, 'paper_v2')
+            t.init_trial(self.store, None, 'paper_v2', BAR)
         with self.assertRaises(t.NamespaceRefused):
-            t.init_trial(self.store, 'paper_render_trial_BAD')
+            t.init_trial(self.store, None, 'paper_render_trial_BAD', BAR)
 
     def test_trial_purge_only_trial_namespace(self):
         import render_lease as rl
@@ -216,20 +245,180 @@ class TrialLifecycleTests(unittest.TestCase):
     def test_trial_isolation_no_live_writes(self):
         """Init + trial budget writes touch only the trial scope."""
         import token_store as ts
-        t.init_trial(self.store, 'paper_render_trial_v1')
-        enc = ts.generate_key()
-        store = ts.TokenStore(self.store, enc, {})
-        store.put_budget({'day': '2026-11-19', 'requests': 1, 'by_route': {},
-                          'times': []}, trial=True)
-        rows = self.store.execute(
-            "SELECT scope, key FROM paper_runtime_kv")
-        scopes = {(r['scope'], r['key']) for r in rows}
-        self.assertNotIn(('paper_v2', 'trial_init'), scopes)
-        # no lease or job rows for the live namespace
-        self.assertEqual(self.store.execute(
-            "SELECT * FROM paper_runner_lease WHERE namespace='paper_v2'"), [])
-        self.assertEqual(self.store.execute(
-            "SELECT * FROM paper_job_runs WHERE namespace='paper_v2'"), [])
+        store, db, path = self._baselined_db()
+        try:
+            t.init_trial(store, db, TRIAL_NS, BAR)
+            enc = ts.generate_key()
+            tstore = ts.TokenStore(store, enc, {})
+            tstore.put_budget({'day': '2026-11-19', 'requests': 1,
+                               'by_route': {}, 'times': []}, trial=True)
+            rows = store.execute(
+                "SELECT scope, key FROM paper_runtime_kv")
+            scopes = {(r['scope'], r['key']) for r in rows}
+            self.assertNotIn((LIVE_NS, 'trial_init'), scopes)
+            # no lease or job rows for the live namespace
+            self.assertEqual(store.execute(
+                "SELECT * FROM paper_runner_lease WHERE namespace='paper_v2'"), [])
+            self.assertEqual(store.execute(
+                "SELECT * FROM paper_job_runs WHERE namespace='paper_v2'"), [])
+        finally:
+            ctl.close_baselined_db(store, path)
+
+
+class TrialInitRealPathTests(unittest.TestCase):
+    """Task 1 (render-deploy-02): the real trial-init baseline.
+
+    Each test builds a local SQLite DB with a paper_v2 baseline at BAR
+    (real bootstrap, no network) and calls the same init_trial function
+    the CLI calls, without --fixture.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = {}
+        for k in ('PAPER_RUNTIME', 'RENDER_MODE',
+                  'PAPER_NAMESPACE_OVERRIDE', 'PAPER_TEST_DATABASE',
+                  'PAPER_STATE_DIR', 'TURSO_DATABASE_URL',
+                  'TURSO_AUTH_TOKEN'):
+            self.old[k] = os.environ.pop(k, None)
+        os.environ['PAPER_RUNTIME'] = 'render'
+        os.environ['RENDER_MODE'] = 'trial'
+        os.environ['PAPER_NAMESPACE_OVERRIDE'] = TRIAL_NS
+        os.environ['PAPER_STATE_DIR'] = self.tmp.name
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _baselined_db(self):
+        fd, raw = tempfile.mkstemp(dir=Path(__file__).resolve().parent,
+                                   prefix='test_trial_init_',
+                                   suffix='.sqlite')
+        os.close(fd)
+        path = Path(raw)
+        return (*ctl.build_baselined_db(path, BAR, self.tmp.name), path)
+
+    def _watermarks(self, db, namespace):
+        return {(r['strategy'], r['symbol']): r['bar_date'] for r in
+                db.query('SELECT strategy, symbol, bar_date'
+                         ' FROM paper_watermarks WHERE namespace=?',
+                         (namespace,))}
+
+    def test_trial_init_real_path_runs_bootstrap_and_matches(self):
+        store, db, path = self._baselined_db()
+        try:
+            out = t.init_trial(store, db, TRIAL_NS, BAR)
+            self.assertEqual(out['namespace'], TRIAL_NS)
+            self.assertEqual(out['bar'], BAR)
+            self.assertTrue(out['bootstrapped'])
+            self.assertFalse(out['already_bootstrapped'])
+            self.assertTrue(out['watermarks_match_paper_v2'])
+            self.assertEqual(out['differences'], [])
+            # 692 universe symbols x 7 strategies, all at the bar
+            self.assertEqual(out['rows_compared'], 692 * 7)
+            self.assertEqual(
+                self._watermarks(db, TRIAL_NS),
+                self._watermarks(db, LIVE_NS))
+        finally:
+            ctl.close_baselined_db(store, path)
+
+    def test_trial_init_real_path_no_network(self):
+        import requests
+        calls = []
+        orig_get, orig_post, orig_request = (
+            requests.get, requests.post, requests.request)
+
+        def _record(name):
+            def _f(*a, **k):
+                calls.append(name)
+                raise AssertionError('network call during trial-init: ' + name)
+            return _f
+        requests.get = _record('GET')
+        requests.post = _record('POST')
+        requests.request = _record('request')
+        store, db, path = self._baselined_db()
+        try:
+            out = t.init_trial(store, db, TRIAL_NS, BAR)
+        finally:
+            requests.get, requests.post, requests.request = (
+                orig_get, orig_post, orig_request)
+            ctl.close_baselined_db(store, path)
+        self.assertTrue(out['watermarks_match_paper_v2'])
+        self.assertEqual(calls, [])
+
+    def test_trial_init_real_path_writes_only_trial_ns(self):
+        store, db, path = self._baselined_db()
+        try:
+            # write spy on the state store: every write must target the
+            # trial scope (or the trial's own _global budget key)
+            seen = []
+            orig_execute = store.execute
+
+            def _spy(sql, args=()):
+                seen.append((sql, tuple(args)))
+                return orig_execute(sql, args)
+            store.execute = _spy
+            before_live = {}
+            for table in ('paper_signals', 'paper_fills',
+                          'paper_positions', 'paper_watermarks',
+                          'paper_scan_batches'):
+                before_live[table] = len(db.query(
+                    'SELECT 1 FROM %s WHERE namespace=?' % table,
+                    (LIVE_NS,)))
+            conn = sqlite3.connect(str(path))
+            before_history = conn.execute(
+                'SELECT COUNT(*) FROM daily_ohlcv').fetchone()[0]
+            conn.close()
+            out = t.init_trial(store, db, TRIAL_NS, BAR)
+            self.assertTrue(out['watermarks_match_paper_v2'])
+            for sql, args in seen:
+                if sql.strip().upper().startswith(
+                        ('INSERT', 'UPDATE', 'DELETE')) \
+                        and 'paper_runtime_kv' in sql and args:
+                    self.assertEqual(args[0], TRIAL_NS, sql)
+            # the live book is untouched, and the shared history table too
+            for table, n in before_live.items():
+                self.assertEqual(len(db.query(
+                    'SELECT 1 FROM %s WHERE namespace=?' % table,
+                    (LIVE_NS,))), n, table)
+            conn = sqlite3.connect(str(path))
+            self.assertEqual(conn.execute(
+                'SELECT COUNT(*) FROM daily_ohlcv').fetchone()[0],
+                before_history)
+            # no rows for any third namespace anywhere
+            namespaces = set()
+            for table in ('paper_signals', 'paper_fills',
+                          'paper_positions', 'paper_watermarks'):
+                namespaces |= {r['namespace'] for r in db.query(
+                    'SELECT DISTINCT namespace FROM %s' % table)}
+            self.assertEqual(namespaces, {LIVE_NS, TRIAL_NS})
+            conn.close()
+        finally:
+            ctl.close_baselined_db(store, path)
+
+    def test_trial_init_idempotent_real_path(self):
+        store, db, path = self._baselined_db()
+        try:
+            first = t.init_trial(store, db, TRIAL_NS, BAR)
+            self.assertTrue(first['bootstrapped'])
+            self.assertFalse(first['already_bootstrapped'])
+            second = t.init_trial(store, db, TRIAL_NS, BAR)
+            self.assertFalse(second['bootstrapped'])
+            self.assertTrue(second['already_bootstrapped'])
+            # the second run still runs the watermark comparison
+            self.assertTrue(second['watermarks_match_paper_v2'])
+            self.assertEqual(second['rows_compared'],
+                             first['rows_compared'])
+            rows = store.execute(
+                "SELECT value FROM paper_runtime_kv WHERE scope=?"
+                " AND key='trial_init'", (TRIAL_NS,))
+            self.assertEqual(len(rows), 1)
+        finally:
+            ctl.close_baselined_db(store, path)
 
 
 if __name__ == '__main__':

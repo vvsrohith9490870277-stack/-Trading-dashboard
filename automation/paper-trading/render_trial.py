@@ -10,6 +10,7 @@ import logging
 import os
 import re
 import time
+from datetime import date
 
 log = logging.getLogger('render.trial')
 
@@ -111,16 +112,127 @@ def _trial_now_iso():
     return time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime())
 
 
-def init_trial(store, namespace):
-    """Prepare a trial namespace: validate the name, record the init marker
-    in kv (scope = the trial namespace) and zero the trial budget row.
+class BarRefused(Exception):
+    """A --bar that is not a verified completed NSE session."""
 
-    Writes only the trial namespace's own kv rows. Refuses anything that
-    is not a trial namespace.
+
+def _read_watermarks(db, namespace):
+    """{(strategy, symbol): bar_date} from paper_watermarks."""
+    rows = db.query(
+        'SELECT strategy, symbol, bar_date FROM paper_watermarks'
+        ' WHERE namespace=?', (namespace,))
+    return {(r['strategy'], r['symbol']): r['bar_date'] for r in rows}
+
+
+def compare_watermarks(db, trial_ns, live_ns='paper_v2'):
+    """Compare bar_date per (strategy, symbol) between two namespaces.
+
+    Read-only. `rows_compared` counts every (strategy, symbol) key in
+    either namespace; `differences` lists the first 10 mismatches
+    (a key missing on one side counts as a mismatch, with None).
+    """
+    live = _read_watermarks(db, live_ns)
+    trial = _read_watermarks(db, trial_ns)
+    diffs = []
+    for key in sorted(set(live) | set(trial)):
+        if live.get(key) != trial.get(key):
+            diffs.append({'strategy': key[0], 'symbol': key[1],
+                          'live_bar_date': live.get(key),
+                          'trial_bar_date': trial.get(key)})
+    return {'watermarks_match_paper_v2': not diffs,
+            'rows_compared': len(set(live) | set(trial)),
+            'differences': diffs[:10]}
+
+
+def validate_bar(bar, latest_completed_day):
+    """Raise BarRefused unless `bar` is a verified completed NSE session
+    on or before `latest_completed_day` (both 'YYYY-MM-DD').
+
+    A verified completed session is a day the engine calendar has a
+    session for (not a weekend, holiday or unverified date) that is not
+    later than the real completed day.
+    """
+    import engine as e
+    try:
+        day = date.fromisoformat(bar)
+    except (TypeError, ValueError):
+        raise BarRefused('bar %r is not YYYY-MM-DD' % (bar,))
+    if not e.session(day):
+        raise BarRefused(
+            'bar %s is not a verified NSE session day' % bar)
+    if bar > latest_completed_day:
+        raise BarRefused(
+            'bar %s is later than the latest completed day %s'
+            % (bar, latest_completed_day))
+    return day
+
+
+class _NoNetworkApi:
+    """Stand-in for MarketData in bootstrap: with do_sync=False the
+    bootstrap path must never touch the network, so any api call is a
+    bug and fails loudly instead of reaching Fyers."""
+
+    def __getattr__(self, name):
+        raise AssertionError(
+            'trial-init bootstrap must not call api.%s' % name)
+
+
+def _run_bootstrap(db, namespace, bar):
+    """Run the real `bootstrap` code path for `namespace` at `bar`.
+
+    Patches `engine.completed_day` (and `engine.NS`) in this process
+    only to return the bar; no engine code changes, no --sync, no
+    Fyers or network call (the api object above raises on any use).
+    The patch is restored even when bootstrap raises.
+    """
+    import engine as e
+    target = date.fromisoformat(bar)
+    old_ns, old_completed = e.NS, e.completed_day
+    try:
+        e.NS = namespace
+        e.completed_day = lambda t: target
+        return e.scan(db, _NoNetworkApi(), do_sync=False, bootstrap=True)
+    finally:
+        e.NS, e.completed_day = old_ns, old_completed
+
+
+def init_trial(store, db, namespace, bar, live_ns='paper_v2',
+               latest_completed_day=None):
+    """Baseline a trial namespace at `bar` (brief 01 Task 10.5).
+
+    One code path for the real and the --fixture modes; only the store
+    (and the trading DB handle) differ. Steps, in order:
+    1. refuse anything that is not a trial namespace (before any write);
+    2. refuse a bar that is not a verified completed session on or
+       before the latest completed day (the real completed day, unless
+       the caller passes one — the fixture passes its own);
+    3. run the real bootstrap for the trial namespace, unless it is
+       already bootstrapped (watermarks exist) — a second run still
+       runs step 5;
+    4. record the init marker in kv (trial scope) and zero the trial
+       budget (its own key; the box budget is never touched);
+    5. read the live namespace's paper_watermarks and compare bar_date
+       per strategy and symbol with the trial's.
+    Writes only the trial namespace's rows (plus the shared audit and
+    qualifier rows the bootstrap itself writes under that namespace).
+    Returns {namespace, bar, bootstrapped, already_bootstrapped,
+    watermarks_match_paper_v2, rows_compared, differences}.
+    The caller exits 2 on a mismatch.
     """
     if not is_trial_namespace(namespace):
         raise NamespaceRefused(
             'trial-init refuses non-trial namespace %s' % namespace)
+    if bar is None:
+        raise BarRefused('trial-init needs --bar YYYY-MM-DD')
+    if latest_completed_day is None:
+        import engine as e
+        latest_completed_day = e.completed_day(e.now()).isoformat()
+    validate_bar(bar, latest_completed_day)
+    already = bool(_read_watermarks(db, namespace))
+    bootstrapped = False
+    if not already:
+        _run_bootstrap(db, namespace, bar)
+        bootstrapped = True
     now_iso = _trial_now_iso()
     store.execute(
         'INSERT INTO paper_runtime_kv(scope, key, value, updated_at)'
@@ -139,7 +251,11 @@ def init_trial(store, namespace):
                  'times': []}, trial=True)
     except Exception:
         pass  # no enc key yet: the budget row is created on first use
-    return {'ok': True, 'namespace': namespace, 'init_at': now_iso}
+    out = {'namespace': namespace, 'bar': bar,
+           'bootstrapped': bootstrapped,
+           'already_bootstrapped': already}
+    out.update(compare_watermarks(db, namespace, live_ns))
+    return out
 
 
 def compare_trial(db, trial_ns, live_ns, day):

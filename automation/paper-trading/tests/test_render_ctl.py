@@ -2,6 +2,7 @@
 adds migrate/status/handoff/keys/token/net-check/dry-run/footprint tests)."""
 import json
 import os
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
+import render_ctl as ctl
 import render_lease as rl
 import render_state as rs
 
@@ -50,28 +52,45 @@ class TrialCtlTests(unittest.TestCase):
         })
         return env
 
-    def _run(self, *argv):
+    def _run(self, *argv, db_path=None):
+        env = self._env()
+        if db_path is not None:
+            env['PAPER_TEST_DATABASE'] = str(db_path)
         return subprocess.run(
             [sys.executable, str(CTL), *argv],
-            capture_output=True, text=True, env=self._env(), timeout=120,
+            capture_output=True, text=True, env=env, timeout=120,
             cwd=str(HERE.parent))
 
     def test_trial_init_cli(self):
-        r = self._run('trial-init', '--namespace', 'paper_render_trial_v1')
-        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        out = json.loads(r.stdout)
-        self.assertTrue(out['ok'])
-        rows = self.store.execute(
-            "SELECT value FROM paper_runtime_kv WHERE scope=?"
-            " AND key='trial_init'", ('paper_render_trial_v1',))
-        self.assertEqual(len(rows), 1)
+        # The real path needs --bar and a paper_v2-baselined DB.
+        fd, raw = tempfile.mkstemp(dir=HERE, prefix='test_trial_init_',
+                                   suffix='.sqlite')
+        os.close(fd)
+        path = Path(raw)
+        store, db = ctl.build_baselined_db(path, '2026-11-18',
+                                           self.tmp.name)
+        try:
+            r = self._run('trial-init', '--namespace',
+                          'paper_render_trial_v1', '--bar', '2026-11-18',
+                          db_path=path)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            out = json.loads(r.stdout)
+            self.assertTrue(out['watermarks_match_paper_v2'])
+            rows = store.execute(
+                "SELECT value FROM paper_runtime_kv WHERE scope=?"
+                " AND key='trial_init'", ('paper_render_trial_v1',))
+            self.assertEqual(len(rows), 1)
+        finally:
+            ctl.close_baselined_db(store, path)
 
     def test_trial_init_cli_refuses_live(self):
         r = self._run('trial-init', '--namespace', 'paper_v2')
         self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
 
     def test_trial_purge_cli(self):
-        self._run('trial-init', '--namespace', 'paper_render_trial_v1')
+        # No trial-init here: the purge test sets the flag directly.
+        # (trial-init now needs --bar and a baselined DB; see the
+        # TrialInitRealPathCtlTests class.)
         rl.set_active_runner(self.store, 'paper_render_trial_v1', 'render')
         r = self._run('trial-purge', '--namespace', 'paper_render_trial_v1',
                       '--state-only')
@@ -89,6 +108,90 @@ class TrialCtlTests(unittest.TestCase):
         self.assertEqual(out['box']['limits']['per_day'], 4000)
         self.assertIsNone(out['trial']['state'])
         self.assertIsNone(out['box']['state'])
+
+
+class TrialInitRealPathCtlTests(unittest.TestCase):
+    """Task 1 (render-deploy-02): the real trial-init baseline at CLI level.
+
+    The DB is a local SQLite file with a paper_v2 baseline at
+    2026-11-18 (real bootstrap, no network); the CLI runs against it
+    without --fixture.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = {}
+        for k in ('PAPER_RUNTIME', 'RENDER_MODE', 'PAPER_NAMESPACE_OVERRIDE',
+                  'PAPER_TEST_DATABASE', 'PAPER_STATE_DIR',
+                  'TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN'):
+            self.old[k] = os.environ.pop(k, None)
+        fd, raw = tempfile.mkstemp(dir=HERE, prefix='test_trial_init_',
+                                   suffix='.sqlite')
+        os.close(fd)
+        self.db_path = Path(raw)
+        self.store, self.db = ctl.build_baselined_db(
+            self.db_path, '2026-11-18', self.tmp.name)
+
+    def tearDown(self):
+        ctl.close_baselined_db(self.store, self.db_path)
+        self.tmp.cleanup()
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _run(self, *argv):
+        env = dict(os.environ)
+        env.update({
+            'PAPER_RUNTIME': 'render',
+            'RENDER_MODE': 'trial',
+            'PAPER_NAMESPACE_OVERRIDE': 'paper_render_trial_v1',
+            'PAPER_TEST_DATABASE': str(self.db_path),
+            'PAPER_STATE_DIR': self.tmp.name,
+        })
+        return subprocess.run(
+            [sys.executable, str(CTL), *argv],
+            capture_output=True, text=True, env=env, timeout=180,
+            cwd=str(HERE.parent))
+
+    def test_trial_init_real_path_requires_bar(self):
+        r = self._run('trial-init', '--namespace', 'paper_render_trial_v1')
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        # wrote nothing: no marker row, no trial watermarks
+        self.assertEqual(self.store.execute(
+            "SELECT * FROM paper_runtime_kv"
+            " WHERE scope='paper_render_trial_v1'"), [])
+        self.assertEqual(self.db.query(
+            'SELECT 1 FROM paper_watermarks WHERE namespace=?',
+            ('paper_render_trial_v1',)), [])
+
+    def test_trial_init_real_path_mismatch_exits_2(self):
+        r = self._run('trial-init', '--namespace', 'paper_render_trial_v1',
+                      '--bar', '2026-11-18')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(
+            json.loads(r.stdout)['watermarks_match_paper_v2'])
+        # advance one paper_v2 watermark past the bar: the next run
+        # (idempotent, still compares) must exit 2 with the difference
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute(
+            "UPDATE paper_watermarks SET bar_date='2026-11-19'"
+            " WHERE rowid=(SELECT rowid FROM paper_watermarks"
+            " WHERE namespace='paper_v2' LIMIT 1)")
+        conn.commit()
+        conn.close()
+        r = self._run('trial-init', '--namespace', 'paper_render_trial_v1',
+                      '--bar', '2026-11-18')
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        out = json.loads(r.stdout)
+        self.assertFalse(out['watermarks_match_paper_v2'])
+        self.assertTrue(out['already_bootstrapped'])
+        self.assertEqual(len(out['differences']), 1)
+        self.assertEqual(out['differences'][0]['live_bar_date'],
+                         '2026-11-19')
+        self.assertEqual(out['differences'][0]['trial_bar_date'],
+                         '2026-11-18')
 
 
 class OpsCtlTests(unittest.TestCase):

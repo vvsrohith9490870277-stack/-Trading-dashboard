@@ -55,89 +55,166 @@ def _print(obj):
     print(json.dumps(obj), flush=True)
 
 
-class _SqliteTradingDb:
-    """Minimal engine-DB facade over a sqlite3 connection: .query() returns
-    a list of dicts, .batch() runs [(sql, params)]. Used by the --fixture
-    commands and the dry-run fake box."""
+def build_baselined_db(path, bar, state_dir=None, baseline=True):
+    """Build a local SQLite DB with the full paper schema, seeded
+    daily_ohlcv history up to `bar`, and (baseline=True) a paper_v2
+    baseline via the real bootstrap at `bar`.
 
-    def __init__(self, conn):
-        self._conn = conn
-        self._conn.row_factory = sqlite3.Row
-
-    def query(self, sql, params=()):
-        cur = self._conn.execute(sql, params)
-        return [dict(r) for r in cur.fetchall()]
-
-    def batch(self, statements):
-        for sql, params in statements:
-            self._conn.execute(sql, params)
-        self._conn.commit()
-
-
-def _fixture_db():
-    """Build the gate fixture: a temp SQLite DB with the render state
-    schema, minimal paper tables, and a paper_v2 baseline at bar
-    FIXTURE_COMPLETED_DAY (3 signals, 2 fills, 1 position, 2 watermarks,
-    2 shared paper_meta rows). Returns (store, trading_db, tmp_path)."""
-    fd, path = tempfile.mkstemp(prefix='render-fixture-', suffix='.sqlite')
-    os.close(fd)
-    store = rs.SqliteStore(Path(path))
+    `path` must live under automation/paper-trading/tests/ as
+    test_*.sqlite: db.mjs rejects any other test-database path.
+    Returns (store, db): a SqliteStore and the node-backed engine DB
+    over the same file. The caller closes it with
+    close_baselined_db(). No network is used anywhere here.
+    """
+    import csv
+    import engine as e
+    tests_dir = Path(__file__).resolve().parent / 'tests'
+    if not (path.name.startswith('test_') and path.suffix == '.sqlite'
+            and path.resolve().parent == tests_dir.resolve()):
+        raise ValueError(
+            'baselined DB path must be tests/test_*.sqlite: %s' % path)
+    if state_dir is None:
+        state_dir = os.environ.get('PAPER_STATE_DIR') or str(
+            Path(tempfile.gettempdir()) / 'render-fixture-state')
+    for folder in ('logs', 'out'):
+        (Path(state_dir) / folder).mkdir(parents=True, exist_ok=True)
+    store = rs.SqliteStore(path)
     rs.migrate(store)
-    conn = sqlite3.connect(path)
-    conn.execute('PRAGMA journal_mode=WAL')
-    conn.execute('PRAGMA busy_timeout=30000')
-    conn.executescript('''
-        CREATE TABLE IF NOT EXISTS paper_signals(
-            id INTEGER PRIMARY KEY, namespace TEXT, bar_date TEXT);
-        CREATE TABLE IF NOT EXISTS paper_fills(
-            id INTEGER PRIMARY KEY, namespace TEXT, filled_at TEXT);
-        CREATE TABLE IF NOT EXISTS paper_positions(
-            id INTEGER PRIMARY KEY, namespace TEXT);
-        CREATE TABLE IF NOT EXISTS paper_meta(
-            key TEXT PRIMARY KEY, value TEXT);
-    ''')
-    day = FIXTURE_COMPLETED_DAY
-    for _ in range(3):
-        conn.execute(
-            'INSERT INTO paper_signals(namespace, bar_date) VALUES(?, ?)',
-            (FIXTURE_LIVE_NS, day))
-    for _ in range(2):
-        conn.execute(
-            'INSERT INTO paper_fills(namespace, filled_at) VALUES(?, ?)',
-            (FIXTURE_LIVE_NS, day + 'T10:00:00'))
-    conn.execute('INSERT INTO paper_positions(namespace) VALUES(?)',
-                 (FIXTURE_LIVE_NS,))
-    conn.execute("INSERT INTO paper_meta(key, value) VALUES('box_heartbeat', ?)",
-                 (day + 'T10:00:00',))
-    conn.execute("INSERT INTO paper_meta(key, value) VALUES('box_started', ?)",
-                 (day + 'T08:00:00',))
-    # Commit the paper-table writes before the store writes its own rows:
-    # the two connections share one file, and an open write transaction on
-    # one blocks the other until its busy timeout.
-    conn.commit()
-    now = day + 'T10:00:00'
-    for key in ('watermark:daily_ohlcv', 'watermark:signals'):
-        store.execute(
-            'INSERT INTO paper_runtime_kv(scope, key, value, updated_at)'
-            ' VALUES(?, ?, ?, ?)',
-            (FIXTURE_LIVE_NS, key, day, now))
-    return store, _SqliteTradingDb(conn), Path(path)
-
-
-def _close_fixture(store, db, path):
-    """Close a fixture's connections and remove its temp file."""
+    db = e.DB(str(path))
+    old_ns = e.NS
     try:
-        db._conn.close()
-    except Exception:
-        pass
+        e.NS = FIXTURE_LIVE_NS
+        e.init(db)
+    finally:
+        e.NS = old_ns
+    # Shared history the bootstrap reads (daily_ohlcv is not created by
+    # engine.init; it is a shared table the sync normally fills).
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute(
+            'CREATE TABLE IF NOT EXISTS daily_ohlcv('
+            'trade_date TEXT NOT NULL, symbol TEXT NOT NULL,'
+            ' open REAL, high REAL, low REAL, close REAL, volume INTEGER,'
+            ' turnover REAL, source TEXT, loaded_at TEXT,'
+            ' PRIMARY KEY(trade_date, symbol))')
+        universe = []
+        with open(Path(__file__).resolve().parent
+                  / 'universe.csv') as fh:
+            universe = [r['db_symbol'] for r in csv.DictReader(fh)][:5]
+        end = datetime.fromisoformat(bar).date()
+        for sym in universe:
+            for b in range(30):
+                d = (end - timedelta(days=b)).isoformat()
+                conn.execute(
+                    'INSERT OR IGNORE INTO daily_ohlcv'
+                    '(trade_date, symbol, open, high, low, close, volume,'
+                    ' turnover, source, loaded_at)'
+                    ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                    (d, sym, 100.0 + b, 101.0 + b, 99.0 + b, 100.5 + b,
+                     1000 + b, 100500.0, 'RENDER_FIXTURE',
+                     bar + 'T10:00:00'))
+        conn.commit()
+        _seed_fixture_rows(conn)
+    finally:
+        conn.close()
+    if baseline:
+        # The box's baseline: real bootstrap for paper_v2 at the bar.
+        rt._run_bootstrap(db, FIXTURE_LIVE_NS, bar)
+    return store, db
+
+
+def _seed_fixture_rows(conn):
+    """Small hand-built live-side rows so trial-compare / trial-purge
+    --fixture have non-trivial data (and the trial side has a monitor
+    history with one heartbeat gap over 60 s)."""
+    day = '2026-11-20'
+    conn.execute(
+        "INSERT OR IGNORE INTO paper_signals(namespace, id, strategy,"
+        " symbol, bar_date, side, status, reason, created_at,"
+        " eligible_date) VALUES"
+        "('paper_v2', 'fix-sig-1', 1, '360ONE-EQ', '2026-11-19', 'BUY',"
+        " 'pending', 'fixture', '2026-11-20T08:45:00', '2026-11-20'),"
+        "('paper_v2', 'fix-sig-2', 2, 'ABB-EQ', '2026-11-19', 'BUY',"
+        " 'pending', 'fixture', '2026-11-20T08:45:00', '2026-11-20'),"
+        "('paper_v2', 'fix-sig-3', 1, 'ACC-EQ', '2026-11-19', 'SELL',"
+        " 'pending', 'fixture', '2026-11-20T08:45:00', '2026-11-20')")
+    conn.execute(
+        "INSERT OR IGNORE INTO paper_fills(namespace, signal_id, strategy,"
+        " symbol, side, qty, price, quote_at, filled_at, reason,"
+        " realized_pnl, cashflow, execution_path) VALUES"
+        "('paper_v2', 'fix-sig-1', 1, '360ONE-EQ', 'BUY', 10, 100.5,"
+        " '2026-11-20T09:30:00', '2026-11-20T09:30:00', 'fixture', 0,"
+        " -1005.0, 'LTP_LEGACY'),"
+        "('paper_v2', 'fix-sig-3', 1, 'ACC-EQ', 'SELL', 5, 200.0,"
+        " '2026-11-20T10:00:00', '2026-11-20T10:00:00', 'fixture', 0,"
+        " 1000.0, 'LTP_LEGACY')")
+    conn.execute(
+        "INSERT OR IGNORE INTO paper_positions(namespace, strategy, symbol,"
+        " qty, entry_price, entry_at, high_water, updated_at) VALUES"
+        "('paper_v2', 1, '360ONE-EQ', 10, 100.5, '2026-11-20T09:30:00',"
+        " 101.0, '2026-11-20T09:30:00')")
+    conn.execute(
+        "INSERT OR IGNORE INTO paper_scan_batches(namespace, bar_date,"
+        " scanned_at, status, report_json) VALUES"
+        "('paper_v2', '2026-11-19', '2026-11-20T08:45:00', 'ok', '{}')")
+    conn.execute(
+        "INSERT OR IGNORE INTO paper_eod(namespace, day, as_of,"
+        " report_json) VALUES"
+        "('paper_v2', '2026-11-20', '2026-11-20T16:10:00', '{}')")
+    for i, at in enumerate(('2026-11-20T10:00:00', '2026-11-20T11:00:00')):
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_events(namespace, event_id,"
+            " run_id, session_day, source_at, recorded_at, event_type,"
+            " severity, outcome, data_json) VALUES"
+            "('paper_v2', ?, 'fixrun', '2026-11-20', ?, ?,"
+            " 'fixture_error', 'ERROR', 'failed', '{}')",
+            ('%032x' % (i + 1), at, at))
+    for at in ('2026-11-20T09:15:00', '2026-11-20T09:15:30',
+               '2026-11-20T09:17:30'):
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_runs(namespace, kind, at, status,"
+            " details_json) VALUES"
+            "('paper_render_trial_v1', 'monitor', ?, 'ok', '{}')", (at,))
+    for at in ('2026-11-20T09:15:00', '2026-11-20T09:15:30'):
+        conn.execute(
+            "INSERT OR IGNORE INTO paper_runs(namespace, kind, at, status,"
+            " details_json) VALUES"
+            "('paper_v2', 'monitor', ?, 'ok', '{}')", (at,))
+    conn.commit()
+
+
+def close_baselined_db(store, path):
+    """Close a DB built by build_baselined_db and remove its files."""
     try:
         store.close()
     except Exception:
         pass
-    try:
-        os.unlink(path)
-    except Exception:
-        pass
+    for suffix in ('', '-wal', '-shm', '-journal'):
+        try:
+            os.unlink(str(path) + suffix)
+        except Exception:
+            pass
+
+
+def _fixture_db(baseline=True):
+    """Build the gate fixture: a temp SQLite DB with the render state
+    schema, the full paper schema, seeded history and a paper_v2
+    baseline at bar FIXTURE_COMPLETED_DAY (baseline=True, the
+    trial-init fixture), plus hand-built live-side rows for compare /
+    purge. Returns (store, trading_db, tmp_path)."""
+    fd, raw = tempfile.mkstemp(
+        dir=Path(__file__).resolve().parent / 'tests',
+        prefix='test_render_fixture_', suffix='.sqlite')
+    os.close(fd)
+    path = Path(raw)
+    store, db = build_baselined_db(path, FIXTURE_COMPLETED_DAY,
+                                   baseline=baseline)
+    return store, db, path
+
+
+def _close_fixture(store, db, path):
+    """Close a fixture's connections and remove its temp file."""
+    close_baselined_db(store, path)
 
 
 def _count_namespace_rows(store, db, namespace):
@@ -191,50 +268,57 @@ def _trial_namespace(args):
 
 
 def cmd_trial_init(args):
+    """Real trial-init: --bar is required; the namespace is refused
+    (exit 3) before any DB write, a missing bar exits 2 with usage and
+    writes nothing, an invalid bar exits 2, a watermark mismatch exits 2.
+    """
+    namespace = _trial_namespace(args)
+    if not rt.is_trial_namespace(namespace):
+        raise rt.NamespaceRefused(
+            'trial-init refuses non-trial namespace %s' % namespace)
     if getattr(args, 'fixture', False):
         return _cmd_trial_init_fixture(args)
-    out = rt.init_trial(_store(), _trial_namespace(args))
+    if not args.bar:
+        print('usage: trial-init --namespace %s --bar YYYY-MM-DD'
+              % namespace, file=sys.stderr)
+        print('trial-init needs --bar (a verified completed NSE session)',
+              file=sys.stderr)
+        return 2
+    try:
+        out = rt.init_trial(_store(), _trading_db(), namespace, args.bar)
+    except rt.BarRefused as ex:
+        print('trial-init refuses bar: %s' % ex, file=sys.stderr)
+        return 2
     _print(out)
-    return 0
+    return 0 if out['watermarks_match_paper_v2'] else 2
 
 
 def _cmd_trial_init_fixture(args):
-    """Trial-init against the gate fixture: a paper_v2 baseline at bar
-    FIXTURE_COMPLETED_DAY. Copies the paper_v2 watermarks into the trial
-    namespace and verifies they match. A bar later than the fixture's
-    latest completed day is refused (non-zero exit)."""
+    """Trial-init against the gate fixture: the same init_trial function
+    as the real path, only the store/DB differ (a fresh fixture DB with
+    a paper_v2 baseline at FIXTURE_COMPLETED_DAY)."""
     namespace = _trial_namespace(args)
-    bar = args.bar or FIXTURE_COMPLETED_DAY
-    if bar > FIXTURE_COMPLETED_DAY:
-        print('trial-init refuses bar %s: later than the latest completed'
-              ' day %s' % (bar, FIXTURE_COMPLETED_DAY), file=sys.stderr)
-        return 1
-    store, _db, _path = _fixture_db()
+    if not rt.is_trial_namespace(namespace):
+        raise rt.NamespaceRefused(
+            'trial-init refuses non-trial namespace %s' % namespace)
+    if not args.bar:
+        print('usage: trial-init --namespace %s --bar YYYY-MM-DD'
+              % namespace, file=sys.stderr)
+        print('trial-init needs --bar (a verified completed NSE session)',
+              file=sys.stderr)
+        return 2
+    store, db, _path = _fixture_db(baseline=True)
     try:
-        out = rt.init_trial(store, namespace)
-        watermarks = {}
-        for row in store.execute(
-                "SELECT key, value FROM paper_runtime_kv"
-                " WHERE scope=? AND key LIKE 'watermark:%'",
-                (FIXTURE_LIVE_NS,)):
-            watermarks[row['key']] = row['value']
-        now = FIXTURE_COMPLETED_DAY + 'T10:00:00'
-        for key, value in watermarks.items():
-            store.execute(
-                'INSERT INTO paper_runtime_kv(scope, key, value, updated_at)'
-                ' VALUES(?, ?, ?, ?)'
-                ' ON CONFLICT(scope, key) DO UPDATE SET value=excluded.value,'
-                ' updated_at=excluded.updated_at',
-                (namespace, key, value, now))
-        back = {row['key']: row['value'] for row in store.execute(
-            "SELECT key, value FROM paper_runtime_kv"
-            " WHERE scope=? AND key LIKE 'watermark:%'", (namespace,))}
-        out.update({'bar': bar, 'watermarks': watermarks,
-                    'watermarks_match_paper_v2': back == watermarks})
+        try:
+            out = rt.init_trial(store, db, namespace, args.bar,
+                                latest_completed_day=FIXTURE_COMPLETED_DAY)
+        except rt.BarRefused as ex:
+            print('trial-init refuses bar: %s' % ex, file=sys.stderr)
+            return 2
         _print(out)
-        return 0
+        return 0 if out['watermarks_match_paper_v2'] else 2
     finally:
-        _close_fixture(store, _db, _path)
+        _close_fixture(store, db, _path)
 
 
 def cmd_trial_compare(args):
@@ -242,7 +326,7 @@ def cmd_trial_compare(args):
     if not day:
         day = datetime.now(IST).date().isoformat()
     if getattr(args, 'fixture', False):
-        store, db, _path = _fixture_db()
+        store, db, _path = _fixture_db(baseline=False)
         try:
             out = rt.compare_trial(db, _trial_namespace(args),
                                    args.live or 'paper_v2', day)
@@ -270,7 +354,7 @@ def _cmd_trial_purge_fixture(args):
     (nothing is deleted); with --yes it purges the trial namespace and
     proves no other namespace changed."""
     namespace = _trial_namespace(args)
-    store, db, _path = _fixture_db()
+    store, db, _path = _fixture_db(baseline=False)
     try:
         if not args.yes:
             counts = _count_namespace_rows(store, db, namespace)
