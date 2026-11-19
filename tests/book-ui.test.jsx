@@ -103,6 +103,13 @@ describe('book switch and archive banner', () => {
 });
 
 describe('empty live book renders clear text, never NaN/undefined/Infinity', () => {
+  it('stock detail labels follow the book', async () => {
+    mockNetwork({ov: emptyOverview});
+    window.history.replaceState(null, '', '/stock/RELIANCE');
+    render(<Portal/>);
+    await screen.findByText('Searched every paper_v2 fill read.');
+    expect(screen.getByText('Open positions in this stock')).not.toBeNull();
+  });
   it.each(['/paper', '/strategy-tester', '/strategy-comparison', '/performance', '/stock/RELIANCE'])('empty %s', async (path) => {
     mockNetwork({ov: emptyOverview});
     window.history.replaceState(null, '', path);
