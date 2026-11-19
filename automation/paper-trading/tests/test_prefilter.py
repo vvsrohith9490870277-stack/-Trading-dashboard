@@ -78,6 +78,8 @@ class CalculationTests(unittest.TestCase):
 class EntryGuardTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):fixtures.PaperTests.setUpClass.__func__(cls)
+ @classmethod
+ def tearDownClass(cls):fixtures.PaperTests.tearDownClass.__func__(cls)
  setUp=fixtures.PaperTests.setUp;seed_adv=fixtures.PaperTests.seed_adv;signal=fixtures.PaperTests.signal;quote=fixtures.PaperTests.quote
  def test_all_seven_entries_fail_closed_without_proofs(self):
   for strategy in range(1,8):

@@ -138,9 +138,17 @@ class RuntimeDepsTests(unittest.TestCase):
         if not rd.venv_python().is_file():
             self.skipTest('runtime venv (rd.venv_python) only exists on the owner box; runtime_deps.ok is False without it')
         db=e.DB(str(e.ROOT/'tests'/'test_runtime_health_')+os.urandom(4).hex()+'.sqlite');e.init(db)
-        h=e.au.health(e,db)
-        self.assertIn('runtime_deps',h)
-        self.assertIn('ok',h['runtime_deps'])
-        self.assertTrue(h['runtime_deps']['ok'])
+        try:
+         h=e.au.health(e,db)
+         self.assertIn('runtime_deps',h)
+         self.assertIn('ok',h['runtime_deps'])
+         self.assertTrue(h['runtime_deps']['ok'])
+        finally:
+         # Unlink even when the test fails (it does on this VM: runtime_deps ok False),
+         # or a failing test leaves its DB behind.
+         try:db.close_helper()
+         except Exception:pass
+         p=Path(db.test_database);p.unlink(missing_ok=True)
+         for suffix in ('-wal','-shm','-journal'):Path(str(p)+suffix).unlink(missing_ok=True)
 
 if __name__=='__main__':unittest.main()

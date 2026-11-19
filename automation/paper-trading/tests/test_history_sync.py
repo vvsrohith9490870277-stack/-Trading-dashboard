@@ -30,6 +30,10 @@ class HistorySyncTests(unittest.TestCase):
         self.api=API()
     def tearDown(self):
         e.now=self.prev_now
+        try:self.db.close_helper()
+        except Exception:pass
+        p=Path(self.db.test_database);p.unlink(missing_ok=True)
+        for suffix in ('-wal','-shm','-journal'):Path(str(p)+suffix).unlink(missing_ok=True)
     def test_skips_symbols_already_at_target(self):
         self.db.batch([('INSERT INTO daily_ohlcv(trade_date,symbol,open,high,low,close,volume,turnover,source,loaded_at) VALUES(?,?,?,?,?,?,?,?,?,?)',
                         ('2026-11-11','AAA-EQ',10,11,9,10,100,1000,'FIX',T.isoformat()))])

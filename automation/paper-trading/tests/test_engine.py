@@ -9,6 +9,16 @@ class PaperTests(unittest.TestCase):
  def setUpClass(cls):
   cls.db=e.DB(str(e.ROOT/'tests'/'test_')+uuid.uuid4().hex+'.sqlite');e.NS='test_fixture';e.init(cls.db)
   cls.db.batch([('CREATE TABLE daily_ohlcv(symbol TEXT,trade_date TEXT,close REAL,volume REAL,turnover REAL)',())]);e.now=lambda:T
+ @classmethod
+ def tearDownClass(cls):
+  # A file-backed test DB must not survive the run: stop the helper, then remove the file
+  # (and any WAL/journal sidecars). Every class that reuses this setUpClass inherits this.
+  db=getattr(cls,'db',None)
+  if db is None:return
+  try:db.close_helper()
+  except Exception:pass
+  p=Path(db.test_database);p.unlink(missing_ok=True)
+  for suffix in ('-wal','-shm','-journal'):Path(str(p)+suffix).unlink(missing_ok=True)
  def setUp(self):e.NS='test_'+uuid.uuid4().hex;e.now=lambda:T;self.db.batch([('DELETE FROM paper_corporate_actions',()),('DELETE FROM paper_price_bands',())])
  def seed_adv(self,symbol,turnover,sessions=40):
   self.db.batch([('DELETE FROM daily_ohlcv WHERE symbol=?',(symbol,))])

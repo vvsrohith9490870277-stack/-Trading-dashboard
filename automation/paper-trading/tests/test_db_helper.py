@@ -28,7 +28,7 @@ class HelperTests(unittest.TestCase):
   fixtures.PaperTests.setUpClass.__func__(cls)
   cls.tmp=tempfile.TemporaryDirectory();cls.fake=Path(cls.tmp.name)/'fake_helper.py';cls.fake.write_text(FAKE)
  @classmethod
- def tearDownClass(cls):cls.tmp.cleanup()
+ def tearDownClass(cls):cls.tmp.cleanup();fixtures.PaperTests.tearDownClass.__func__(cls)
  setUp=fixtures.PaperTests.setUp
  def real(self,**over):
   self.calls=[];base=e.DB(self.db.test_database)

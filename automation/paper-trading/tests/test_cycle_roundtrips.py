@@ -12,6 +12,8 @@ class Feed:
 class CycleRoundTripTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):fixtures.PaperTests.setUpClass.__func__(cls)
+ @classmethod
+ def tearDownClass(cls):fixtures.PaperTests.tearDownClass.__func__(cls)
  setUp=fixtures.PaperTests.setUp;seed_adv=fixtures.PaperTests.seed_adv;signal=fixtures.PaperTests.signal;quote=fixtures.PaperTests.quote
  def open_position(self,price=100):
   self.assertTrue(e.fill(self.db,self.signal(),self.quote(price),T)['filled'])
