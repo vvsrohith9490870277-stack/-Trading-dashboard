@@ -1,10 +1,11 @@
+import {ACTIVE_BOOK, isBook} from './books.mjs';
 import {cappedLedger,PUBLIC_LABELS} from './capped-ledger.mjs';
 import {readAutomation} from './automation-read.mjs';
 import {DEMO_NAMESPACE,DEMO_SELECT} from './demo-read.mjs';
 import {createClient} from '@libsql/client/web';
 import {loadExitInputs,planFor,pauseStates,pauseFor,entryPlan,entryCosts,entrySignals,positionMoney} from './exit-plan.mjs';
 import {readLedgerView,runHealth,runSummary,enrichFills,industryOf,LEDGER_VIEWS,SIGNAL_STATUSES,RUN_KINDS,STRATEGY_VIEWS} from './ledger-read.mjs';
-export const NAMESPACE='paper_v1';
+export const NAMESPACE=ACTIVE_BOOK;
 export const IST='Asia/Kolkata';
 export function istDay(value=new Date()){return new Intl.DateTimeFormat('en-CA',{timeZone:IST,year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(value));}
 export function numeric(value){if(value===null||value===undefined||value==='')return null;const n=Number(value);return Number.isFinite(n)?n:null;}
@@ -33,27 +34,28 @@ export function parseOptions(query={}){
  if(['scan','analytics','qualifiers'].includes(view)&&scope!=='all'||['scan','analytics','prefilter'].includes(view)&&strategy!==null)throw new Error('BAD_REQUEST');
  if(view==='qualifiers'&&strategy===null)throw new Error('BAD_REQUEST');
  const q=query.q;if(q!==undefined&&(!['qualifiers','prefilter'].includes(view)||typeof q!=='string'||q.length>60||!/^[A-Za-z0-9&_. -]*$/.test(q)))throw new Error('BAD_REQUEST');
- const allowed=new Set(['q','view','page','limit','strategy','scope','symbol','refresh','status','kind','accepted']);if(Object.keys(query).some(k=>!allowed.has(k)))throw new Error('BAD_REQUEST');
+ const allowed=new Set(['q','view','page','limit','strategy','scope','symbol','refresh','status','kind','accepted','book']);if(Object.keys(query).some(k=>!allowed.has(k)))throw new Error('BAD_REQUEST');
  // Tab filters: each is bound to exactly one view and a fixed enum.
  const status=query.status,kind=query.kind,accepted=query.accepted;
  if(status!==undefined&&(view!=='signals'||!SIGNAL_STATUSES.includes(status)))throw new Error('BAD_REQUEST');
  if(kind!==undefined&&(view!=='runs'||!RUN_KINDS.includes(kind)))throw new Error('BAD_REQUEST');
  if(accepted!==undefined&&(view!=='quotes'||!['0','1'].includes(accepted)))throw new Error('BAD_REQUEST');
  if(LEDGER_VIEWS.includes(view)&&strategy!==null&&!STRATEGY_VIEWS.includes(view))throw new Error('BAD_REQUEST');
- return {view,page,limit,strategy,scope,...(q?{q}:{}),...(symbol?{symbol}:{}),...(status?{status}:{}),...(kind?{kind}:{}),...(accepted?{accepted:Number(accepted)}:{}),...(refresh==='1'?{forceRefresh:true}:{})};
+ const book=query.book;if(book!==undefined&&!isBook(book))throw new Error('BAD_REQUEST');
+ return {view,page,limit,strategy,scope,book:book??ACTIVE_BOOK,...(q?{q}:{}),...(symbol?{symbol}:{}),...(status?{status}:{}),...(kind?{kind}:{}),...(accepted?{accepted:Number(accepted)}:{}),...(refresh==='1'?{forceRefresh:true}:{})};
 }
 let client;
 export function readConfig(env=process.env){
  const clean=v=>String(v??'').trim().replace(/^(["'])(.*)\1$/s,'$2').trim();
- const namespace=clean(env.PAPER_NAMESPACE)||NAMESPACE,url=clean(env.TURSO_DATABASE_URL),authToken=clean(env.TURSO_AUTH_TOKEN);
- if(namespace!==NAMESPACE)throw new Error('CONFIG_NAMESPACE');
+ const namespace=clean(env.PAPER_NAMESPACE),url=clean(env.TURSO_DATABASE_URL),authToken=clean(env.TURSO_AUTH_TOKEN);
+ if(namespace&&!isBook(namespace))throw new Error('CONFIG_NAMESPACE');
  if(!url)throw new Error('CONFIG_MISSING_URL');if(!authToken)throw new Error('CONFIG_MISSING_TOKEN');
  if(!/^(libsql|https):\/\/[^\s]+$/.test(url))throw new Error('CONFIG_URL_INVALID');
  return {url,authToken};
 }
 function getClient(){const config=readConfig();return client??=createClient(config);}
 export function publicError(error){
- const messages={CONFIG_MISSING_URL:'Server setup needed: TURSO_DATABASE_URL is missing.',CONFIG_MISSING_TOKEN:'Server setup needed: TURSO_AUTH_TOKEN is missing.',CONFIG_NAMESPACE:'Server setup needed: PAPER_NAMESPACE must be paper_v1.',CONFIG_URL_INVALID:'Server setup needed: TURSO_DATABASE_URL is not a valid libsql:// or https:// address.'};
+ const messages={CONFIG_MISSING_URL:'Server setup needed: TURSO_DATABASE_URL is missing.',CONFIG_MISSING_TOKEN:'Server setup needed: TURSO_AUTH_TOKEN is missing.',CONFIG_NAMESPACE:'Server setup needed: PAPER_NAMESPACE, when set, must be paper_v2 or paper_v1.',CONFIG_URL_INVALID:'Server setup needed: TURSO_DATABASE_URL is not a valid libsql:// or https:// address.'};
  if(messages[error.message])return {code:error.message,message:messages[error.message]};
  const code=String(error.code??''),message=String(error.message??'');
  if(/UNAUTHORIZED|AUTH_TOKEN|AUTHENTICATION|TOKEN_EXPIRED|FORBIDDEN/.test(code)||/HTTP_STATUS_(401|403)/.test(code)||/\b(401|403)\b|not authorized|invalid auth token|authentication failed/i.test(message))return {code:'DB_AUTH_REJECTED',message:'Turso rejected the server credential. Replace the server-only read token and redeploy.'};
@@ -64,15 +66,16 @@ export function publicError(error){
 export async function readDashboard(options,execute,now=new Date()){
  const run=execute??(async(sql,args)=>(await getClient().execute({sql,args})).rows);
  const select=(sql,args=[])=>{if(!/^SELECT\s/i.test(sql))throw new Error('READ_ONLY_GUARD');return run(sql,args);};
- const day=istDay(now),ns=[NAMESPACE];
- if(['analytics','scan','qualifiers','prefilter'].includes(options.view)){try{return await readAutomation({...options,day},select,now);}catch(error){const e=publicError(error);return {readAt:now.toISOString(),namespace:NAMESPACE,available:false,error:e};}}
- if(options.view==='demo'){if(options.strategy!==null)throw new Error('BAD_REQUEST');const rows=await select(DEMO_SELECT,[DEMO_NAMESPACE]);return {readAt:now.toISOString(),namespace:NAMESPACE,demoNamespace:DEMO_NAMESPACE,excludedFromPerformance:true,rows};}
+ const book=options.book??ACTIVE_BOOK;
+ const day=istDay(now),ns=[book];
+ if(['analytics','scan','qualifiers','prefilter'].includes(options.view)){try{return await readAutomation({...options,day,book},select,now);}catch(error){const e=publicError(error);return {readAt:now.toISOString(),namespace:book,book,isArchive:book!==ACTIVE_BOOK,available:false,error:e};}}
+ if(options.view==='demo'){if(options.strategy!==null)throw new Error('BAD_REQUEST');const rows=await select(DEMO_SELECT,[DEMO_NAMESPACE]);return {readAt:now.toISOString(),namespace:book,book,isArchive:book!==ACTIVE_BOOK,demoNamespace:DEMO_NAMESPACE,excludedFromPerformance:true,rows};}
  if(options.view==='history'){
-  const raw=await select('SELECT quote_at,price FROM paper_quote_audit WHERE namespace=? AND symbol=? AND accepted=1 AND price>0 AND quote_at IS NOT NULL ORDER BY quote_at DESC,id DESC LIMIT 60',[NAMESPACE,options.symbol]);
+  const raw=await select('SELECT quote_at,price FROM paper_quote_audit WHERE namespace=? AND symbol=? AND accepted=1 AND price>0 AND quote_at IS NOT NULL ORDER BY quote_at DESC,id DESC LIMIT 60',[book,options.symbol]);
   const seen=new Set();const rows=raw.filter(r=>{if(seen.has(r.quote_at))return false;seen.add(r.quote_at);return numeric(r.price)>0;}).reverse();
-  return {readAt:now.toISOString(),namespace:NAMESPACE,symbol:options.symbol,source:'Accepted recorded Fyers quotes',rows};
+  return {readAt:now.toISOString(),namespace:book,book,isArchive:book!==ACTIVE_BOOK,symbol:options.symbol,source:'Accepted recorded Fyers quotes',rows};
  }
- if(LEDGER_VIEWS.includes(options.view)){if(options.strategy!==null&&!STRATEGY_VIEWS.includes(options.view))throw new Error('BAD_REQUEST');return {readAt:now.toISOString(),namespace:NAMESPACE,view:options.view,market:marketState(now),...await readLedgerView({...options,namespace:NAMESPACE},select,day,publicRows)};}
+ if(LEDGER_VIEWS.includes(options.view)){if(options.strategy!==null&&!STRATEGY_VIEWS.includes(options.view))throw new Error('BAD_REQUEST');return {readAt:now.toISOString(),namespace:book,book,isArchive:book!==ACTIVE_BOOK,view:options.view,market:marketState(now),...await readLedgerView({...options,namespace:book},select,day,publicRows)};}
  if(options.view!=='overview'){
   const definitions={
    fills:{table:'paper_fills',fields:'id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl,cashflow',order:'filled_at DESC,id DESC',date:'filled_at'},
@@ -93,29 +96,29 @@ export async function readDashboard(options,execute,now=new Date()){
   const extra={positions:',pending_exit,pending_exit_since',fills:',execution_path'}[options.view];
   const readRows=async()=>{if(!extra)return select(rowsSql(d.fields),pageArgs);try{return await select(rowsSql(d.fields+extra),pageArgs);}catch(e){if(/no such column/i.test(String(e?.message??'')))return select(rowsSql(d.fields),pageArgs);throw e;}};
   const [counts,rows]=await Promise.all([select(`SELECT COUNT(*) AS total FROM ${d.table} WHERE ${where}`,args),readRows()]);
-  const base={readAt:now.toISOString(),namespace:NAMESPACE,view:options.view,market:marketState(now),page:options.page,limit:options.limit,total:Number(counts[0].total)};
+  const base={readAt:now.toISOString(),namespace:book,book,isArchive:book!==ACTIVE_BOOK,view:options.view,market:marketState(now),page:options.page,limit:options.limit,total:Number(counts[0].total)};
   if(options.view==='positions'){
    // Stop / target / exit rule per position: S7 trail = trail_level(high_water) from config TRAIL; S1-6 rule levels only from stored completed bars.
-   const views=rows.map(r=>positionView(r,now.getTime()));const [inputs,pauses,costs,entries]=await Promise.all([loadExitInputs(select,NAMESPACE,views),pauseStates(select,NAMESPACE),entryCosts(select,NAMESPACE,views),entrySignals(select,NAMESPACE,views)]);
+   const views=rows.map(r=>positionView(r,now.getTime()));const [inputs,pauses,costs,entries]=await Promise.all([loadExitInputs(select,book,views),pauseStates(select,book),entryCosts(select,book,views),entrySignals(select,book,views)]);
    return {...base,pausesAvailable:pauses.available,rows:views.map(v=>{const {pending_exit,pending_exit_since,...p}=v;return {...p,industry:industryOf(v.symbol),pending_exit:pending_exit===undefined||pending_exit===null?null:Number(pending_exit)===1,pending_exit_since:typeof pending_exit_since==='string'?pending_exit_since:null,exit_plan:planFor(v,inputs),entry_pause:pauseFor(pauses,v.strategy),...positionMoney(v,costs,now.getTime()),entry_signal:entries.get(`${Number(v.strategy)}|${v.symbol}|${v.entry_at}`)??null};})};
   }
-  if(options.view==='runs'){const health=await runHealth(select,NAMESPACE);return {...base,health:{...health,latestByKind:publicRows(health.latestByKind)},rows:publicRows(rows.map(({details_json,...r})=>({...r,summary:runSummary(details_json)})))};}
-  if(options.view==='fills'){const e=await enrichFills(select,NAMESPACE,publicRows(rows));return {...base,...e};}
+  if(options.view==='runs'){const health=await runHealth(select,book);return {...base,health:{...health,latestByKind:publicRows(health.latestByKind)},rows:publicRows(rows.map(({details_json,...r})=>({...r,summary:runSummary(details_json)})))};}
+  if(options.view==='fills'){const e=await enrichFills(select,book,publicRows(rows));return {...base,...e};}
   if(options.view==='signals'){
    // Attach the fill (qty/price/time) that executed each signal, when one exists.
    const ids=rows.map(r=>r.id).filter(Boolean);let fills=[];
-   if(ids.length)fills=await select(`SELECT signal_id,qty,price,filled_at FROM paper_fills WHERE namespace=? AND signal_id IN (${ids.map(()=>'?').join(',')})`,[NAMESPACE,...ids]);
+   if(ids.length)fills=await select(`SELECT signal_id,qty,price,filled_at FROM paper_fills WHERE namespace=? AND signal_id IN (${ids.map(()=>'?').join(',')})`,[book,...ids]);
    const byId=new Map(fills.map(f=>[f.signal_id,f]));
    // Pending orders: exits carry the held position's current stop / rule level; entries carry the policy sizing context and the signal-bar close.
    // Current price for each order's stock: the latest accepted recorded quote (never fetched live here).
    const qs=[...new Set(rows.map(r=>r.symbol))];const lastQuote=new Map();
-   if(qs.length)for(const q of await select(`SELECT q.symbol,q.price,q.quote_at FROM paper_quote_audit q WHERE q.namespace=? AND q.accepted=1 AND q.price>0 AND q.symbol IN (${qs.map(()=>'?').join(',')}) AND q.id=(SELECT MAX(m.id) FROM paper_quote_audit m WHERE m.namespace=q.namespace AND m.symbol=q.symbol AND m.accepted=1 AND m.price>0)`,[NAMESPACE,...qs]))lastQuote.set(q.symbol,{price:numeric(q.price),quote_at:q.quote_at??null});
+   if(qs.length)for(const q of await select(`SELECT q.symbol,q.price,q.quote_at FROM paper_quote_audit q WHERE q.namespace=? AND q.accepted=1 AND q.price>0 AND q.symbol IN (${qs.map(()=>'?').join(',')}) AND q.id=(SELECT MAX(m.id) FROM paper_quote_audit m WHERE m.namespace=q.namespace AND m.symbol=q.symbol AND m.accepted=1 AND m.price>0)`,[book,...qs]))lastQuote.set(q.symbol,{price:numeric(q.price),quote_at:q.quote_at??null});
    const pend=rows.filter(r=>r.status==='pending');let held=[],plans=new Map(),closes=new Map(),pauses={available:false,rows:[]};
    if(pend.length){
     const sells=pend.filter(r=>r.side==='SELL'),buys=pend.filter(r=>r.side==='BUY');
-    if(sells.length){const syms=[...new Set(sells.map(r=>r.symbol))];held=(await select(`SELECT strategy,symbol,qty,entry_price,entry_at,high_water,mark_price,mark_at,updated_at FROM paper_positions WHERE namespace=? AND qty>0 AND symbol IN (${syms.map(()=>'?').join(',')})`,[NAMESPACE,...syms])).map(r=>positionView(r,now.getTime()));const inputs=await loadExitInputs(select,NAMESPACE,held);plans=new Map(held.map(p=>[`${p.strategy}|${p.symbol}`,planFor(p,inputs)]));}
-    if(buys.length){try{const bs=[...new Set(buys.map(r=>r.symbol))],bd=[...new Set(buys.map(r=>r.bar_date))];const q=await select(`SELECT strategy,symbol,bar_date,plan_json FROM paper_qualifier_states WHERE namespace=? AND symbol IN (${bs.map(()=>'?').join(',')}) AND bar_date IN (${bd.map(()=>'?').join(',')})`,[NAMESPACE,...bs,...bd]);for(const r of q){let plan={};try{plan=JSON.parse(r.plan_json);}catch{/* unreadable plan stays unavailable */}closes.set(`${r.strategy}|${r.symbol}|${r.bar_date}`,plan&&typeof plan==='object'?plan:{});}}catch(e){if(!/no such (table|column)/i.test(String(e?.message??'')))throw e;}}
-    pauses=await pauseStates(select,NAMESPACE);
+    if(sells.length){const syms=[...new Set(sells.map(r=>r.symbol))];held=(await select(`SELECT strategy,symbol,qty,entry_price,entry_at,high_water,mark_price,mark_at,updated_at FROM paper_positions WHERE namespace=? AND qty>0 AND symbol IN (${syms.map(()=>'?').join(',')})`,[book,...syms])).map(r=>positionView(r,now.getTime()));const inputs=await loadExitInputs(select,book,held);plans=new Map(held.map(p=>[`${p.strategy}|${p.symbol}`,planFor(p,inputs)]));}
+    if(buys.length){try{const bs=[...new Set(buys.map(r=>r.symbol))],bd=[...new Set(buys.map(r=>r.bar_date))];const q=await select(`SELECT strategy,symbol,bar_date,plan_json FROM paper_qualifier_states WHERE namespace=? AND symbol IN (${bs.map(()=>'?').join(',')}) AND bar_date IN (${bd.map(()=>'?').join(',')})`,[book,...bs,...bd]);for(const r of q){let plan={};try{plan=JSON.parse(r.plan_json);}catch{/* unreadable plan stays unavailable */}closes.set(`${r.strategy}|${r.symbol}|${r.bar_date}`,plan&&typeof plan==='object'?plan:{});}}catch(e){if(!/no such (table|column)/i.test(String(e?.message??'')))throw e;}}
+    pauses=await pauseStates(select,book);
    }
    return {...base,rows:publicRows(rows).map(r=>{const f=byId.get(r.id);const lq=lastQuote.get(r.symbol);const out={...r,fill_qty:f?numeric(f.qty):null,fill_price:f?numeric(f.price):null,filled_at:f?.filled_at??null,current_price:lq?.price??null,current_quote_at:lq?.quote_at??null};
     if(r.status!=='pending')return out;const k=`${r.strategy}|${r.symbol}`;
@@ -126,7 +129,7 @@ export async function readDashboard(options,execute,now=new Date()){
   return {...base,rows:publicRows(rows)};
  }
  const [totals,positions,pnl,performance,recentFills,recentSignals,lastRuns,audit,coverage,closedStats,demoTrades]=await Promise.all([
-  select("SELECT COUNT(*) AS filled_orders,COALESCE(SUM(realized_pnl),0) AS realized,COALESCE(SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END),0) AS closed_trades,COALESCE(SUM(CASE WHEN date(filled_at,'+5 hours','+30 minutes')=? THEN 1 ELSE 0 END),0) AS today_fills FROM paper_fills WHERE namespace=?",[day,NAMESPACE]),
+  select("SELECT COUNT(*) AS filled_orders,COALESCE(SUM(realized_pnl),0) AS realized,COALESCE(SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END),0) AS closed_trades,COALESCE(SUM(CASE WHEN date(filled_at,'+5 hours','+30 minutes')=? THEN 1 ELSE 0 END),0) AS today_fills FROM paper_fills WHERE namespace=?",[day,book]),
   select('SELECT strategy,symbol,qty,entry_price,entry_at,high_water,mark_price,mark_at,updated_at FROM paper_positions WHERE namespace=? AND qty>0 ORDER BY strategy,symbol LIMIT 5000',ns),
   select('SELECT day,as_of,report_json FROM paper_pnl WHERE namespace=? ORDER BY day DESC LIMIT 366',ns),
   select("SELECT strategy,SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END) AS closed_trades,SUM(CASE WHEN side='SELL' AND realized_pnl>0 THEN 1 ELSE 0 END) AS wins,COALESCE(SUM(realized_pnl),0) AS realized FROM paper_fills WHERE namespace=? GROUP BY strategy ORDER BY strategy",ns),
@@ -134,13 +137,13 @@ export async function readDashboard(options,execute,now=new Date()){
   select('SELECT strategy,symbol,bar_date,side,status,reason,created_at,eligible_date FROM paper_signals WHERE namespace=? ORDER BY created_at DESC LIMIT 12',ns),
   select('SELECT kind,at,status FROM paper_runs WHERE namespace=? ORDER BY at DESC,id DESC LIMIT 10',ns),
   select('SELECT symbol,observed_at,quote_at,price,accepted,reason,source FROM paper_quote_audit WHERE namespace=? ORDER BY observed_at DESC,id DESC LIMIT 8',ns),
-  select("SELECT (SELECT COUNT(*) FROM paper_watermarks WHERE namespace=?) AS watermarks,(SELECT COUNT(*) FROM paper_data_audit WHERE namespace=?) AS excluded_bars,(SELECT COUNT(*) FROM paper_signals WHERE namespace=? AND status='pending') AS pending_signals,(SELECT COUNT(*) FROM paper_signals WHERE namespace=? AND date(created_at,'+5 hours','+30 minutes')=?) AS signals_today",[NAMESPACE,NAMESPACE,NAMESPACE,NAMESPACE,day]),
+  select("SELECT (SELECT COUNT(*) FROM paper_watermarks WHERE namespace=?) AS watermarks,(SELECT COUNT(*) FROM paper_data_audit WHERE namespace=?) AS excluded_bars,(SELECT COUNT(*) FROM paper_signals WHERE namespace=? AND status='pending') AS pending_signals,(SELECT COUNT(*) FROM paper_signals WHERE namespace=? AND date(created_at,'+5 hours','+30 minutes')=?) AS signals_today",[book,book,book,book,day]),
   select("SELECT COUNT(*) AS closed_count,SUM(CASE WHEN s.realized_pnl>0 THEN 1 ELSE 0 END) AS wins,AVG(julianday(s.filled_at)-julianday((SELECT b.filled_at FROM paper_fills b WHERE b.namespace=s.namespace AND b.strategy=s.strategy AND b.symbol=s.symbol AND b.side='BUY' AND b.id<s.id ORDER BY b.id DESC LIMIT 1))) AS average_hold_days,COUNT((SELECT b.id FROM paper_fills b WHERE b.namespace=s.namespace AND b.strategy=s.strategy AND b.symbol=s.symbol AND b.side='BUY' AND b.id<s.id ORDER BY b.id DESC LIMIT 1)) AS matched_closures FROM paper_fills s WHERE s.namespace=? AND s.side='SELL'",ns),
   select(DEMO_SELECT,[DEMO_NAMESPACE])
  ]);
- const capped=await cappedLedger(select,NAMESPACE,positions);
+ const capped=await cappedLedger(select,book,positions);
  const pos=positions.map(r=>positionView(r,now.getTime()));const unrealized=pos.some(r=>r.unrealized_pnl===null)?null:pos.reduce((a,r)=>a+r.unrealized_pnl,0);
  const reports=pnl.map(r=>{let d={};try{d=JSON.parse(r.report_json);}catch{/* Corrupt snapshots stay unavailable. */}return {day:r.day,asOf:r.as_of,daily:numeric(d.daily_mark_to_market_pnl_INR),total:numeric(d.latest_known_total_pnl_INR),realizedClosuresToday:numeric(d.realized_on_closures_today_INR),valuationIsLive:d.valuation_is_live===true,missingDailyBasis:d.missing_daily_basis_symbols??[]};});
  const latest=reports[0]??null,today=latest?.day===day?latest:null,realized=numeric(totals[0].realized);
- return {readAt:now.toISOString(),namespace:NAMESPACE,day,market:marketState(now),cappedLedger:capped,publicLabels:PUBLIC_LABELS,totals:{filledOrders:Number(totals[0].filled_orders),closedTrades:Number(totals[0].closed_trades),todayFills:Number(totals[0].today_fills),openPositions:pos.length,realized,unrealized,total:unrealized===null?null:realized+unrealized,daily:today?.daily??null,staleMarks:pos.filter(r=>r.mark_stale).length,missingMarks:pos.filter(r=>r.unrealized_pnl===null).length,pendingSignals:Number(coverage[0].pending_signals)},closedStats:{count:Number(closedStats[0]?.closed_count??0),winRate:Number(closedStats[0]?.closed_count)>0?Number(closedStats[0].wins)/Number(closedStats[0].closed_count)*100:null,averageHoldDays:numeric(closedStats[0]?.average_hold_days),matchedClosures:Number(closedStats[0]?.matched_closures??0)},signalsToday:Number(coverage[0].signals_today??0),demoTrades,positions:pos.slice(0,20),performance:Array.from({length:7},(_,i)=>{const row=performance.find(r=>Number(r.strategy)===i+1);const closed=Number(row?.closed_trades??0);return {strategy:i+1,closedTrades:closed,winRate:closed?Number(row.wins)/closed*100:null,realized:numeric(row?.realized??0),openPositions:pos.filter(r=>Number(r.strategy)===i+1).length};}),dailyHistory:reports.reverse(),latestSnapshot:latest,recentFills:publicRows(recentFills),recentSignals:publicRows(recentSignals),lastRuns:publicRows(lastRuns),quoteAudit:publicRows(audit),coverage:coverage[0]};
+ return {readAt:now.toISOString(),namespace:book,book,isArchive:book!==ACTIVE_BOOK,day,market:marketState(now),cappedLedger:capped,publicLabels:PUBLIC_LABELS,totals:{filledOrders:Number(totals[0].filled_orders),closedTrades:Number(totals[0].closed_trades),todayFills:Number(totals[0].today_fills),openPositions:pos.length,realized,unrealized,total:unrealized===null?null:realized+unrealized,daily:today?.daily??null,staleMarks:pos.filter(r=>r.mark_stale).length,missingMarks:pos.filter(r=>r.unrealized_pnl===null).length,pendingSignals:Number(coverage[0].pending_signals)},closedStats:{count:Number(closedStats[0]?.closed_count??0),winRate:Number(closedStats[0]?.closed_count)>0?Number(closedStats[0].wins)/Number(closedStats[0].closed_count)*100:null,averageHoldDays:numeric(closedStats[0]?.average_hold_days),matchedClosures:Number(closedStats[0]?.matched_closures??0)},signalsToday:Number(coverage[0].signals_today??0),demoTrades,positions:pos.slice(0,20),performance:Array.from({length:7},(_,i)=>{const row=performance.find(r=>Number(r.strategy)===i+1);const closed=Number(row?.closed_trades??0);return {strategy:i+1,closedTrades:closed,winRate:closed?Number(row.wins)/closed*100:null,realized:numeric(row?.realized??0),openPositions:pos.filter(r=>Number(r.strategy)===i+1).length};}),dailyHistory:reports.reverse(),latestSnapshot:latest,recentFills:publicRows(recentFills),recentSignals:publicRows(recentSignals),lastRuns:publicRows(lastRuns),quoteAudit:publicRows(audit),coverage:coverage[0]};
 }

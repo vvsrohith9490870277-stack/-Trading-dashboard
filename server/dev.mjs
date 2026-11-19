@@ -6,4 +6,4 @@ const {default:handler}=await import('../api/dashboard.js');const app=express();
 app.use((_req,res,next)=>{res.setHeader('X-Content-Type-Options','nosniff');res.setHeader('Referrer-Policy','strict-origin-when-cross-origin');next();});
 app.all('/api/dashboard',handler);
 if(process.env.NODE_ENV==='production')app.use(express.static('dist'));else{const {createServer}=await import('vite');const vite=await createServer({server:{middlewareMode:true},appType:'spa'});app.use(vite.middlewares);}
-const port=Number(process.env.PORT??5173);app.listen(port,'127.0.0.1',()=>console.log(`Dashboard ready: http://127.0.0.1:${port} (read-only paper_v1)`));
+const port=Number(process.env.PORT??5173);app.listen(port,'127.0.0.1',()=>console.log(`Dashboard ready: http://127.0.0.1:${port} (read-only; active book from config, archive paper_v1)`));

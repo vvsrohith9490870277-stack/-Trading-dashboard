@@ -1,3 +1,4 @@
+import {ACTIVE_BOOK} from './books.mjs';
 import {cappedLedger,PUBLIC_LABELS} from './capped-ledger.mjs';
 import inputEvidence from '../automation/paper-trading/session_input_evidence.json' with {type:'json'};
 import inputPolicy from '../automation/paper-trading/session_input_policy.json' with {type:'json'};
@@ -8,7 +9,7 @@ import calendar from '../automation/paper-trading/config.json' with {type:'json'
 import adaptivePolicy from '../automation/paper-trading/adaptive_policy.json' with {type:'json'};
 import {estimate,paise,policy as bundledPolicy} from '../automation/paper-trading/fees.mjs';
 
-const NS='paper_v1',buckets=['single','exactly_2','exactly_3','4_plus','unavailable'];
+const DEFAULT_NS=ACTIVE_BOOK,buckets=['single','exactly_2','exactly_3','4_plus','unavailable'];
 const safe=n=>{const x=Number(n??0);if(!Number.isSafeInteger(x))throw Error('PRECISION_UNAVAILABLE');return x;};
 const parse=s=>{try{return JSON.parse(s);}catch{return null;}};
 const MARK_BASES=['official_close_revaluation'],OUTAGE_KINDS=['no_monitoring','monitor_coverage_low','scan_missing','eod_missing'];
@@ -47,7 +48,7 @@ export function weeklySummary(eods,day,calendar,now=new Date(day+'T23:59:00+05:3
 
 // Adaptive (Tracks A/B/C) read model. Column names below are the real schema.sql / adaptive_logging.py columns,
 // aliased to the fields the UI renders. Numbers come from adaptive_policy.json, never from literals here.
-export async function readAdaptiveSummary(select,ns=NS){
+export async function readAdaptiveSummary(select,ns=DEFAULT_NS){
  const def={observation_only:calendar.adaptive_observation_only!==false,ci_lookahead_passed:false,calibration_go:false,power_floor_target:adaptivePolicy.power_floor,max_concurrent_challengers_track_b:adaptivePolicy.max_track_b_challengers,max_champions_per_strategy_track_c:adaptivePolicy.max_track_c_champions,policy_version:adaptivePolicy.version,tracks:[],spawns:[],gate_evaluations:[],calibration_runs:[],probation:[],logs:[],read_error:null};
  try{
   const metaRows=await select("SELECT key AS k,value AS v FROM paper_meta WHERE namespace=? AND key='adaptive_observation_only'",[ns]);
@@ -70,6 +71,7 @@ export async function readAdaptiveSummary(select,ns=NS){
 }
 
 export async function readAutomation(o,select,now){
+ const NS=o.book??DEFAULT_NS;
  const readAt=now.toISOString(),base={readAt,namespace:NS,available:true};
  if(o.view==='scan'||o.view==='qualifiers'||o.view==='prefilter'){
   const latest=(await select(`SELECT bar_date,scanned_at,status,json_extract(report_json,'$.input_validation') AS input_validation_json FROM paper_scan_batches WHERE namespace=? ORDER BY bar_date DESC LIMIT 1`,[NS]))[0];
