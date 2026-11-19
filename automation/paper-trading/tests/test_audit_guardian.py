@@ -60,7 +60,8 @@ class AuditTests(unittest.TestCase):
   a.emit(self.e,self.db,'monitor_idle',open_positions=0);r=a.export(self.e,self.db,'2026-11-09');self.assertTrue(r['complete_export']);self.assertFalse(r['full_flow_verified']);self.assertIn('monitor_coverage_incomplete',r['warnings']);row=json.loads(Path(r['path']).read_text());self.assertTrue(row['source_at_IST'].endswith('+05:30'));self.assertTrue(row['recorded_at_UTC'].endswith('+00:00'));self.assertNotIn('pid',row)
  def test_csv_and_export_limit_are_explicit(self):
   for i in range(3):a.emit(self.e,self.db,'monitor_idle',count=i)
-  r=a.export(self.e,self.db,'2026-11-09','csv',2);self.assertFalse(r['complete_export']);self.assertIn('export_event_limit',r['warnings']);self.assertEqual(len(list(csv.DictReader(open(r['path'])))),2)
+  r=a.export(self.e,self.db,'2026-11-09','csv',2);self.assertFalse(r['complete_export']);self.assertIn('export_event_limit',r['warnings'])
+  with open(r['path']) as f:self.assertEqual(len(list(csv.DictReader(f))),2)
  def test_closed_day_export_not_market_proof(self):
   r=a.export(self.e,self.db,'2026-11-07');self.assertIn('not_verified_weekday_session',r['warnings']);self.assertFalse(r['full_flow_verified'])
  def test_guardian_weekend_holiday_and_boundaries(self):

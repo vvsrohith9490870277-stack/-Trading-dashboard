@@ -142,5 +142,8 @@ class RuntimeDepsTests(unittest.TestCase):
         self.assertIn('runtime_deps',h)
         self.assertIn('ok',h['runtime_deps'])
         self.assertTrue(h['runtime_deps']['ok'])
+        try:db.close_helper()
+        except Exception:pass
+        Path(db.test_database).unlink(missing_ok=True)
 
 if __name__=='__main__':unittest.main()
