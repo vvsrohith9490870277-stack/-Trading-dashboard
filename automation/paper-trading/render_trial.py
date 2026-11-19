@@ -10,7 +10,7 @@ import logging
 import os
 import re
 import time
-from datetime import date
+from datetime import date, datetime
 
 log = logging.getLogger('render.trial')
 
@@ -259,35 +259,188 @@ def init_trial(store, db, namespace, bar, live_ns='paper_v2',
 
 
 def compare_trial(db, trial_ns, live_ns, day):
-    """Compare trial vs live for one session day.
+    """Compare trial vs live for one session day (read-only).
 
-    `db` is an engine DB (or a fake with .query). Counts are read-only and
-    scoped to each namespace, so the comparison can never leak one book
-    into the other.
+    `db` is an engine DB (or a fake with .query). Signals are counted
+    by `eligible_date` = the session day (the day's queue: a scan for
+    bar D-1 creates signals eligible D), fills by the date part of
+    `filled_at`. Fills are matched by `signal_id`, which is stable
+    across books for the same bar. Heartbeat gaps come from consecutive
+    `paper_runs` monitor rows for the trial namespace on the session
+    day (the only timestamped per-namespace heartbeat series in the
+    DB; `paper_monitor_health` holds one upserted row per namespace
+    and no history). Every query is read-only; a missing table yields
+    an empty result instead of an error.
     """
-    def _count(table, ns, day_col=None):
-        if day_col == 'filled_at':
-            # filled_at is a full timestamp; compare its date part
-            rows = db.query(
-                'SELECT COUNT(*) AS n FROM %s WHERE namespace=?'
-                ' AND substr(filled_at, 1, 10)=?' % table, (ns, day))
-        elif day_col:
-            rows = db.query(
-                'SELECT COUNT(*) AS n FROM %s WHERE namespace=? AND %s=?'
-                % (table, day_col), (ns, day))
-        else:
-            rows = db.query(
-                'SELECT COUNT(*) AS n FROM %s WHERE namespace=?' % table,
-                (ns,))
+    def _safe_query(sql, args=()):
+        try:
+            return db.query(sql, args) or []
+        except Exception:
+            return []
+
+    def _count(sql, args=()):
+        rows = _safe_query(sql, args)
         return int(rows[0]['n']) if rows else 0
 
     out = {'day': day}
     for label, ns in (('trial', trial_ns), ('live', live_ns)):
         out[label] = {
-            'signals': _count('paper_signals', ns, 'bar_date'),
-            'fills': _count('paper_fills', ns, 'filled_at'),
-            'positions': _count('paper_positions', ns),
+            'signals': _count(
+                'SELECT COUNT(*) AS n FROM paper_signals WHERE namespace=?'
+                ' AND eligible_date=?', (ns, day)),
+            'fills': _count(
+                'SELECT COUNT(*) AS n FROM paper_fills WHERE namespace=?'
+                ' AND substr(filled_at, 1, 10)=?', (ns, day)),
+            'positions': _count(
+                'SELECT COUNT(*) AS n FROM paper_positions WHERE namespace=?',
+                (ns,)),
         }
+
+    # -- signals by strategy, with symbol sets -----------------------
+    by_strategy = {}
+    for label, ns in (('trial', trial_ns), ('live', live_ns)):
+        for row in _safe_query(
+                'SELECT strategy, symbol FROM paper_signals'
+                ' WHERE namespace=? AND eligible_date=?'
+                ' ORDER BY strategy, symbol', (ns, day)):
+            key = str(row['strategy'])
+            entry = by_strategy.setdefault(
+                key, {'live': 0, 'trial': 0, '_live_syms': set(),
+                      '_trial_syms': set()})
+            entry[label] += 1
+            entry['_%s_syms' % label].add(row['symbol'])
+    for key in sorted(by_strategy):
+        entry = by_strategy[key]
+        live_syms, trial_syms = entry.pop('_live_syms'), \
+            entry.pop('_trial_syms')
+        entry['only_box'] = sorted(live_syms - trial_syms)
+        entry['only_trial'] = sorted(trial_syms - live_syms)
+        entry['both'] = sorted(live_syms & trial_syms)
+    out['signals_by_strategy'] = by_strategy
+
+    # -- fills by strategy, matched by signal_id --------------------
+    # Every strategy in the day's signals gets an entry (empty when it
+    # has no fills), so the report is uniform across strategies.
+    fills_by_strategy = {key: {'live': [], 'trial': [], 'matched': []}
+                         for key in by_strategy}
+    by_signal = {}
+    for label, ns in (('trial', trial_ns), ('live', live_ns)):
+        for row in _safe_query(
+                'SELECT signal_id, strategy, symbol, side, qty, price,'
+                ' filled_at FROM paper_fills WHERE namespace=?'
+                ' AND substr(filled_at, 1, 10)=?'
+                ' ORDER BY strategy, symbol', (ns, day)):
+            key = str(row['strategy'])
+            entry = fills_by_strategy.setdefault(
+                key, {'live': [], 'trial': [], 'matched': []})
+            fill = {'signal_id': row['signal_id'],
+                    'symbol': row['symbol'], 'side': row['side'],
+                    'qty': row['qty'], 'price': row['price'],
+                    'filled_at': row['filled_at']}
+            entry[label].append(fill)
+            by_signal.setdefault(row['signal_id'], {})[label] = fill
+    for sid, sides in by_signal.items():
+        if 'live' in sides and 'trial' in sides:
+            live, trial = sides['live'], sides['trial']
+            diff = None
+            if live['price']:
+                diff = round((trial['price'] - live['price'])
+                             / live['price'] * 10000, 2)
+            # the strategy key is the live fill's strategy (same bar,
+            # same strategy on both sides by construction)
+            live_strat = None
+            for strat, entry in fills_by_strategy.items():
+                if any(f['signal_id'] == sid for f in entry['live']):
+                    live_strat = strat
+                    break
+            fills_by_strategy[live_strat]['matched'].append({
+                'signal_id': sid, 'symbol': live['symbol'],
+                'side': live['side'], 'live_qty': live['qty'],
+                'trial_qty': trial['qty'], 'live_price': live['price'],
+                'trial_price': trial['price'], 'price_diff_bps': diff})
+    out['fills_by_strategy'] = fills_by_strategy
+
+    # -- open positions, scan batches, EOD, errors -------------------
+    out['open_positions'] = {}
+    for label, ns in (('trial', trial_ns), ('live', live_ns)):
+        out['open_positions'][label] = [{
+            'strategy': row['strategy'], 'symbol': row['symbol'],
+            'qty': row['qty'], 'entry_price': row['entry_price'],
+            'entry_at': row['entry_at']} for row in _safe_query(
+                'SELECT strategy, symbol, qty, entry_price, entry_at'
+                ' FROM paper_positions WHERE namespace=?'
+                ' ORDER BY strategy, symbol', (ns,))]
+    out['scan_batches'] = {}
+    for label, ns in (('trial', trial_ns), ('live', live_ns)):
+        rows = _safe_query(
+            'SELECT MAX(bar_date) AS bar FROM paper_scan_batches'
+            ' WHERE namespace=? AND bar_date<=?', (ns, day))
+        bar = rows[0]['bar'] if rows else None
+        out['scan_batches'][label] = {'present': bar is not None,
+                                      'bar_date': bar}
+    out['paper_eod'] = {
+        label: _count(
+            'SELECT COUNT(*) AS n FROM paper_eod WHERE namespace=?'
+            ' AND day=?', (ns, day)) > 0
+        for label, ns in (('trial', trial_ns), ('live', live_ns))}
+    out['errors'] = {
+        label: _count(
+            'SELECT COUNT(*) AS n FROM paper_events WHERE namespace=?'
+            " AND session_day=? AND severity='ERROR'", (ns, day))
+        for label, ns in (('trial', trial_ns), ('live', live_ns))}
+
+    # -- trial heartbeat gaps over 60 s -------------------------------
+    gaps = []
+    prev = None
+    for row in _safe_query(
+            'SELECT at FROM paper_runs WHERE namespace=? AND kind='
+            "'monitor' AND status='ok' AND substr(at, 1, 10)=?"
+            ' ORDER BY at', (trial_ns, day)):
+        try:
+            at = datetime.fromisoformat(row['at'])
+        except Exception:
+            prev = None
+            continue
+        if prev is not None:
+            gap = (at - prev[0]).total_seconds()
+            if gap > 60:
+                gaps.append({'from': prev[1], 'to': row['at'],
+                             'gap_seconds': int(gap)})
+        prev = (at, row['at'])
+    out['heartbeat_gaps'] = gaps
+
+    # -- summary: exactly 5 plain lines -------------------------------
+    live_sig = out['live']['signals']
+    trial_sig = out['trial']['signals']
+    only_box = sorted({s for e in by_strategy.values()
+                       for s in e['only_box']})
+    only_trial = sorted({s for e in by_strategy.values()
+                         for s in e['only_trial']})
+    matched = sum(len(e['matched']) for e in fills_by_strategy.values())
+    max_bps = max(
+        (abs(m['price_diff_bps']) for e in fills_by_strategy.values()
+         for m in e['matched'] if m['price_diff_bps'] is not None),
+        default=None)
+    out['summary'] = [
+        'signals: live %d across %d strategies, trial %d across %d'
+        ' strategies; %d symbols only on the box, %d only on the trial'
+        % (live_sig, len(by_strategy), trial_sig, len(by_strategy),
+           len(only_box), len(only_trial)),
+        'fills: live %d, trial %d, %d matched by signal_id; max'
+        ' |price diff| %s bps'
+        % (out['live']['fills'], out['trial']['fills'], matched,
+           ('%.2f' % max_bps) if max_bps is not None else 'n/a'),
+        'open positions: live %d, trial %d'
+        % (len(out['open_positions']['live']),
+           len(out['open_positions']['trial'])),
+        'scan batches: live bar %s, trial bar %s; EOD: live %s, trial %s'
+        % (out['scan_batches']['live']['bar_date'] or 'absent',
+           out['scan_batches']['trial']['bar_date'] or 'absent',
+           'yes' if out['paper_eod']['live'] else 'no',
+           'yes' if out['paper_eod']['trial'] else 'no'),
+        'errors: live %d, trial %d; heartbeat gaps over 60s: %d'
+        % (out['errors']['live'], out['errors']['trial'], len(gaps)),
+    ]
     return out
 
 

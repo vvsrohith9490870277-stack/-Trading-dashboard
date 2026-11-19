@@ -224,16 +224,65 @@ class TrialLifecycleTests(unittest.TestCase):
             t.purge_trial(self.store, 'paper_v2')
 
     def test_trial_compare(self):
+        # Realistic rows per query shape (the report reads detail rows,
+        # not just counts).
+        live_sig = [{'strategy': 1, 'symbol': '360ONE-EQ'},
+                    {'strategy': 2, 'symbol': 'ABB-EQ'},
+                    {'strategy': 1, 'symbol': 'ACC-EQ'}]
+        trial_sig = [{'strategy': 1, 'symbol': '360ONE-EQ'},
+                     {'strategy': 2, 'symbol': 'ABB-EQ'},
+                     {'strategy': 1, 'symbol': 'ADANIENT-EQ'}]
+        live_fill = [{'signal_id': 'fix-sig-1', 'strategy': 1,
+                      'symbol': '360ONE-EQ', 'side': 'BUY', 'qty': 10,
+                      'price': 100.5, 'filled_at': '2026-11-20T09:30:00'},
+                     {'signal_id': 'fix-sig-3', 'strategy': 1,
+                      'symbol': 'ACC-EQ', 'side': 'SELL', 'qty': 5,
+                      'price': 200.0, 'filled_at': '2026-11-20T10:00:00'}]
+        trial_fill = [{'signal_id': 'fix-sig-1', 'strategy': 1,
+                       'symbol': '360ONE-EQ', 'side': 'BUY', 'qty': 10,
+                       'price': 101.0, 'filled_at': '2026-11-20T09:31:00'},
+                      {'signal_id': 'fix-sig-4', 'strategy': 1,
+                       'symbol': 'ADANIENT-EQ', 'side': 'BUY', 'qty': 5,
+                       'price': 50.0, 'filled_at': '2026-11-20T09:32:00'}]
+
         class FakeDB:
             def query(self, sql, args=()):
                 ns = args[0]
+                trial = ns == 'paper_render_trial_v1'
+                if 'MAX(bar_date)' in sql:
+                    return [{'bar': '2026-11-19'}]
+                if 'paper_runs' in sql:
+                    ats = ['2026-11-20T09:15:00', '2026-11-20T09:15:30',
+                           '2026-11-20T09:17:30'] if trial else \
+                          ['2026-11-20T09:15:00', '2026-11-20T09:15:30']
+                    return [{'at': a} for a in ats]
+                if 'COUNT(*)' in sql:
+                    if 'paper_signals' in sql:
+                        return [{'n': 5 if trial else 4}]
+                    if 'paper_fills' in sql:
+                        return [{'n': 2 if trial else 3}]
+                    if 'paper_positions' in sql:
+                        return [{'n': 1}]
+                    if 'paper_eod' in sql:
+                        return [{'n': 0 if trial else 1}]
+                    if 'paper_events' in sql:
+                        return [{'n': 1 if trial else 2}]
+                    return [{'n': 0}]
                 if 'paper_signals' in sql:
-                    return [{'n': 5 if ns == 'paper_render_trial_v1' else 4}]
+                    return trial_sig if trial else live_sig
                 if 'paper_fills' in sql:
-                    return [{'n': 2 if ns == 'paper_render_trial_v1' else 3}]
+                    return trial_fill if trial else live_fill
                 if 'paper_positions' in sql:
-                    return [{'n': 1 if ns == 'paper_render_trial_v1' else 1}]
-                return [{'n': 0}]
+                    return [{'strategy': 1, 'symbol': '360ONE-EQ',
+                             'qty': 10, 'entry_price': 100.5,
+                             'entry_at': '2026-11-20T09:30:00'}] if not trial \
+                        else [{'strategy': 1, 'symbol': '360ONE-EQ',
+                              'qty': 10, 'entry_price': 101.0,
+                              'entry_at': '2026-11-20T09:31:00'},
+                             {'strategy': 1, 'symbol': 'ADANIENT-EQ',
+                              'qty': 5, 'entry_price': 50.0,
+                              'entry_at': '2026-11-20T09:32:00'}]
+                return []
         out = t.compare_trial(FakeDB(), 'paper_render_trial_v1', 'paper_v2',
                                '2026-11-20')
         self.assertEqual(out['trial']['signals'], 5)
@@ -263,6 +312,180 @@ class TrialLifecycleTests(unittest.TestCase):
                 "SELECT * FROM paper_job_runs WHERE namespace='paper_v2'"), [])
         finally:
             ctl.close_baselined_db(store, path)
+
+
+class CompareReportTests(unittest.TestCase):
+    """Task 4 (render-deploy-02): trial-compare is a full report.
+
+    The fixture DB (baseline=False) already seeds live-side rows for
+    session 2026-11-20; each test adds the trial-side rows it needs.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.old = {}
+        for k in ('PAPER_RUNTIME', 'RENDER_MODE',
+                  'PAPER_NAMESPACE_OVERRIDE', 'PAPER_TEST_DATABASE',
+                  'PAPER_STATE_DIR', 'TURSO_DATABASE_URL',
+                  'TURSO_AUTH_TOKEN'):
+            self.old[k] = os.environ.pop(k, None)
+        os.environ['PAPER_RUNTIME'] = 'render'
+        os.environ['RENDER_MODE'] = 'trial'
+        os.environ['PAPER_NAMESPACE_OVERRIDE'] = TRIAL_NS
+        os.environ['PAPER_STATE_DIR'] = self.tmp.name
+        self.store, self.db, self.path = ctl._fixture_db(baseline=False)
+
+    def tearDown(self):
+        ctl._close_fixture(self.store, self.db, self.path)
+        self.tmp.cleanup()
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _add_trial_rows(self):
+        """Trial-side rows mirroring the fixture's live rows, with one
+        extra symbol and one fill at a different price."""
+        self.db.batch([
+            ("INSERT INTO paper_signals(namespace, id, strategy, symbol,"
+             " bar_date, side, status, reason, created_at, eligible_date)"
+             " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (TRIAL_NS, 'fix-sig-1', 1, '360ONE-EQ', '2026-11-19', 'BUY',
+              'pending', 'fixture', '2026-11-20T08:45:00', '2026-11-20')),
+            ("INSERT INTO paper_signals(namespace, id, strategy, symbol,"
+             " bar_date, side, status, reason, created_at, eligible_date)"
+             " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (TRIAL_NS, 'fix-sig-2', 2, 'ABB-EQ', '2026-11-19', 'BUY',
+              'pending', 'fixture', '2026-11-20T08:45:00', '2026-11-20')),
+            ("INSERT INTO paper_signals(namespace, id, strategy, symbol,"
+             " bar_date, side, status, reason, created_at, eligible_date)"
+             " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (TRIAL_NS, 'fix-sig-4', 1, 'ADANIENT-EQ', '2026-11-19', 'BUY',
+              'pending', 'fixture', '2026-11-20T08:45:00', '2026-11-20')),
+            ("INSERT INTO paper_fills(namespace, signal_id, strategy,"
+             " symbol, side, qty, price, quote_at, filled_at, reason,"
+             " realized_pnl, cashflow, execution_path)"
+             " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (TRIAL_NS, 'fix-sig-1', 1, '360ONE-EQ', 'BUY', 10, 101.0,
+              '2026-11-20T09:31:00', '2026-11-20T09:31:00', 'fixture', 0,
+              -1010.0, 'LTP_LEGACY')),
+            ("INSERT INTO paper_fills(namespace, signal_id, strategy,"
+             " symbol, side, qty, price, quote_at, filled_at, reason,"
+             " realized_pnl, cashflow, execution_path)"
+             " VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (TRIAL_NS, 'fix-sig-4', 1, 'ADANIENT-EQ', 'BUY', 5, 50.0,
+              '2026-11-20T09:32:00', '2026-11-20T09:32:00', 'fixture', 0,
+              -250.0, 'LTP_LEGACY')),
+            ("INSERT INTO paper_positions(namespace, strategy, symbol,"
+             " qty, entry_price, entry_at, high_water, updated_at)"
+             " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+             (TRIAL_NS, 1, '360ONE-EQ', 10, 101.0, '2026-11-20T09:31:00',
+              101.5, '2026-11-20T09:31:00')),
+            ("INSERT INTO paper_positions(namespace, strategy, symbol,"
+             " qty, entry_price, entry_at, high_water, updated_at)"
+             " VALUES(?, ?, ?, ?, ?, ?, ?, ?)",
+             (TRIAL_NS, 1, 'ADANIENT-EQ', 5, 50.0, '2026-11-20T09:32:00',
+              50.5, '2026-11-20T09:32:00')),
+            ("INSERT INTO paper_scan_batches(namespace, bar_date,"
+             " scanned_at, status, report_json) VALUES(?, ?, ?, ?, ?)",
+             (TRIAL_NS, '2026-11-19', '2026-11-20T08:45:00', 'ok', '{}')),
+            ("INSERT INTO paper_events(namespace, event_id, run_id,"
+             " session_day, source_at, recorded_at, event_type, severity,"
+             " outcome, data_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             (TRIAL_NS, '%032x' % 9, 'fixrun', '2026-11-20',
+              '2026-11-20T12:00:00', '2026-11-20T12:00:00',
+              'fixture_error', 'ERROR', 'failed', '{}')),
+        ])
+
+    def test_compare_symbol_sets_and_fill_bps(self):
+        self._add_trial_rows()
+        out = t.compare_trial(self.db, TRIAL_NS, LIVE_NS, '2026-11-20')
+        # counts are kept (signals by eligible_date = the session day)
+        self.assertEqual(out['trial']['signals'], 3)
+        self.assertEqual(out['live']['signals'], 3)
+        self.assertEqual(out['trial']['fills'], 2)
+        self.assertEqual(out['live']['fills'], 2)
+        self.assertEqual(out['trial']['positions'], 2)
+        self.assertEqual(out['live']['positions'], 1)
+        by_strat = out['signals_by_strategy']
+        self.assertEqual(by_strat['1'], {'live': 2, 'trial': 2,
+                                         'only_box': ['ACC-EQ'],
+                                         'only_trial': ['ADANIENT-EQ'],
+                                         'both': ['360ONE-EQ']})
+        self.assertEqual(by_strat['2'], {'live': 1, 'trial': 1,
+                                         'only_box': [], 'only_trial': [],
+                                         'both': ['ABB-EQ']})
+        fills = out['fills_by_strategy']['1']
+        self.assertEqual(len(fills['live']), 2)
+        self.assertEqual(len(fills['trial']), 2)
+        self.assertEqual(fills['matched'], [{
+            'signal_id': 'fix-sig-1', 'symbol': '360ONE-EQ',
+            'side': 'BUY', 'live_qty': 10, 'trial_qty': 10,
+            'live_price': 100.5, 'trial_price': 101.0,
+            'price_diff_bps': 49.75}])
+        self.assertEqual(out['fills_by_strategy']['2']['matched'], [])
+        self.assertEqual(len(out['open_positions']['live']), 1)
+        self.assertEqual(len(out['open_positions']['trial']), 2)
+        self.assertEqual(out['open_positions']['trial'][1]['symbol'],
+                         'ADANIENT-EQ')
+        self.assertEqual(out['scan_batches'],
+                         {'live': {'present': True,
+                                   'bar_date': '2026-11-19'},
+                          'trial': {'present': True,
+                                    'bar_date': '2026-11-19'}})
+        self.assertEqual(out['paper_eod'],
+                         {'live': True, 'trial': False})
+        self.assertEqual(out['errors'], {'live': 2, 'trial': 1})
+        self.assertEqual(out['heartbeat_gaps'], [{
+            'from': '2026-11-20T09:15:30', 'to': '2026-11-20T09:17:30',
+            'gap_seconds': 120}])
+
+    def test_compare_read_only(self):
+        self._add_trial_rows()
+        writes = []
+        orig_query, orig_batch = self.db.query, self.db.batch
+
+        def _spy_query(sql, args=()):
+            for word in ('INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER'):
+                if word in sql.upper():
+                    writes.append(sql)
+            return orig_query(sql, args)
+
+        def _spy_batch(items):
+            writes.append('batch: %d items' % len(items))
+            return orig_batch(items)
+        self.db.query, self.db.batch = _spy_query, _spy_batch
+        try:
+            before = {table: orig_query(
+                'SELECT COUNT(*) AS n FROM %s' % table)[0]['n']
+                for table in ('paper_signals', 'paper_fills',
+                              'paper_positions', 'paper_scan_batches',
+                              'paper_eod', 'paper_events', 'paper_runs')}
+            t.compare_trial(self.db, TRIAL_NS, LIVE_NS, '2026-11-20')
+            after = {table: orig_query(
+                'SELECT COUNT(*) AS n FROM %s' % table)[0]['n']
+                for table in before}
+        finally:
+            self.db.query, self.db.batch = orig_query, orig_batch
+        self.assertEqual(writes, [])
+        self.assertEqual(before, after)
+
+    def test_compare_summary_present(self):
+        out = t.compare_trial(self.db, TRIAL_NS, LIVE_NS, '2026-11-20')
+        for key in ('day', 'trial', 'live', 'signals_by_strategy',
+                    'fills_by_strategy', 'open_positions', 'scan_batches',
+                    'paper_eod', 'errors', 'heartbeat_gaps', 'summary'):
+            self.assertIn(key, out, key)
+        summary = out['summary']
+        self.assertIsInstance(summary, list)
+        self.assertEqual(len(summary), 5)
+        for line in summary:
+            self.assertIsInstance(line, str)
+            self.assertTrue(line)
+        joined = '\n'.join(summary)
+        for word in ('signals', 'fills', 'positions', 'EOD', 'errors'):
+            self.assertIn(word, joined, word)
 
 
 class TrialInitRealPathTests(unittest.TestCase):
