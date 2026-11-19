@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS paper_runs(id INTEGER PRIMARY KEY AUTOINCREMENT,names
 CREATE TABLE IF NOT EXISTS paper_quote_audit(id INTEGER PRIMARY KEY AUTOINCREMENT,namespace TEXT NOT NULL,symbol TEXT NOT NULL,observed_at TEXT NOT NULL,quote_at TEXT,price REAL,accepted INTEGER NOT NULL,reason TEXT NOT NULL,source TEXT NOT NULL DEFAULT 'FYERS_QUOTES');
 CREATE TABLE IF NOT EXISTS paper_data_audit(namespace TEXT NOT NULL,symbol TEXT NOT NULL,bar_date TEXT NOT NULL,reason TEXT NOT NULL,observed_at TEXT NOT NULL,PRIMARY KEY(namespace,symbol,bar_date,reason));
 CREATE TABLE IF NOT EXISTS paper_meta(namespace TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,PRIMARY KEY(namespace,key));
+CREATE TABLE IF NOT EXISTS paper_outages(namespace TEXT NOT NULL,session_day TEXT NOT NULL,kind TEXT NOT NULL,detected_at TEXT NOT NULL,detail_json TEXT NOT NULL,PRIMARY KEY(namespace,session_day,kind));
 
 CREATE INDEX IF NOT EXISTS paper_signals_pending_idx ON paper_signals(namespace,status);
 CREATE INDEX IF NOT EXISTS paper_fills_day_idx ON paper_fills(namespace,filled_at);
