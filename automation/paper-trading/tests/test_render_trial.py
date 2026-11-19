@@ -58,6 +58,14 @@ class ResolveTableTests(unittest.TestCase):
                 with self.assertRaises(t.NamespaceRefused):
                     t.resolve('trial', 'paper_v2', ns, True)
 
+    def test_protected_namespaces(self):
+        # The guard's data itself: a scratch edit that drops a name from
+        # PROTECTED must fail here (G6 mutation check), even where the
+        # trial regex would also refuse that name.
+        self.assertEqual(t.PROTECTED, frozenset({
+            'paper_v1', 'paper_v2', 'paper_demo_v1',
+            'paper_exit_test_v1', 'adaptive_v1'}))
+
     def test_override_ignored_when_runtime_not_render(self):
         self.assertEqual(
             t.resolve('trial', 'paper_v2', 'paper_render_trial_v1', False), 'paper_v2')
