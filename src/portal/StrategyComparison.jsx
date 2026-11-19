@@ -1,5 +1,6 @@
 import {useMemo, useState} from 'react';
 import {Link, runIdFor, stockHref} from './router';
+import {bookFromSearch} from './book';
 import {useAllPages, useStatic} from './data';
 import {fmt, pct, strategyName, STRATEGY_HUES, ticker} from './format';
 import {Blank, Callout, Loading, Section} from './ui';
@@ -33,6 +34,7 @@ export function overlapStats(sets) {
 }
 
 export default function StrategyComparison({overview, refreshKey = 0}) {
+  const book = bookFromSearch(window.location.search);
   const [ids, setIds] = useState(readIds);
   const [scope, setScopeState] = useState(readScope);
   const history = useStatic('/data/historical.json');
@@ -56,7 +58,7 @@ export default function StrategyComparison({overview, refreshKey = 0}) {
   const years = [...new Set(chosen.flatMap(s => s.yearly.map(y => y.period)))].sort().slice(-12);
   return <div className="ad-screen">
     <div className="ad-hero compact"><div><span className="ad-eyebrow">Strategy comparison</span><h1>Side by side</h1>
-      <p>Choose two to four strategies. Saved-run figures are gross closed-trade statistics from the {asOf} export; live paper figures come from the paper_v1 ledger. They sit side by side and are never blended or ranked together.</p></div></div>
+      <p>Choose two to four strategies. Saved-run figures are gross closed-trade statistics from the {asOf} export; live paper figures come from the {book} ledger. They sit side by side and are never blended or ranked together.</p></div></div>
     <div className="ad-chooser" role="group" aria-label="Strategies to compare">{[1, 2, 3, 4, 5, 6, 7].map(id => <button key={id} aria-pressed={ids.includes(id)} className={ids.includes(id) ? 'on' : ''} style={{'--ad-accent': STRATEGY_HUES[id - 1]}} onClick={() => toggle(id)}>
       <i/>{strategyName(id)}</button>)}</div>
     <div className="ad-ranges" role="group" aria-label="Strategies in the paper comparison">

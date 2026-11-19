@@ -33,15 +33,15 @@ Do not use `vite preview` alone for live data: it has no API. Both provided dev/
 2. Set **server-side only** environment variables in Vercel:
    - `TURSO_DATABASE_URL`: existing Turso database URL.
    - `TURSO_AUTH_TOKEN`: a **read-only**, least-privilege token for that database.
-   - Optional `PAPER_NAMESPACE=paper_v1` (no other value is accepted).
-3. Deploy and verify `/api/dashboard?view=overview` responds with namespace `paper_v1`, then inspect UI. Never set `VITE_…` / `NEXT_PUBLIC_…` versions of credentials. No Fyers variable is needed.
+   - Optional `PAPER_NAMESPACE` (paper_v2 or paper_v1 if set; it does not select the book).
+3. Deploy and verify `/api/dashboard?view=overview` responds with namespace `paper_v2`, then inspect UI. Never set `VITE_…` / `NEXT_PUBLIC_…` versions of credentials. No Fyers variable is needed.
 4. The public site intentionally exposes selected paper fills, positions, P&L, signals and non-sensitive operational summaries. Anyone with its URL can read these. It does not publish raw run JSON, database identifiers/URLs, account credentials, or broker errors.
 
 Deployment itself, GitHub commit/push, and visual browser QA are separate review steps. No deployment was performed by the implementation script.
 
 ## Live data and public API
 
-`GET /api/dashboard` defaults to an overview of production `paper_v1`. Allowlisted views: `overview`, `fills`, `positions`, `signals`, `runs`, `quotes`. List views accept `page=1`, `limit=25` (max100), `scope=all|today`. Only fills/positions/signals accept `strategy=1..7`. Unknown keys, client SQL, namespaces and invalid pagination are rejected. All DB inputs are bound; table/projection/order strings come from a fixed server map. No migration or write API is provided. All non-GET methods are rejected.
+`GET /api/dashboard` defaults to an overview of the active book, production `paper_v2`. Add `book=paper_v1` to read the archived paper_v1 book instead. Allowlisted views: `overview`, `fills`, `positions`, `signals`, `runs`, `quotes`. List views accept `page=1`, `limit=25` (max100), `scope=all|today`. Only fills/positions/signals accept `strategy=1..7`. Unknown keys, client SQL, namespaces and invalid pagination are rejected. All DB inputs are bound; table/projection/order strings come from a fixed server map. No migration or write API is provided. All non-GET methods are rejected.
 
 Data is read on page load, manual refresh and every five minutes when enabled. There is a 20-second in-memory server cache, bounded200 entries, and a best-effort90 requests/minute/client limiter, bounded2000 buckets. Serverless instances do not share these counters: use Vercel's edge/platform protections for stronger public abuse controls. No CORS is opened. Responses disable downstream HTTP caching. Rate-limited clients receive429. Error responses/logs are sanitized; public event reason/status fields are allowlisted. Public fields are intentionally selected, not `SELECT *` from paper tables.
 
@@ -92,7 +92,7 @@ Win rate uses closed paper SELL fills, with strictly positive realized P&L as wi
 
 ### Safe connection diagnostics
 
-Canonical server variables remain `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`; optional `PAPER_NAMESPACE` must equal `paper_v1`. Surrounding whitespace/newlines and matching accidental surrounding quotes are normalized server-side. No unsafe browser-variable alias or client token fallback is accepted. The existing local external-env loader still reads only the Turso keys.
+Canonical server variables remain `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN`; optional `PAPER_NAMESPACE`, when set, must be paper_v2 or paper_v1; it does not select the book. Surrounding whitespace/newlines and matching accidental surrounding quotes are normalized server-side. No unsafe browser-variable alias or client token fallback is accepted. The existing local external-env loader still reads only the Turso keys.
 
 The public GET API returns safe actionable error codes, never raw exceptions or credentials:
 - `CONFIG_MISSING_URL` / `CONFIG_MISSING_TOKEN`: named server variable absent.

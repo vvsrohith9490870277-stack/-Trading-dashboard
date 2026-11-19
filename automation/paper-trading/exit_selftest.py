@@ -1,13 +1,13 @@
 """Isolated paper exit self-test. Uses the production monitor/fill path in a private namespace.
 
-Never writes paper_v1. Never takes engine.lock. Never sends broker orders.
+Never writes paper_v1 or paper_v2. Never takes engine.lock. Never sends broker orders.
 """
 import fcntl, hashlib, json, time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 TEST_NS = 'paper_exit_test_v1'
-PROTECTED = frozenset({'paper_v1'})
+PROTECTED = frozenset({'paper_v1', 'paper_v2'})
 STOP_SYMBOL = 'RELIANCE-EQ'
 SELL_SYMBOL = 'HDFCBANK-EQ'
 GAP_SYMBOL = 'INFY-EQ'
@@ -263,6 +263,10 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
             return report
         v1_before = snapshot_ns(db, 'paper_v1')
         report['paper_v1_before'] = v1_before
+        live_ns = e.CFG['namespace']
+        live_before = snapshot_ns(db, live_ns)
+        report['live_ns'] = live_ns
+        report['live_ns_before'] = live_before
         e.NS = ns
         e.init(db)
         t0 = e.now()
@@ -382,6 +386,8 @@ def run(e, db, api, max_seconds=1200, max_quotes=40, poll_seconds=20, cleanup_af
         e.NS = previous_ns
         report['paper_v1_after'] = snapshot_ns(db, 'paper_v1')
         report['paper_v1_positions_unchanged'] = report['paper_v1_after']['positions'] == v1_before['positions']
+        report['live_ns_after'] = snapshot_ns(db, live_ns)
+        report['live_ns_positions_unchanged'] = report['live_ns_after']['positions'] == live_before['positions']
         return report
     except Exception as ex:
         report['status'] = 'failed'
@@ -496,7 +502,9 @@ def cli(e, db, args):
         finally:
             e.NS = previous
         v1 = snapshot_ns(db, 'paper_v1')
-        return {'status': 'cleaned', 'namespace': TEST_NS, 'paper_only': True, 'paper_v1': v1}
+        live_ns = e.CFG['namespace']
+        return {'status': 'cleaned', 'namespace': TEST_NS, 'paper_only': True, 'paper_v1': v1,
+                'live_ns': live_ns, 'live_ns_after': snapshot_ns(db, live_ns)}
     api = e.MarketData()
     return run(e, db, api,
                max_seconds=getattr(args, 'max_seconds', 1200) or 1200,

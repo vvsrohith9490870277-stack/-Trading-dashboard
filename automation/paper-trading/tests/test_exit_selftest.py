@@ -8,6 +8,7 @@ import exit_selftest as xst
 
 T = datetime(2026, 11, 9, 10, tzinfo=e.IST)
 NS_V1 = 'paper_v1'
+NS_V2 = 'paper_v2'
 
 
 class FakeAPI:
@@ -55,6 +56,12 @@ class ExitSelftestTests(unittest.TestCase):
             ('INSERT INTO paper_positions(namespace,strategy,symbol,qty,entry_price,entry_at,high_water,updated_at) VALUES(?,?,?,?,?,?,?,?)',
              (NS_V1, 1, 'TCS-EQ', 3, 100, T.isoformat(), 100, T.isoformat())),
         ])
+        # Live-namespace (paper_v2) equivalent: the live book's row must survive too.
+        self.db.batch([
+            ('DELETE FROM paper_positions WHERE namespace=?', (NS_V2,)),
+            ('INSERT INTO paper_positions(namespace,strategy,symbol,qty,entry_price,entry_at,high_water,updated_at) VALUES(?,?,?,?,?,?,?,?)',
+             (NS_V2, 1, 'TCS-EQ', 3, 100, T.isoformat(), 100, T.isoformat())),
+        ])
 
     def tearDown(self):
         xst.cleanup(e, self.db, self.ns)
@@ -68,6 +75,15 @@ class ExitSelftestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'protected'):
             xst.cleanup(e, self.db, 'paper_v1')
         self.assertEqual(self.db.query('SELECT qty FROM paper_positions WHERE namespace=? AND symbol=?', (NS_V1, 'TCS-EQ'))[0]['qty'], 3)
+
+    def test_live_ns_paper_v2_row_survives_harness(self):
+        q = {'symbol': 'RELIANCE-EQ', 'price': 101, 'open': 100, 'low': 99, 'high': 102,
+             'quote_at': T.isoformat(), 'provider_status': 'ok', 'source': 'FYERS_QUOTES'}
+        api = FakeAPI({'RELIANCE-EQ': q, 'HDFCBANK-EQ': dict(q, symbol='HDFCBANK-EQ')})
+        r = xst.run(e, self.db, api, max_seconds=1, max_quotes=5, poll_seconds=0, cleanup_after=False, live=False, quotes_seed={'RELIANCE-EQ': q, 'HDFCBANK-EQ': dict(q, symbol='HDFCBANK-EQ')})
+        self.assertEqual(r['live_ns'], 'paper_v2')
+        self.assertTrue(r['live_ns_positions_unchanged'])
+        self.assertEqual(self.db.query('SELECT qty FROM paper_positions WHERE namespace=? AND symbol=?', (NS_V2, 'TCS-EQ'))[0]['qty'], 3)
 
     def test_s7_trail_touch_uses_production_monitor_and_fill(self):
         # low 99 <= level ~99.5 < open 100, last 101 → trail_touch, fill at level (then sell slippage).

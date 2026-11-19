@@ -385,3 +385,12 @@
   .ad-pvr-table tr.ad-pvr-leg td:first-child .ad-strat{display:flex;margin:2px 0 0}
   .ad-pvr-table thead th{font-size:11px}
 }
+.ad-book-switch{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none}
+.ad-book-switch a{display:inline-flex;align-items:center;min-height:34px;padding:0 10px;border:1px solid var(--ad-line);border-radius:10px;background:var(--ad-surface);color:var(--ad-dim);font-size:12px;white-space:nowrap;text-decoration:none}
+.ad-book-switch a[aria-current="page"]{color:var(--ad-text);border-color:var(--ad-brand);background:var(--ad-raised)}
+.ad-book-banner{padding:12px 28px 0;overflow-wrap:anywhere;white-space:normal}
+@media (max-width:640px){
+  .ad-book-switch{overflow-x:auto;flex-wrap:nowrap}
+  .ad-book-switch a{min-height:44px;padding:0 12px}
+  .ad-book-banner{white-space:normal;padding:10px 14px 0}
+}

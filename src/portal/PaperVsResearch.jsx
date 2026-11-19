@@ -1,7 +1,8 @@
-// Compare screen: saved research vs the live paper_v1 book, side by side and never blended,
+// Compare screen: saved research vs the live paper book, side by side and never blended,
 // plus stocks that more than one strategy actually holds or traded on paper.
 import {Fragment} from 'react';
 import {Link, stockHref} from './router';
+import {bookFromSearch} from './book';
 import {fmt, inr, pct, signedInr, strategyName, STRATEGY_HUES, ticker, tone} from './format';
 import {Blank, Callout, Loading, Section, Tag} from './ui';
 import {paperAge, paperOverlap, paperStats, researchStats} from './paper-vs-research';
@@ -17,21 +18,23 @@ export function Incomplete({set, what}) {
 }
 
 export function PaperAgeNote({fills}) {
+  const book = bookFromSearch(window.location.search);
   const a = paperAge(fills);
   return <Callout tone="info" title="Paper is very young.">
-    {a.first ? `The paper_v1 book’s first fill was on ${a.first} (IST) and it has fills on ${a.sessions} session day${a.sessions === 1 ? '' : 's'} so far. ` : 'No paper fills are recorded yet. '}
+    {a.first ? `The ${book} book’s first fill was on ${a.first} (IST) and it has fills on ${a.sessions} session day${a.sessions === 1 ? '' : 's'} so far. ` : 'No paper fills are recorded yet. '}
     Research covers years of closed trades; a handful of paper trades does not prove or disprove a strategy. The two sides are shown next to each other and are never averaged, blended or ranked together. The RELIANCE manual demo (paper_demo_v1) is excluded.
   </Callout>;
 }
 
 export function ResearchVsPaper({ids, history, overview, ledger}) {
+  const book = bookFromSearch(window.location.search);
   const {trades, positions, fills} = ledger;
   const rows = ids.map(id => ({id, r: researchStats(history.strategies.find(s => s.id === id)),
     p: trades.data && positions.data && fills.data ? paperStats(id, {trades: trades.data.rows, positions: positions.data.rows, fills: fills.data.rows, sleeve: overview?.cappedLedger?.sleeves?.[id]}) : null}));
   const err = trades.error || positions.error || fills.error;
   const loading = !err && rows.some(x => !x.p);
   const noClose = 'No closed paper trades yet: win rate, mean, best and worst need at least one closed trade.';
-  return <Section eyebrow={`Research ${history.asOf} | paper_v1 now`} title="Research vs paper, same metrics" className="ad-ledger-palette ad-pvr">
+  return <Section eyebrow={`Research ${history.asOf} | ${book} now`} title="Research vs paper, same metrics" className="ad-ledger-palette ad-pvr">
     {err && <Callout tone="error">{err}</Callout>}
     {loading && <Loading label="Reading every paper trade, position and fill…"/>}
     <Incomplete set={trades.data} what="closed trades"/><Incomplete set={positions.data} what="open positions"/><Incomplete set={fills.data} what="fills"/>
@@ -40,7 +43,7 @@ export function ResearchVsPaper({ids, history, overview, ledger}) {
       <thead>
         <tr className="ad-pvr-groups"><th scope="col" rowSpan={2}>Strategy</th>
           <th scope="colgroup" colSpan={5} className="ad-pvr-g research">Research · saved backtest (gross % / closed trade)</th>
-          <th scope="colgroup" colSpan={6} className="ad-pvr-g paper">Paper · closed trades (paper_v1)</th>
+          <th scope="colgroup" colSpan={6} className="ad-pvr-g paper">Paper · closed trades ({book})</th>
           <th scope="colgroup" colSpan={5} className="ad-pvr-g now">Paper · open book now</th></tr>
         <tr>{['Closed', 'Win', 'Mean', 'Best', 'Worst'].map(h => <th key={'r' + h} scope="col" className="r research">{h}</th>)}
           {['Closed', 'Win', 'Mean %', 'Best %', 'Worst %', 'Realized ₹'].map(h => <th key={'p' + h} scope="col" className="r paper">{h}</th>)}
@@ -74,16 +77,17 @@ export function ResearchVsPaper({ids, history, overview, ledger}) {
 }
 
 export function PaperOverlap({ids, ledger, researchShared = [], asOf}) {
+  const book = bookFromSearch(window.location.search);
   const {trades, positions, fills} = ledger;
   const err = trades.error || positions.error || fills.error;
   const ready = trades.data && positions.data && fills.data;
   const rows = ready ? paperOverlap(ids, {trades: trades.data.rows, positions: positions.data.rows, fills: fills.data.rows}) : [];
   const onPaper = new Set(ready ? [...positions.data.rows, ...trades.data.rows, ...fills.data.rows].filter(r => ids.includes(Number(r.strategy))).map(r => r.symbol) : []);
-  return <Section eyebrow="paper_v1 · actual book" title="Stocks more than one strategy holds or traded on paper" className="ad-ledger-palette ad-pvr">
+  return <Section eyebrow={`${book} · actual book`} title="Stocks more than one strategy holds or traded on paper" className="ad-ledger-palette ad-pvr">
     {err ? <Callout tone="error">{err}</Callout> : !ready ? <Loading label="Reading the paper book…"/> : !rows.length
       ? <Blank title="No paper overlap among these strategies" text="No stock is held, closed or filled on paper by two or more of the selected strategies. Nothing is inferred from research scans."/>
       : <>
-        <p className="ad-ledger-note">{rows.length} stock{rows.length === 1 ? '' : 's'} appear in the paper activity of 2+ selected strategies. One row per strategy leg, then the combined line. All figures are real paper_v1 records; nothing is simulated.</p>
+        <p className="ad-ledger-note">{rows.length} stock{rows.length === 1 ? '' : 's'} appear in the paper activity of 2+ selected strategies. One row per strategy leg, then the combined line. All figures are real {book} records; nothing is simulated.</p>
         <div className="ad-table-scroll"><table className="ad-table ad-pvr-table">
           <caption className="ad-sr">Paper overlap stocks</caption>
           <thead><tr>{['Stock / strategy', 'Open qty', 'Avg entry', 'Mark', 'Unrealized ₹', 'Unrealized %', 'Net of charges ₹', 'Charges paid ₹', 'Closed', 'Realized ₹', 'Realized net ₹'].map((h, i) => <th key={h} scope="col" className={i ? 'r' : ''}>{h}</th>)}</tr></thead>

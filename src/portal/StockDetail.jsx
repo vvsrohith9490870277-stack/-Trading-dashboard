@@ -1,6 +1,7 @@
 import {useMemo, useState} from 'react';
 import {ArrowLeft, Check, X} from 'lucide-react';
 import {Link, runIdFor, stockHref} from './router';
+import {bookFromSearch} from './book';
 import {symbolCandidates, useAllPages, useDashboard, useStatic} from './data';
 import {closedStats, openStats, withoutDemo} from './paper-vs-research';
 import {fmt, inr, istTime, pct, signedInr, strategyName, STRATEGY_HUES, ticker, tone} from './format';
@@ -63,6 +64,7 @@ function SavedBacktest({file, strategyId, sym, runId}) {
 
 export default function StockDetail({route, refreshKey}) {
   const {symbol, runId} = route;
+  const book = bookFromSearch(window.location.search);
   const history = useStatic('/data/historical.json');
   const catalog = useStatic('/data/strategy-catalog.json');
   const candidates = symbolCandidates(symbol);
@@ -116,7 +118,7 @@ export default function StockDetail({route, refreshKey}) {
       <Section eyebrow={`Bar ${scanRow.bar_date}`} title="Live checklist"><KeyValues value={scanRow.checklist}/></Section>
       <Section eyebrow="Engine plan" title="Trade plan"><KeyValues value={scanRow.plan}/></Section></div>)}
     {tab === 'live' && <>
-      <Section eyebrow="paper_v1" title="Open positions in this stock">
+      <Section eyebrow={book} title="Open positions in this stock">
         {positions.error ? <Callout tone="error">{positions.error}</Callout> : <SortTable caption="positions" rows={myPositions} columns={[
           {key: 'strategy', title: 'Strategy', render: v => <span className="ad-strat"><i style={{background: STRATEGY_HUES[v - 1]}}/>{strategyName(v)}</span>},
           {key: 'qty', title: 'Qty', align: 'right'}, {key: 'entry_price', title: 'Entry', align: 'right', render: v => inr(v)},
@@ -124,12 +126,12 @@ export default function StockDetail({route, refreshKey}) {
           {key: 'entry_at', title: 'Opened', render: v => istTime(v)},
         ]} empty={{title: 'Not held on paper', text: 'No strategy currently holds this stock.'}}/>}
       </Section>
-      <Section eyebrow="paper_v1" title="Fills">
+      <Section eyebrow={book} title="Fills">
         {fills.error ? <Callout tone="error">{fills.error}</Callout> : <SortTable caption="fills" rows={myFills} columns={[
           {key: 'filled_at', title: 'Filled', render: v => istTime(v)}, {key: 'strategy', title: 'Strategy', render: v => strategyName(v)},
           {key: 'side', title: 'Side', render: v => <Tag tone={v === 'BUY' ? 'good' : 'bad'}>{v}</Tag>}, {key: 'qty', title: 'Qty', align: 'right'},
           {key: 'price', title: 'Price', align: 'right', render: v => inr(v)}, {key: 'realized_pnl', title: 'Realized', align: 'right', render: v => (v === null || v === undefined ? '—' : signedInr(v))},
-        ]} empty={{title: 'No paper fills for this stock', text: 'Searched every paper_v1 fill read.'}}/>}
+        ]} empty={{title: 'No paper fills for this stock', text: `Searched every ${book} fill read.`}}/>}
         <p className="ad-muted ad-fine">Searched {fills.data?.rows?.length ?? 0} of {fills.data?.total ?? 0} paper fills{fills.data && !fills.data.complete ? ' (partial record: 5,000-row cap)' : ''}.</p>
       </Section>
     </>}
@@ -147,7 +149,7 @@ export default function StockDetail({route, refreshKey}) {
         {key: 'pUnrealized', title: 'Unrealized ₹', align: 'right', render: v => <span className={`ad-${tone(v)}`}>{signedInr(v)}</span>},
         {key: 'pNet', title: 'Net of charges ₹', align: 'right', render: v => <span className={`ad-${tone(v)}`}>{signedInr(v)}</span>},
       ]}/>}
-      <p className="ad-muted ad-fine">Closed / Win / Mean / Best / Worst are the saved research run ({history.data?.asOf ?? '—'}, gross % per closed trade, costs excluded). “Paper” columns are this stock’s real paper_v1 record for the same strategy and are never blended with research. Paper win and mean need at least one closed paper trade; unrealized is open, not closed.</p>
+      <p className="ad-muted ad-fine">Closed / Win / Mean / Best / Worst are the saved research run ({history.data?.asOf ?? '—'}, gross % per closed trade, costs excluded). “Paper” columns are this stock’s real {book} record for the same strategy and are never blended with research. Paper win and mean need at least one closed paper trade; unrealized is open, not closed.</p>
     </Section>}
     <Section className="ad-stubbed" eyebrow="Not connected" title="Fundamentals, corporate events and news">
       <p className="ad-muted">Market cap, earnings and ex-dividend dates, and news are not available: the dashboard has no data source for them, so nothing is shown rather than made up.</p>

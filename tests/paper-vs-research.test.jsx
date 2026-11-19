@@ -82,7 +82,7 @@ describe('research vs paper statistics', () => {
 });
 
 const sleeve = (open, net) => ({cash_paise: 100000000, market_value_paise: 0, equity_paise: 100000000 + net, net_pnl_paise: net, open_positions: open, slots_max: 9});
-const overview = {readAt: '2026-11-09T11:00:00.000Z', namespace: 'paper_v1', day: '2026-11-09', market: {open: false, label: 'closed'},
+const overview = {readAt: '2026-11-09T11:00:00.000Z', namespace: 'paper_v2', day: '2026-11-09', market: {open: false, label: 'closed'},
   cappedLedger: {available: true, master_capital_paise: 700000000, sleeves: {1: sleeve(1, -2000), 4: sleeve(0, 0), 7: sleeve(1, -10000)}},
   totals: {openPositions: 2}, performance: [], positions: [], dailyHistory: [], recentFills: [], recentSignals: [], lastRuns: [], quoteAudit: [], demoTrades: []};
 const pages = {

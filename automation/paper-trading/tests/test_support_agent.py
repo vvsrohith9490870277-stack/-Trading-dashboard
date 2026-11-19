@@ -404,6 +404,22 @@ class SupportAgentV3ProductionPlanTests(unittest.TestCase):
             self.assertTrue((Path(tmp) / 'heartbeat.json').exists())
             self.assertEqual(hb_file['status'], 'ok')
 
+    def test_namespace_defaults_follow_config(self):
+        import inspect
+        import tempfile
+        for fn in (sa.build_nov9_replay_fixture, sa.run_virtual_clock_replay, sa.write_heartbeat):
+            self.assertIsNone(inspect.signature(fn).parameters['namespace'].default)
+        prev = sa.CFG['namespace']
+        try:
+            sa.CFG['namespace'] = 'paper_cutover_test_v1'
+            with tempfile.TemporaryDirectory() as tmp:
+                hb = sa.write_heartbeat(tmp, now_at='2026-11-09T10:00:00+05:30')
+                self.assertEqual(hb['namespace'], 'paper_cutover_test_v1')
+                explicit = sa.write_heartbeat(tmp, 'paper_v1', now_at='2026-11-09T10:05:00+05:30')
+                self.assertEqual(explicit['namespace'], 'paper_v1')
+        finally:
+            sa.CFG['namespace'] = prev
+
     def test_v3_f5_f6_p4_verifier_loop_binding_scripts_and_reconciler(self):
         import tempfile
         import support_verifiers as sv

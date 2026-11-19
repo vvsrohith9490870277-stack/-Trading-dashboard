@@ -15,8 +15,8 @@ async function fixture({costs=true,events=true}={}){
 }
 const now=new Date('2026-11-09T10:00:00Z');const run=db=>async(sql,args)=>(await db.execute({sql,args})).rows;
 const read=(db,q)=>readDashboard(parseOptions(q),run(db),now);
-async function fill(db,id,signal,strategy,symbol,side,qty,price,at,reason,pnl){await db.execute({sql:'INSERT INTO paper_fills(id,namespace,signal_id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl,cashflow) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',args:[id,'paper_v1',signal,strategy,symbol,side,qty,price,at,at,reason,pnl,side==='BUY'?-price*qty:price*qty]});}
-async function cost(db,fillId,strategy,symbol,side,turnover,total,day='2026-11-09'){const fees={brokerage:Math.floor(total/2),stt:total-Math.floor(total/2),exchange:0,sebi:0,ipft:0,clearing:0,stamp:0,gst:0,dp:0,dp_gst:0,total};await db.execute({sql:'INSERT INTO paper_fill_costs(namespace,fill_id,day,strategy,symbol,isin,side,turnover_paise,policy_version,components_json,total_paise,entry_at,gross_cashflow_paise,net_cashflow_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v1',fillId,day,strategy,symbol,'INE000000000',side,turnover,'FIXTURE_POLICY_v1',JSON.stringify(fees),total,'2026-11-06T10:00:00+05:30',side==='BUY'?-turnover:turnover,(side==='BUY'?-turnover:turnover)-total]});}
+async function fill(db,id,signal,strategy,symbol,side,qty,price,at,reason,pnl){await db.execute({sql:'INSERT INTO paper_fills(id,namespace,signal_id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl,cashflow) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',args:[id,'paper_v2',signal,strategy,symbol,side,qty,price,at,at,reason,pnl,side==='BUY'?-price*qty:price*qty]});}
+async function cost(db,fillId,strategy,symbol,side,turnover,total,day='2026-11-09'){const fees={brokerage:Math.floor(total/2),stt:total-Math.floor(total/2),exchange:0,sebi:0,ipft:0,clearing:0,stamp:0,gst:0,dp:0,dp_gst:0,total};await db.execute({sql:'INSERT INTO paper_fill_costs(namespace,fill_id,day,strategy,symbol,isin,side,turnover_paise,policy_version,components_json,total_paise,entry_at,gross_cashflow_paise,net_cashflow_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v2',fillId,day,strategy,symbol,'INE000000000',side,turnover,'FIXTURE_POLICY_v1',JSON.stringify(fees),total,'2026-11-06T10:00:00+05:30',side==='BUY'?-turnover:turnover,(side==='BUY'?-turnover:turnover)-total]});}
 
 describe('ledger tab adapters (isolated fixture)',()=>{
  it('history pairs each exit with its latest earlier entry and nets recorded charges of both fills',async()=>{
@@ -50,7 +50,7 @@ describe('ledger tab adapters (isolated fixture)',()=>{
  });
  it('orders/signals filter by status and attach the executing fill',async()=>{
   const db=await fixture();
-  for(const[id,status]of [['p1','pending'],['f1','filled'],['x1','expired']])await db.execute({sql:'INSERT INTO paper_signals VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v1',id,3,'ABB-EQ','2026-11-06','BUY',status,'daily_entry:beta_momentum_v1','2026-11-06T16:00:00+05:30','2026-11-09']});
+  for(const[id,status]of [['p1','pending'],['f1','filled'],['x1','expired']])await db.execute({sql:'INSERT INTO paper_signals VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v2',id,3,'ABB-EQ','2026-11-06','BUY',status,'daily_entry:beta_momentum_v1','2026-11-06T16:00:00+05:30','2026-11-09']});
   await fill(db,1,'f1',3,'ABB-EQ','BUY',4,99.5,'2026-11-09T09:20:00+05:30','daily_entry',0);
   const pending=await read(db,{view:'signals',status:'pending'});expect(pending.total).toBe(1);expect(pending.rows[0]).toMatchObject({id:'p1',status:'pending',fill_qty:null,reason:'daily_entry:beta_momentum_v1'});
   const filled=await read(db,{view:'signals',status:'filled'});expect(filled.rows[0]).toMatchObject({fill_qty:4,fill_price:99.5,filled_at:'2026-11-09T09:20:00+05:30'});
@@ -58,21 +58,21 @@ describe('ledger tab adapters (isolated fixture)',()=>{
  });
  it('engine runs filter by kind, expose a whitelisted summary and a latest-per-kind health strip',async()=>{
   const db=await fixture();
-  await db.execute({sql:'INSERT INTO paper_runs(namespace,kind,at,status,details_json) VALUES(?,?,?,?,?)',args:['paper_v1','scan','2026-11-09T06:57:00Z','partial',JSON.stringify({signals_queued:17,latest_qualifiers:40,universe_symbols:750,unavailable_current_symbols:['A','B'],target_completed_bar:'2026-11-06',prefilter_counts:{PASS:300,FAIL:440,UNAVAILABLE:10},token:'secret-token'})]});
-  for(let i=0;i<3;i++)await db.execute({sql:'INSERT INTO paper_runs(namespace,kind,at,status,details_json) VALUES(?,?,?,?,?)',args:['paper_v1','monitor',`2026-11-09T0${7+i}:00:00Z`,'ok',JSON.stringify({fills:0,quotes:17,fresh_quotes:17})]});
-  await db.execute("INSERT INTO paper_quote_audit(namespace,symbol,observed_at,quote_at,price,accepted,reason) VALUES('paper_v1','ABB-EQ','2026-11-09T09:00:05Z','2026-11-09T09:00:00Z',100,1,'fresh')");
+  await db.execute({sql:'INSERT INTO paper_runs(namespace,kind,at,status,details_json) VALUES(?,?,?,?,?)',args:['paper_v2','scan','2026-11-09T06:57:00Z','partial',JSON.stringify({signals_queued:17,latest_qualifiers:40,universe_symbols:750,unavailable_current_symbols:['A','B'],target_completed_bar:'2026-11-06',prefilter_counts:{PASS:300,FAIL:440,UNAVAILABLE:10},token:'secret-token'})]});
+  for(let i=0;i<3;i++)await db.execute({sql:'INSERT INTO paper_runs(namespace,kind,at,status,details_json) VALUES(?,?,?,?,?)',args:['paper_v2','monitor',`2026-11-09T0${7+i}:00:00Z`,'ok',JSON.stringify({fills:0,quotes:17,fresh_quotes:17})]});
+  await db.execute("INSERT INTO paper_quote_audit(namespace,symbol,observed_at,quote_at,price,accepted,reason) VALUES('paper_v2','ABB-EQ','2026-11-09T09:00:05Z','2026-11-09T09:00:00Z',100,1,'fresh')");
   const r=await read(db,{view:'runs',kind:'scan'});expect(r.total).toBe(1);
   expect(r.rows[0]).toMatchObject({kind:'scan',status:'partial',summary:{signals_queued:17,latest_qualifiers:40,universe_symbols:750,unavailable_symbols:2,target_bar:'2026-11-06',prefilter:{pass:300,fail:440,unavailable:10}}});
   expect(JSON.stringify(r)).not.toContain('secret');expect(r.rows[0]).not.toHaveProperty('details_json');
   expect(r.health.latestByKind.map(x=>[x.kind,Number(x.runs)])).toEqual([['monitor',3],['scan',1]]);expect(r.health.lastAcceptedQuoteAt).toBe('2026-11-09T09:00:00Z');
  });
  it('quote audit filters accepted/rejected and reports exchange lag',async()=>{
-  const db=await fixture();for(const[acc,reason]of [[1,'fresh'],[0,'stale_or_future_quote']])await db.execute({sql:'INSERT INTO paper_quote_audit(namespace,symbol,observed_at,quote_at,price,accepted,reason) VALUES(?,?,?,?,?,?,?)',args:['paper_v1','ABB-EQ','2026-11-09T09:01:00Z','2026-11-09T09:00:00Z',100,acc,reason]});
+  const db=await fixture();for(const[acc,reason]of [[1,'fresh'],[0,'stale_or_future_quote']])await db.execute({sql:'INSERT INTO paper_quote_audit(namespace,symbol,observed_at,quote_at,price,accepted,reason) VALUES(?,?,?,?,?,?,?)',args:['paper_v2','ABB-EQ','2026-11-09T09:01:00Z','2026-11-09T09:00:00Z',100,acc,reason]});
   const r=await read(db,{view:'quotes',accepted:'0'});expect(r.total).toBe(1);expect(r.rows[0]).toMatchObject({accepted:0,reason:'stale_or_future_quote',lag_seconds:60});
  });
  it('alerts read risk hits and blocked orders from the audit log without exposing raw payloads; a missing table is unavailable',async()=>{
   const db=await fixture();
-  const ev=(id,type,sev,outcome,data)=>db.execute({sql:'INSERT INTO paper_events(namespace,event_id,run_id,session_day,source_at,recorded_at,event_type,severity,outcome,strategy,symbol,bar_date,data_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v1',id,'r','2026-11-09','2026-11-09T05:00:0'+id+'Z','2026-11-09T05:00:00Z',type,sev,outcome,7,'ABB-EQ','2026-11-06',JSON.stringify(data)]});
+  const ev=(id,type,sev,outcome,data)=>db.execute({sql:'INSERT INTO paper_events(namespace,event_id,run_id,session_day,source_at,recorded_at,event_type,severity,outcome,strategy,symbol,bar_date,data_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v2',id,'r','2026-11-09','2026-11-09T05:00:0'+id+'Z','2026-11-09T05:00:00Z',type,sev,outcome,7,'ABB-EQ','2026-11-06',JSON.stringify(data)]});
   await ev('1','risk_hit','INFO','ok',{price:95.5,threshold:96,rule:'observed_stop_crossing',quote_at:'2026-11-09T05:00:00Z',note:'free text /home/x'});
   await ev('2','paper_order_result','INFO','blocked',{reason:'SLEEVE_SLOT_FULL'});await ev('3','paper_order_result','INFO','filled',{});await ev('4','monitor_tick','INFO','ok',{});
   const r=await read(db,{view:'events'});expect(r.total).toBe(2);
@@ -81,9 +81,9 @@ describe('ledger tab adapters (isolated fixture)',()=>{
   expect(await read(await fixture({events:false}),{view:'events'})).toMatchObject({available:false,total:0,rows:[]});
  });
  it('data audit lists excluded bars and positions report fresh / stale / missing marks distinctly',async()=>{
-  const db=await fixture();await db.execute("INSERT INTO paper_data_audit VALUES('paper_v1','ABB-EQ','2026-11-06','invalid_Fyers_OHLC','2026-11-09T03:00:00Z')");
+  const db=await fixture();await db.execute("INSERT INTO paper_data_audit VALUES('paper_v2','ABB-EQ','2026-11-06','invalid_Fyers_OHLC','2026-11-09T03:00:00Z')");
   const a=await read(db,{view:'dataaudit'});expect(a.rows).toEqual([{symbol:'ABB-EQ',bar_date:'2026-11-06',reason:'invalid_Fyers_OHLC',observed_at:'2026-11-09T03:00:00Z'}]);
-  for(const[s,mark,markAt]of [['ABB-EQ',110,'2026-11-09T09:59:40Z'],['ACC-EQ',55,'2026-11-09T08:00:00Z'],['AGI-EQ',null,null]])await db.execute({sql:'INSERT INTO paper_positions VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v1',1,s,2,100,'2026-11-09T04:00:00Z',100,mark,markAt,'2026-11-09T09:59:40Z']});
+  for(const[s,mark,markAt]of [['ABB-EQ',110,'2026-11-09T09:59:40Z'],['ACC-EQ',55,'2026-11-09T08:00:00Z'],['AGI-EQ',null,null]])await db.execute({sql:'INSERT INTO paper_positions VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v2',1,s,2,100,'2026-11-09T04:00:00Z',100,mark,markAt,'2026-11-09T09:59:40Z']});
   const p=await read(db,{view:'positions'});const by=Object.fromEntries(p.rows.map(r=>[r.symbol,r]));
   expect(by['ABB-EQ']).toMatchObject({mark_state:'fresh',unrealized_pnl:20,unrealized_pct:10,cost_basis:200,market_value:220,high_water:100});
   expect(by['ACC-EQ'].mark_state).toBe('stale');expect(by['AGI-EQ']).toMatchObject({mark_state:'missing',unrealized_pnl:null,market_value:null});
