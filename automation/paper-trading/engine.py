@@ -1071,6 +1071,15 @@ def main():
    elif args.command=='support':
     print(js(sa.run_cli(e,db,args.session)))
    else:
+    if rm.is_render() and args.command in ('guardian', 'sessiond',
+                                           'ensure-session', 'ensure-sessiond'):
+     # Render mode: the supervisor replaces the box session daemon and
+     # guardian, so these box daemons must never start on Render. (They
+     # also open log/lock files under e.ROOT/'logs', which does not exist
+     # in a bare tree or a Render container.)
+     print(js({'paper_only': True, 'status': 'disabled',
+               'command': args.command, 'reason': 'render_mode'}))
+     return
     import sessiond as sd
     fn={'worker':au.worker,'ensure-monitor':au.ensure_monitor,'health':au.health,'preflight':au.preflight,'ensure-session':_ensure_session,'guardian':gd.run,'sessiond':sd.run,'ensure-sessiond':sd.ensure,'record-outages':au.record_outages}[args.command]
     with al.scope(e,db,args.command):print(js(fn(e,db)))

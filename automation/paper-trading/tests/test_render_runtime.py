@@ -220,5 +220,51 @@ class PreflightTests(unittest.TestCase):
                 au.preflight(self.e, self.db)
 
 
+class BoxDaemonDisabledInRenderTests(unittest.TestCase):
+    """Task 1.6: the box session daemon / guardian must never start on
+    Render (the supervisor replaces them). They return a disabled status
+    instead of opening log/lock files under e.ROOT/'logs'."""
+
+    def test_box_daemons_disabled_in_render(self):
+        import subprocess
+        # db.mjs only accepts a test DB under tests/test_*.sqlite
+        db = ROOT / 'tests' / 'test_render_daemon.sqlite'
+        import render_state as rs
+        store = rs.SqliteStore(db)
+        rs.migrate(store)
+        # the runner guard fails closed with no flag; set active_runner so
+        # the commands reach the render-mode disable
+        store.execute(
+            'INSERT INTO paper_runtime_kv(scope, key, value, updated_at)'
+            ' VALUES(?, ?, ?, ?)'
+            ' ON CONFLICT(scope, key) DO UPDATE SET value=excluded.value',
+            ('paper_v2', 'active_runner', 'render', '2026-11-19T00:00:00'))
+        store.close()
+        try:
+            for cmd in ('ensure-session', 'guardian', 'sessiond',
+                        'ensure-sessiond'):
+                with self.subTest(cmd=cmd):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        env = dict(os.environ)
+                        env['PAPER_RUNTIME'] = 'render'
+                        env['RENDER_MODE'] = 'live'
+                        env['PAPER_TEST_DATABASE'] = str(db)
+                        env['PAPER_STATE_DIR'] = tmp
+                        env['PAPER_SESSIOND_DISABLE'] = '1'
+                        r = subprocess.run(
+                            [sys.executable, 'engine.py', cmd],
+                            capture_output=True, text=True, env=env,
+                            timeout=120, cwd=str(ROOT))
+                        self.assertEqual(r.returncode, 0,
+                                         r.stdout + r.stderr)
+                        out = json.loads(r.stdout.strip().splitlines()[-1])
+                        self.assertEqual(out['status'], 'disabled', out)
+                        self.assertEqual(out['reason'], 'render_mode', out)
+        finally:
+            db.unlink(missing_ok=True)
+            for suffix in ('-wal', '-shm', '-journal'):
+                Path(str(db) + suffix).unlink(missing_ok=True)
+
+
 if __name__ == '__main__':
     unittest.main()
