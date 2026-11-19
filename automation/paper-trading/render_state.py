@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -52,44 +53,56 @@ def migrate(store):
 
 
 class SqliteStore:
-    """Local SQLite backend (tests, dry-run)."""
+    """Local SQLite backend (tests, dry-run).
+
+    Thread-safe: the Render supervisor shares one store between its main
+    thread, the lease-renewal thread and the HTTP thread, so the connection
+    is opened with check_same_thread=False and every use is serialised
+    with a lock.
+    """
 
     def __init__(self, path):
         self.path = str(path)
         Path(self.path).parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(self.path, timeout=30)
+        self.conn = sqlite3.connect(self.path, timeout=30,
+                                    check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute('PRAGMA journal_mode=WAL')
         self.conn.execute('PRAGMA busy_timeout=30000')
+        self._lock = threading.RLock()
 
     def execute(self, sql, args=()):
-        cur = self.conn.execute(sql, args)
-        rows = [dict(r) for r in cur.fetchall()] if cur.description is not None else []
-        self.conn.commit()
-        return rows
+        with self._lock:
+            cur = self.conn.execute(sql, args)
+            rows = [dict(r) for r in cur.fetchall()] if cur.description is not None else []
+            self.conn.commit()
+            return rows
 
     def execute_many(self, statements):
         counts = []
-        for sql, args in statements:
-            cur = self.conn.execute(sql, args)
-            counts.append(cur.rowcount if cur.rowcount is not None else 0)
-        self.conn.commit()
+        with self._lock:
+            for sql, args in statements:
+                cur = self.conn.execute(sql, args)
+                counts.append(cur.rowcount if cur.rowcount is not None else 0)
+            self.conn.commit()
         return counts
 
     def affected_rows(self, sql, args=()):
-        cur = self.conn.execute(sql, args)
-        self.conn.commit()
-        return cur.rowcount if cur.rowcount is not None else 0
+        with self._lock:
+            cur = self.conn.execute(sql, args)
+            self.conn.commit()
+            return cur.rowcount if cur.rowcount is not None else 0
 
     def server_time(self):
         rows = self.execute("SELECT CAST(strftime('%s','now') AS INTEGER) AS t")
         return int(rows[0]['t'])
 
     def close(self):
-        try:
-            self.conn.close()
-        except Exception:
-            pass
+        with self._lock:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
 
 
 class TursoHttpStore:
