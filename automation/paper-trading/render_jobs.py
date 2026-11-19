@@ -67,8 +67,15 @@ def run_job(store, namespace, job, session_day, owner_id, runner):
 
 
 def last_run_times(store, namespace):
-    """{job name: aware datetime of its last completed (status ok) run}."""
+    """{job name: aware datetime of its last completed (status ok) run}.
+
+    finished_at is stored in UTC by _now_iso(); parse it as UTC and convert
+    to IST. (Parsing it as IST directly puts last_run 5.5 h behind the real
+    run, so due_jobs() would report the job due again for the rest of its
+    catch-up window and the supervisor would re-run it every tick.)
+    """
     from zoneinfo import ZoneInfo
+    from datetime import timezone
     rows = store.execute(
         'SELECT job, MAX(finished_at) AS f FROM paper_job_runs'
         ' WHERE namespace=? AND status=? GROUP BY job',
@@ -77,5 +84,6 @@ def last_run_times(store, namespace):
     for r in rows:
         if r['f']:
             out[r['job']] = datetime.strptime(
-                r['f'], '%Y-%m-%dT%H:%M:%S').replace(tzinfo=ZoneInfo('Asia/Kolkata'))
+                r['f'], '%Y-%m-%dT%H:%M:%S').replace(
+                    tzinfo=timezone.utc).astimezone(ZoneInfo('Asia/Kolkata'))
     return out

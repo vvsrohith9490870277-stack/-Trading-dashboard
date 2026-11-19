@@ -82,11 +82,14 @@ class ScheduleTests(unittest.TestCase):
     def test_trial_schedule(self):
         sched = rsch.load_schedule(mode='trial')
         names = {j['name'] for j in sched['jobs']}
-        self.assertIn('preflight', names)
         self.assertIn('scan', names)
         self.assertIn('record_outages', names)
         self.assertNotIn('exit_selftest', names)
         self.assertNotIn('adaptive', names)
+        # The trial never calls Fyers: no preflight (reference refresh) and
+        # no sync_history (history is seeded by trial-init) in trial mode.
+        self.assertNotIn('preflight', names)
+        self.assertNotIn('sync_history', names)
         by_name = {j['name']: j for j in sched['jobs']}
         self.assertEqual(by_name['scan']['time'], '08:45')
 
@@ -139,6 +142,28 @@ class JobRunTests(unittest.TestCase):
         self.assertEqual(rows[0]['status'], 'ok')
         last = rj.last_run_times(self.store, 'paper_v2')
         self.assertIn('scan', last)
+
+    def test_last_run_times_makes_job_not_due_in_window(self):
+        # Regression: finished_at is stored in UTC; last_run_times used to
+        # parse it as IST (5.5 h behind), so due_jobs() reported the job
+        # due again and the supervisor re-ran it every tick for 30 min.
+        rj.run_job(self.store, 'paper_v2', 'scan', '2026-11-20',
+                   'owner', lambda job: {'status': 'ok'})
+        # Pretend the run finished at the 08:45 IST slot (03:15 UTC).
+        self.store.execute(
+            "UPDATE paper_job_runs SET finished_at='2026-11-20T03:15:00'"
+            " WHERE namespace='paper_v2' AND job='scan'")
+        sched = rsch.load_schedule()
+        last = rj.last_run_times(self.store, 'paper_v2')
+        from datetime import datetime
+        from zoneinfo import ZoneInfo
+        ist = ZoneInfo('Asia/Kolkata')
+        # 5 minutes after the 08:45 scan slot, still inside the 30-min
+        # catch-up window: the job must NOT be due again.
+        now = datetime(2026, 11, 20, 8, 50, tzinfo=ist)
+        self.assertNotIn(
+            'scan', [j['name'] for j in rsch.due_jobs(sched, now,
+                                                      last_run=last)])
 
 
 if __name__ == '__main__':

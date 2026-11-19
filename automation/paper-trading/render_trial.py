@@ -52,7 +52,7 @@ def resolve(mode, cfg_namespace, override, runtime_is_render):
         if is_trial_namespace(cfg_namespace):
             raise NamespaceRefused(
                 'live mode refuses trial namespace %s' % cfg_namespace)
-        if cfg_namespace in ('paper_v1', 'paper_demo_v1'):
+        if cfg_namespace in ('paper_v1', 'paper_demo_v1'):  # refused: archived namespaces
             # A Render deploy of a main that still carries the archive
             # namespace must never start (brief section 3).
             raise NamespaceRefused(

@@ -296,6 +296,12 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
 
+    def do_POST(self):
+        # The health endpoint is GET-only; anything else is not a route.
+        self.send_response(405)
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description='Render supervisor + health')
