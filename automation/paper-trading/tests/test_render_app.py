@@ -69,6 +69,122 @@ class HealthTests(unittest.TestCase):
         self.assertFalse(rh.memory_over_limit(100))
 
 
+class HealthFieldsTests(unittest.TestCase):
+    """Task 2 (render-deploy-02): /health carries every brief-01
+    Task 6.3 field, with exactly those names."""
+
+    # Top-level keys a live snapshot must have (trial adds two more).
+    LIVE_KEYS = {
+        'ok', 'mode', 'login_allowed', 'state', 'namespace', 'role',
+        'runner_id', 'epoch', 'uptime_s', 'now_ist', 'session_open',
+        'calendar_valid_through', 'calendar_days_left', 'worker',
+        'last_tick_ist', 'last_lease_renew_age_s', 'jobs_today',
+        'last_job', 'rss_mb', 'children_rss_mb', 'fyers_budget', 'auth',
+        'git_sha', 'version',
+        # kept from the original snapshot:
+        'status', 'active_runner', 'lease', 'jobs', 'uptime_seconds',
+        'memory_mb',
+    }
+
+    def _snap(self, mode='live', **kw):
+        args = dict(mode=mode, namespace='paper_v2',
+                    active_runner='render', lease_held=True,
+                    lease={'owner_id': 'render:h:1:1', 'epoch': 3},
+                    worker={'state': 'running', 'pid': 123, 'rss_mb': 200,
+                            'restarts': 0},
+                    jobs={'scan': '2026-11-20T08:45:00'},
+                    uptime_seconds=60, memory_mb=150)
+        args.update(kw)
+        return rh.build_snapshot(**args)
+
+    def test_health_has_all_brief_fields(self):
+        live = self._snap(mode='live')
+        self.assertEqual(set(live), self.LIVE_KEYS)
+        trial = self._snap(mode='trial')
+        self.assertEqual(set(trial),
+                         self.LIVE_KEYS | {'trial_budget',
+                                           'box_conflict_check'})
+        # worker subkeys (brief 6.3): state, pid, restarts_10m,
+        # last_heartbeat_age_s (plus the kept rss_mb/restarts)
+        for snap in (live, trial):
+            self.assertEqual(
+                set(snap['worker']),
+                {'state', 'pid', 'rss_mb', 'restarts', 'restarts_10m',
+                 'last_heartbeat_age_s'})
+            self.assertEqual(set(snap['fyers_budget']),
+                             {'day_used', 'per_day_limit'})
+            self.assertEqual(set(snap['auth']), {'circuit_open'})
+        self.assertEqual(set(trial['trial_budget']),
+                         {'day_used', 'day_cap', 'minute_cap'})
+        self.assertEqual(set(trial['box_conflict_check']),
+                         {'paper_v2_heartbeat_present',
+                          'paper_v2_heartbeat_age_s'})
+        # the keyword form a monitor matches (documented): "ok": true
+        self.assertIn('"ok": true', json.dumps(live))
+        self.assertIn('"ok": true', json.dumps(trial))
+
+    def test_health_ok_matches_http_status(self):
+        ok_snap = self._snap(mode='live')
+        code, payload = rh.health_response(ok_snap)
+        self.assertEqual(code, 200)
+        self.assertIs(payload['ok'], True)
+        bad_snap = self._snap(mode='live', active_runner='render',
+                              lease_held=False, lease=None,
+                              worker={'state': 'stopped'})
+        code, payload = rh.health_response(bad_snap)
+        self.assertEqual(code, 503)
+        self.assertIs(payload['ok'], False)
+
+    def test_health_login_allowed_false_in_trial_true_in_live_with_creds(self):
+        old = {}
+        for k in ('FYERS_AUTO_LOGIN', 'FYERS_CLIENT_ID', 'FYERS_SECRET_ID',
+                  'FYERS_PIN', 'FYERS_TOTP_SECRET', 'RENDER_GIT_COMMIT'):
+            old[k] = os.environ.pop(k, None)
+        os.environ.update({
+            'FYERS_AUTO_LOGIN': '1', 'FYERS_CLIENT_ID': 'c',
+            'FYERS_SECRET_ID': 's', 'FYERS_PIN': 'p',
+            'FYERS_TOTP_SECRET': 't'})
+        try:
+            live = self._snap(mode='live')
+            self.assertIs(live['login_allowed'], True)
+            trial = self._snap(mode='trial')
+            self.assertIs(trial['login_allowed'], False)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_health_no_secret_values(self):
+        old = {}
+        for k in ('FYERS_AUTO_LOGIN', 'FYERS_CLIENT_ID', 'FYERS_SECRET_ID',
+                  'FYERS_PIN', 'FYERS_TOTP_SECRET', 'TURSO_AUTH_TOKEN',
+                  'TURSO_DATABASE_URL', 'TOKEN_ENC_KEY'):
+            old[k] = os.environ.pop(k, None)
+        os.environ.update({
+            'FYERS_AUTO_LOGIN': '1', 'FYERS_CLIENT_ID': 'CANARY_CLIENT',
+            'FYERS_SECRET_ID': 'CANARY_SECRET', 'FYERS_PIN': 'CANARY_PIN',
+            'FYERS_TOTP_SECRET': 'CANARY_TOTP',
+            'TURSO_AUTH_TOKEN': 'CANARY_TURSO_TOKEN',
+            'TURSO_DATABASE_URL': 'libsql://CANARY_TURSO_HOST',
+            'TOKEN_ENC_KEY': 'CANARY_ENC_KEY'})
+        try:
+            for mode in ('live', 'trial'):
+                body = json.dumps(self._snap(mode=mode))
+                for canary in ('CANARY_CLIENT', 'CANARY_SECRET',
+                               'CANARY_PIN', 'CANARY_TOTP',
+                               'CANARY_TURSO_TOKEN', 'CANARY_TURSO_HOST',
+                               'CANARY_ENC_KEY'):
+                    self.assertNotIn(canary, body, mode)
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class CheckNamespaceTests(unittest.TestCase):
     def setUp(self):
         self.old = {}
@@ -202,6 +318,36 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(payload['status'], 'idle_not_active_runner')
         self.assertEqual(payload['worker']['state'], 'stopped')
         self.assertIsNone(rl.get_lease(self.store, 'paper_v2'))
+
+    def test_supervisor_trial_health_keys(self):
+        # G7n at unit level: the real process in trial mode serves every
+        # brief 6.3 key, login_allowed false, and the "ok": true keyword.
+        self.proc = subprocess.Popen(
+            [sys.executable, str(APP)],
+            env=self._env(RENDER_MODE='trial',
+                          PAPER_NAMESPACE_OVERRIDE='paper_render_trial_v1'),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        code, payload = self._wait_health('idle_not_active_runner')
+        self.assertEqual(code, 200, payload)
+        self.assertIs(payload['ok'], True)
+        self.assertEqual(payload['mode'], 'trial')
+        self.assertEqual(payload['namespace'], 'paper_render_trial_v1')
+        self.assertIs(payload['login_allowed'], False)
+        self.assertIn('trial_budget', payload)
+        self.assertIn('box_conflict_check', payload)
+        for key in ('state', 'role', 'runner_id', 'epoch', 'uptime_s',
+                    'now_ist', 'session_open', 'calendar_valid_through',
+                    'calendar_days_left', 'last_tick_ist',
+                    'last_lease_renew_age_s', 'jobs_today', 'last_job',
+                    'rss_mb', 'children_rss_mb', 'fyers_budget', 'auth',
+                    'git_sha', 'version'):
+            self.assertIn(key, payload, key)
+        self.assertIn('restarts_10m',
+                      payload['worker'])
+        self.assertIn('last_heartbeat_age_s', payload['worker'])
+        raw = urllib.request.urlopen(
+            'http://127.0.0.1:%d/health' % self.port, timeout=2).read()
+        self.assertIn(b'"ok": true', raw)
 
     def test_sigterm_exits_zero_within_25s(self):
         rl.set_active_runner(self.store, 'paper_v2', 'render')

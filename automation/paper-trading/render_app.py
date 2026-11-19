@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime, time as dt_time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -28,6 +28,7 @@ import render_jobs as rj
 import render_lease as rl
 import render_schedule as rsch
 import render_state as rs
+import render_trial as rt
 import runtime_mode as rm
 
 IST = ZoneInfo('Asia/Kolkata')
@@ -39,6 +40,32 @@ def repo_config_namespace():
     """The namespace from config.json (next to engine.py; never edited)."""
     cfg_path = Path(__file__).resolve().parent / 'config.json'
     return json.loads(cfg_path.read_text())['namespace']
+
+
+def repo_config():
+    """The whole config.json (read-only; the file is never edited)."""
+    cfg_path = Path(__file__).resolve().parent / 'config.json'
+    return json.loads(cfg_path.read_text())
+
+
+def session_window(cfg, day):
+    """Session window for `day` from config.json alone.
+
+    Mirrors engine.session without importing the engine (so /health
+    stays fast): None when the calendar does not verify the day,
+    () when the market is closed, else (open, close) times.
+    """
+    key = day.isoformat()
+    if not (cfg.get('calendar_valid_from', '')
+            <= key <= cfg.get('calendar_valid_through', '')):
+        return None
+    if key in (cfg.get('special_sessions') or {}):
+        return tuple(dt_time.fromisoformat(t)
+                     for t in cfg['special_sessions'][key])
+    if day.weekday() >= 5 or key in (cfg.get('holidays') or []):
+        return ()
+    return tuple(dt_time.fromisoformat(t)
+                 for t in cfg['regular_session'])
 
 
 def check_namespace():
@@ -58,11 +85,12 @@ def check_namespace():
 class Worker:
     """The engine worker subprocess, with crash backoff and a memory guard."""
 
-    def __init__(self, cmd, env, restarts=0):
+    def __init__(self, cmd, env, restarts=0, restart_times=None):
         self.cmd = cmd
         self.env = env
         self.proc = None
         self.restarts = restarts
+        self.restart_times = list(restart_times or [])
         self.backoff_idx = 0
         self.next_start = 0.0
         self.state = 'stopped'
@@ -98,6 +126,7 @@ class Worker:
             return 'running'
         self.proc = None
         self.restarts += 1
+        self.restart_times.append(time.time())
         backoff = WORKER_BACKOFF_SECONDS[
             min(self.backoff_idx, len(WORKER_BACKOFF_SECONDS) - 1)]
         self.backoff_idx += 1
@@ -118,9 +147,16 @@ class Worker:
         return 0
 
     def describe(self):
+        now = time.time()
+        self.restart_times = [t for t in self.restart_times
+                              if now - t <= 600]
         return {'state': self.poll(),
                 'pid': self.proc.pid if self.proc is not None else None,
-                'rss_mb': self.rss_mb(), 'restarts': self.restarts}
+                'rss_mb': self.rss_mb(), 'restarts': self.restarts,
+                'restarts_10m': len(self.restart_times),
+                # Needs a store read (paper_monitor_health); left null
+                # per brief 02 section 6 — see render_health.py.
+                'last_heartbeat_age_s': None}
 
 
 class Supervisor:
@@ -129,6 +165,7 @@ class Supervisor:
         self.namespace = namespace
         self.mode = mode
         self.owner_id = owner_id
+        self.config = repo_config()
         self.lease = rl.Lease(store, namespace, owner_id)
         self.lease_held = False
         self.worker = None
@@ -139,6 +176,8 @@ class Supervisor:
         self._lock = threading.Lock()
         self.last_flag = None
         self.last_snapshot = None
+        self.last_tick_at = None
+        self.last_lease_renew_at = None
 
     # -- worker ---------------------------------------------------------
     def _worker_cmd(self):
@@ -163,15 +202,17 @@ class Supervisor:
             if rh.memory_over_limit(self.worker.rss_mb()):
                 # memory guard: restart a worker over 450 MB
                 restarts = self.worker.restarts
+                times = self.worker.restart_times
                 self.worker.stop()
                 self.worker = Worker(self._worker_cmd(), self._child_env(),
-                                     restarts=restarts)
+                                     restarts=restarts, restart_times=times)
                 self.worker.start()
             return
         if state == 'crashed' and time.time() >= self.worker.next_start:
             restarts = self.worker.restarts
+            times = self.worker.restart_times
             self.worker = Worker(self._worker_cmd(), self._child_env(),
-                                 restarts=restarts)
+                                 restarts=restarts, restart_times=times)
             self.worker.start()
 
     # -- jobs -----------------------------------------------------------
@@ -208,6 +249,7 @@ class Supervisor:
 
     # -- main tick ------------------------------------------------------
     def tick(self):
+        self.last_tick_at = time.time()
         try:
             flag = rl.get_active_runner(self.store, self.namespace)
             self.store_error = None
@@ -227,6 +269,8 @@ class Supervisor:
             return self.last_snapshot
         if not self.lease_held:
             self.lease_held = self.lease.acquire()
+            if self.lease_held:
+                self.last_lease_renew_at = time.time()
             if not self.lease_held:
                 self.last_snapshot = self.snapshot(flag)
                 return self.last_snapshot
@@ -240,6 +284,8 @@ class Supervisor:
         """Called by the renewal thread every 20 s while the lease is held."""
         if self.lease_held:
             self.lease_held = self.lease.renew()
+            if self.lease_held:
+                self.last_lease_renew_at = time.time()
 
     def snapshot(self, flag):
         if flag is None:
@@ -255,14 +301,72 @@ class Supervisor:
             jobs = {}
         worker = (self.worker.describe() if self.worker is not None
                   else {'state': 'stopped', 'pid': None, 'rss_mb': 0,
-                        'restarts': 0})
+                        'restarts': 0, 'restarts_10m': 0,
+                        'last_heartbeat_age_s': None})
         if self.store_error is not None:
             worker = dict(worker, state='crashed')
+        if self.stopping:
+            state = 'stopping'
+        elif self.store_error is not None or worker['state'] == 'crashed':
+            state = 'degraded'
+        elif flag != 'render':
+            state = 'idle_not_active_runner'
+        elif not self.lease_held:
+            state = 'standby'
+        elif worker['state'] == 'running':
+            state = 'active'
+        else:
+            state = 'starting'
+        if self.lease_held and flag == 'render':
+            role = 'active'
+        elif flag == 'render':
+            role = 'standby'
+        else:
+            role = 'idle'
+        now = datetime.now(IST)
+        today = now.date()
+        session_open = False
+        window = session_window(self.config, today)
+        if window:
+            moment = now.timetz().replace(tzinfo=None)
+            session_open = window[0] <= moment < window[1]
+        valid_through = self.config.get('calendar_valid_through')
+        try:
+            days_left = (date.fromisoformat(valid_through) - today).days \
+                if valid_through else None
+        except Exception:
+            days_left = None
+        caps = rt.trial_caps()
         return rh.build_snapshot(
             mode=self.mode, namespace=self.namespace, active_runner=flag,
             lease_held=self.lease_held, lease=lease, worker=worker,
             jobs=jobs, uptime_seconds=time.time() - self.started_at,
-            memory_mb=rh.memory_rss_mb())
+            memory_mb=rh.memory_rss_mb(),
+            state=state, role=role, runner_id=self.owner_id,
+            session_open=session_open,
+            calendar_valid_through=valid_through,
+            calendar_days_left=days_left,
+            last_tick_ist=(datetime.fromtimestamp(
+                self.last_tick_at, IST).isoformat()
+                if self.last_tick_at is not None else None),
+            last_lease_renew_age_s=(
+                round(time.time() - self.last_lease_renew_at, 1)
+                if self.last_lease_renew_at is not None else None),
+            jobs_today={}, last_job=None,
+            children_rss_mb=rh.children_rss_mb(),
+            fyers_budget={
+                'day_used': None,
+                'per_day_limit': int(
+                    (self.config.get('market_data') or {}).get(
+                        'budget_requests_per_day', 4000))},
+            auth={'circuit_open': None},
+            trial_budget=({'day_used': None, 'day_cap': caps['day'],
+                           'minute_cap': caps['minute']}
+                          if self.mode == 'trial' else None),
+            box_conflict_check=(
+                {'paper_v2_heartbeat_present': None,
+                 'paper_v2_heartbeat_age_s': None}
+                if self.mode == 'trial' else None))
 
     def shutdown(self):
         self.stopping = True
