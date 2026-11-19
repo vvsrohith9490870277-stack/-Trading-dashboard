@@ -29,13 +29,13 @@ What already exists on the box (read-only sources the checker would use):
 ## Proposal: a small Vercel cron/function that only reads heartbeats
 
 - **What it is**: a Vercel Cron Job (every 5 minutes, only 09:15–15:30 IST) hitting one serverless
-  function. The function runs three read-only Turso queries for namespace `paper_v1` and raises an
+  function. The function runs three read-only Turso queries for the **active book** (`paper_v2` since 19 Nov 2026; `paper_v1` is archived and has no live heartbeats) and raises an
   alert when any heartbeat is stale:
-  1. `SELECT heartbeat_at, status FROM paper_monitor_health WHERE namespace='paper_v1'` — alert
+  1. `SELECT heartbeat_at, status FROM paper_monitor_health WHERE namespace='<active book>'` — alert
      if `heartbeat_at` is more than 5 minutes old (10 missed polls) during session hours.
-  2. `SELECT heartbeat_at, session_day, status FROM paper_guardian_health WHERE namespace='paper_v1'`
+  2. `SELECT heartbeat_at, session_day, status FROM paper_guardian_health WHERE namespace='<active book>'`
      — alert if `heartbeat_at` is more than 5 minutes old or `session_day` is not today.
-  3. `SELECT kind, at, status FROM paper_runs WHERE namespace='paper_v1' ORDER BY id DESC LIMIT 5`
+  3. `SELECT kind, at, status FROM paper_runs WHERE namespace='<active book>' ORDER BY id DESC LIMIT 5`
      — alert if no run of any kind in the last 15 minutes during session hours (catches the case
      where the heartbeats exist but nothing is actually running).
   5 minutes is deliberately looser than the 90-second stale budget, so a single slow poll does not
@@ -56,6 +56,12 @@ What already exists on the box (read-only sources the checker would use):
 - **What it must NOT do**: it must not restart the worker/guardian, must not place or cancel
   anything, must not write to any table, and must not hold credentials for the broker or for a
   write-capable Turso token.
+
+## Note: namespace (senior review, 19 Nov 2026)
+
+The queries above were written against `paper_v1`. The live book is now `paper_v2`, so the checker must take
+the namespace from one place (the same active-book constant the dashboard will use after the paper_v2 cutover),
+not hard-code either name. Watching `paper_v1` would alert forever on a frozen book.
 
 ## Risks
 

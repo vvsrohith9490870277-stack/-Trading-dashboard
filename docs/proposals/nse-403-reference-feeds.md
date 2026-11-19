@@ -80,6 +80,10 @@ a 403 day looks like a quiet day with no entries.
   is still unavailable), so a 403 has time for its 6 attempts plus archive fallbacks before the
   first BUY is attempted. Today the feeds are refreshed as part of the session flow, so a
   morning 403 can block the first entries of the day.
+- Senior note (19 Nov 2026): the scan already calls `rf.refresh` (`engine.py` scan, before the first BUY
+  attempt) and the weekday 08:45 IST scan runs before the 09:15 open, so a first refresh with its 6 attempts
+  already happens pre-open. What is still missing is a second, later retry (e.g. 09:00) when a source is
+  still `unavailable`, and the alert in (b).
 - Effect on frozen rules: none — same sources, same "loaded" definition, just earlier.
 - Risks: small; the refresh already holds a lock (`reference_feeds.lock`) so a second run cannot
   overlap the first.
