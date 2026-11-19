@@ -322,22 +322,29 @@ def book_price(raw):
  except (TypeError,ValueError):return None
  return v if math.isfinite(v) and v>=0 else None
 def market_guard(q,band=None):
- """Upper blocks buys and lower blocks sells. A missing band is not a lock. LOCK_UNKNOWN is a flag, not a skip."""
+ """Upper blocks buys and lower blocks sells. A missing band is not a lock. LOCK_UNKNOWN is a flag, not a skip.
+ The circuit decision records how it was made (circuit_source), in this order: the explicit feed flag,
+ then the depth band (upper_band/lower_band on the quote), then the paper_price_bands row, and only then the
+ book heuristic — a zero side of the book with no band anywhere is kept as a fail-closed lock, labelled
+ book_heuristic_unconfirmed, never silently treated as a confirmed lock."""
  q=q or {};band=band or {};series=str(q.get('series') or band.get('series') or 'EQ').upper();surveillance=str(q.get('surveillance') or band.get('surveillance') or '').upper();surveillance=surveillance if surveillance in ('ASM','GSM') else None
  fo=bool(q.get('fo_eligible') or band.get('fo_eligible'));explicit=str(q.get('circuit') or '').upper()
- if explicit in ('UPPER','LOWER','NONE'):state=explicit
+ if explicit in ('UPPER','LOWER','NONE'):state=explicit;source='explicit'
  else:
-  ask,bid=q.get('ask'),q.get('bid')
-  if ask==0 and isinstance(bid,(int,float)) and not isinstance(bid,bool) and bid>0:state='UPPER'
-  elif bid==0 and isinstance(ask,(int,float)) and not isinstance(ask,bool) and ask>0:state='LOWER'
+  px=positive_price(q.get('price'));upper=positive_price(q.get('upper_band'));lower=positive_price(q.get('lower_band'))
+  if upper and lower and upper>lower and px:state='UPPER' if px>=upper else 'LOWER' if px<=lower else 'NONE';source='depth_band'
   else:
-   upper=positive_price(q.get('upper_band') if q.get('upper_band') is not None else band.get('upper_price'));lower=positive_price(q.get('lower_band') if q.get('lower_band') is not None else band.get('lower_price'));px=positive_price(q.get('price'))
-   if upper and lower and upper>lower and px:state='UPPER' if px>=upper else 'LOWER' if px<=lower else 'NONE'
-   else:state='NONE'
+   upper=positive_price(band.get('upper_price'));lower=positive_price(band.get('lower_price'))
+   if upper and lower and upper>lower and px:state='UPPER' if px>=upper else 'LOWER' if px<=lower else 'NONE';source='price_bands'
+   else:
+    ask,bid=q.get('ask'),q.get('bid')
+    if ask==0 and isinstance(bid,(int,float)) and not isinstance(bid,bool) and bid>0:state='UPPER';source='book_heuristic_unconfirmed'
+    elif bid==0 and isinstance(ask,(int,float)) and not isinstance(ask,bool) and ask>0:state='LOWER';source='book_heuristic_unconfirmed'
+    else:state='NONE';source='book_heuristic'
  has_band=positive_price(band.get('upper_price')) is not None or q.get('upper_band') is not None
  prices=[positive_price(q.get(k)) for k in ('open','high','low','price')]
  unknown=state=='NONE' and not fo and not has_band and all(v is not None for v in prices) and len(set(prices))==1
- return {'circuit':state,'series':series if series in ('EQ','BE','BZ') else 'EQ','surveillance':surveillance,'lock_unknown':unknown}
+ return {'circuit':state,'circuit_source':source,'series':series if series in ('EQ','BE','BZ') else 'EQ','surveillance':surveillance,'lock_unknown':unknown}
 def circuit_haircut(locked_price,locked_days):
  """Additional capital_policy circuit_lock_haircut_pct_per_extra_day of the locked price for each locked session after the first."""
  pct=cap.POLICY['circuit_lock_haircut_pct_per_extra_day'];cut=max(0,int(locked_days)-1)*pct
@@ -432,7 +439,7 @@ def _fill(db,s,q,t):
    log('order_skipped',strategy=s['strategy'],symbol=s['symbol'],signal_id=s['id'],cause='SURVEILLANCE_DATA_MISSING',price=reference,reference_feeds=ready,quantity=0)
    _surveillance_alert(db,t,ready)
    return {'filled':False,'reason':'SURVEILLANCE_DATA_MISSING','quantity':0,'execution_path':path}
- r=db.call({'action':'fill','namespace':NS,'signal':s,'quantity':quantity,'price':reference,'isin':ISINS.get(s['symbol']),'quote_at':q['quote_at'],'at':t.isoformat(),'audit_run_id':al.run_id(),'execution_path':path,'strategy_version':RULE_HASH.get(str(s['strategy'])),'circuit':guard['circuit'],'series':guard['series'],'surveillance':guard['surveillance'],'lock_unknown':guard['lock_unknown']});log('paper_fill_attempt',strategy=s['strategy'],symbol=s['symbol'],result=r)
+ r=db.call({'action':'fill','namespace':NS,'signal':s,'quantity':quantity,'price':reference,'isin':ISINS.get(s['symbol']),'quote_at':q['quote_at'],'at':t.isoformat(),'audit_run_id':al.run_id(),'execution_path':path,'strategy_version':RULE_HASH.get(str(s['strategy'])),'circuit':guard['circuit'],'circuit_source':guard['circuit_source'],'series':guard['series'],'surveillance':guard['surveillance'],'lock_unknown':guard['lock_unknown']});log('paper_fill_attempt',strategy=s['strategy'],symbol=s['symbol'],result=r)
  if isinstance(r,dict) and r.get('reason') in ('SLEEVE_SLOT_FULL','ISIN_CAP','INSUFFICIENT_CASH','ADV_FILTER_SKIP','ADV_PARTICIPATION_CAP','CIRCUIT_LOCKED','SERIES_TRANSITION_BE_BZ','ASM_GSM_RESTRICTION','KILL_PAUSE'):
   log('order_skipped',strategy=s['strategy'],symbol=s['symbol'],signal_id=s['id'],cause=r['reason'],price=reference,open_positions=r.get('open_positions'),max_positions_per_sleeve=cap.POLICY['max_positions_per_sleeve'],max_strategies_per_isin=cap.POLICY['max_strategies_per_isin'],quantity=0)
  if isinstance(r,dict) and 'qty' in r:r['quantity']=r['qty']
@@ -686,6 +693,21 @@ def _note_full_sleeve(db,s,t,day):
  _FULL_NOTED.add(key)
  try:decide(db,s,t,'SKIP','SLEEVE_SLOT_FULL','sleeve_full_earlier_in_poll',{'quantity':0,'recorded_once_per_session':True})
  except Exception:pass
+def _confirm_circuit_band(api,sym,q):
+ """Best-effort: fetch the depth band for a one-sided quote and merge only upper_band/lower_band into q.
+ Never raises and never blocks a fill — a depth failure (or an API with no get, as test Feed fakes have)
+ leaves the quote as it was, so market_guard falls back to the paper_price_bands row or the unconfirmed
+ book heuristic. api.get enforces the Fyers RequestBudget."""
+ try:get=getattr(api,'get',None)
+ except Exception:return
+ if not callable(get):return
+ try:row=api.get('depth',{'symbol':'NSE:'+sym,'ohlcv_flag':'1'})
+ except Exception:return
+ try:dq=depth_quote(sym,row or {})
+ except Exception:return
+ for k in ('upper_band','lower_band'):
+  if dq.get(k) is not None:q[k]=dq[k]
+
 def _monitor(db,api):
  t=now()
  if not au.active(sys.modules[__name__],t):r={'status':'market_closed_or_calendar_unverified','at_IST':t.isoformat(),'fills':0};db.run('monitor','closed',**r);return r
@@ -717,7 +739,7 @@ def _monitor(db,api):
   if ok and (triggered or carried):
    actions.append({'id':stable_id(p['strategy'],p['symbol'],p['entry_at'],'pending' if carried else stop_rule),'strategy':p['strategy'],'symbol':p['symbol'],'side':'SELL','bar_date':t.date().isoformat(),'eligible_date':t.date().isoformat(),'reason':'pending_exit_carry' if carried else stop_rule,'rule':None if carried else stop_rule,'expected_entry_at':p['entry_at'],'stop':True,'pending_exit':carried,'stop_level':level})
  for i in range(0,len(position_rows),50):al.emit(sys.modules[__name__],db,'position_checks',rows=position_rows[i:i+50],count=len(position_rows[i:i+50]))
- actions+=signals;day=t.date().isoformat();actions.sort(key=lambda s:entry_priority(day,s));full_sleeves=set();sticky=0
+ actions+=signals;day=t.date().isoformat();actions.sort(key=lambda s:entry_priority(day,s));full_sleeves=set();sticky=0;confirmed=set()
  for s in actions:
   key=(s['strategy'],s['symbol'])
   if key in used:continue
@@ -727,6 +749,10 @@ def _monitor(db,api):
   q=quotes.get(s['symbol'])
   if s.get('stop') and not s.get('pending_exit') and q:
    al.emit(sys.modules[__name__],db,'risk_hit',strategy=7,symbol=s['symbol'],price=q.get('open') if s.get('rule')=='trail_gap' else s.get('stop_level'),quote_at=q.get('quote_at'),threshold=s.get('stop_level'),reason=s.get('rule') or 'observed_stop_crossing',target_defined=False)
+  # A one-sided book is only a suspected lock: confirm it against the depth band before the fill attempt,
+  # once per symbol per cycle. Best-effort only — _confirm_circuit_band never raises.
+  if q and isinstance(q,dict) and (q.get('bid')==0 or q.get('ask')==0) and s['symbol'] not in confirmed:
+   confirmed.add(s['symbol']);_confirm_circuit_band(api,s['symbol'],q)
   # Use the post-quotes batch clock for every fill so intra-cycle work cannot age a still-fresh quote past quote_max_age_seconds.
   r=fill(db,s,q,t)
   if r['filled']:fills+=1;used.add(key)
