@@ -433,6 +433,24 @@ class DryRunSimTests(unittest.TestCase):
             if v.get('enabled', True):
                 self.assertEqual(v['runs'], 1, name)
 
+    def test_fake_clock_no_store_configured(self):
+        # The gate's 7d/7e run the dry-run with no store in env: it falls
+        # back to a throwaway SQLite store instead of failing.
+        env = dict(os.environ)
+        env.update({'PAPER_RUNTIME': 'render', 'RENDER_MODE': 'live',
+                    'PAPER_STATE_DIR': self.tmp.name})
+        env.pop('PAPER_TEST_DATABASE', None)
+        env.pop('TURSO_DATABASE_URL', None)
+        env.pop('TURSO_AUTH_TOKEN', None)
+        r = subprocess.run(
+            [sys.executable, str(CTL), 'dry-run', '--fake-clock',
+             '--minutes', '5'],
+            capture_output=True, text=True, env=env, timeout=120,
+            cwd=str(HERE.parent))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertTrue(d['store'].startswith('sqlite-temp:'))
+
     def test_kill_restart_catch_up(self):
         # G7d: kill the supervisor mid-day, restart on the same store:
         # jobs due must run once, done jobs must not rerun.

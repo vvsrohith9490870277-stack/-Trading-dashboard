@@ -802,7 +802,20 @@ def _cmd_dry_run_fake_clock(args):
     budget and no job ran twice, else 2."""
     import render_app as ra
     import render_schedule as rsch
-    store = _store()
+    try:
+        store = _store()
+        store_kind = ('sqlite:' + os.environ['PAPER_TEST_DATABASE']
+                      if 'PAPER_TEST_DATABASE' in os.environ else 'turso')
+    except Exception:
+        # A fake-clock dry-run is a local simulation: with no store
+        # configured it falls back to a throwaway SQLite store instead
+        # of failing (the gate's 7d/7e run it with no store in env).
+        # It never touches Turso or a real namespace.
+        fd, tmp_path = tempfile.mkstemp(prefix='render-dry-run-',
+                                        suffix='.sqlite')
+        os.close(fd)
+        store = rs.SqliteStore(Path(tmp_path))
+        store_kind = 'sqlite-temp:' + tmp_path
     rs.migrate(store)
     trial = bool(getattr(args, 'trial', False))
     if trial:
@@ -842,7 +855,8 @@ def _cmd_dry_run_fake_clock(args):
               for i in range(max(1, args.supervisors or 1))]
     kill = getattr(args, 'kill_restart_at', None)
     result = {'mode': mode, 'namespace': namespace,
-              'day': day.isoformat(), 'minutes': minutes}
+              'day': day.isoformat(), 'minutes': minutes,
+              'store': store_kind}
     if getattr(args, 'with_fake_box', False):
         # The fake box runs the live schedule in the live namespace first
         # and holds its lease through the trial phase; then we prove the
