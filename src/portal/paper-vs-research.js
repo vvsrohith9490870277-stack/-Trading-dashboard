@@ -1,4 +1,4 @@
-// Research (saved backtest export) vs live paper (paper_v1) statistics, computed separately and
+// Research (saved backtest export) vs live paper statistics, computed separately and
 // never blended. Inputs are rows exactly as returned by /api/dashboard and /data/historical.json.
 // A figure whose inputs are missing is null (shown as "—"), never zero.
 const finite = v => v !== null && v !== undefined && v !== '' && Number.isFinite(Number(v));
@@ -6,7 +6,7 @@ const sum = list => list.reduce((a, v) => a + Number(v), 0);
 const max = list => (list.length ? Math.max(...list) : null);
 const min = list => (list.length ? Math.min(...list) : null);
 
-// The isolated RELIANCE manual demo lives in paper_demo_v1. Ledger views read paper_v1 only, but any
+// The isolated RELIANCE manual demo lives in paper_demo_v1. Ledger views read the active book only, but any
 // row that is tagged as demo/test is dropped again here so it can never reach a total.
 export const DEMO_NAMESPACE = 'paper_demo_v1';
 export function isDemo(r) {

@@ -1,5 +1,6 @@
 // Path-based routing for the portal screens. The classic dashboard keeps its hash routes at "/".
 import {useEffect, useState} from 'react';
+import {bookFromSearch, withBook} from './book';
 
 export const PORTAL_ROUTES = [
   {path: '/paper', key: 'paper', title: 'Paper desk'},
@@ -41,9 +42,19 @@ export function stockHref(symbol, runId) {
 }
 
 export function navigate(href) {
-  window.history.pushState(null, '', href);
+  window.history.pushState(null, '', resolveHref(href));
   window.dispatchEvent(new PopStateEvent('popstate'));
   window.scrollTo?.({top: 0});
+}
+
+// An internal link keeps the current book unless it names one explicitly:
+// the archive stays on ?book=paper_v1, the live book stays param-free.
+export function resolveHref(href) {
+  try {
+    const u = new URL(href, window.location.origin);
+    if (u.searchParams.has('book')) return href;
+    return withBook(href, bookFromSearch(window.location.search));
+  } catch { return href; }
 }
 
 export function useLocation() {
@@ -59,9 +70,10 @@ export function useLocation() {
 
 // Plain anchor that keeps navigation inside the SPA without a full reload.
 export function Link({href, children, className, ...rest}) {
-  return <a href={href} className={className} onClick={e => {
+  const target = resolveHref(href);
+  return <a href={target} className={className} onClick={e => {
     if (e.defaultPrevented || e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     e.preventDefault();
-    navigate(href);
+    navigate(target);
   }} {...rest}>{children}</a>;
 }

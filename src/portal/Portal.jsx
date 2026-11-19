@@ -1,6 +1,7 @@
 import {lazy, Suspense, useEffect, useState} from 'react';
 import {Moon, RefreshCw, Sun, ShieldCheck, LayoutGrid} from 'lucide-react';
 import {Link, PORTAL_ROUTES, parseRoute, useLocation} from './router';
+import {ACTIVE_BOOK, ARCHIVE_BOOK, ARCHIVE_LABEL, bookFromSearch, bookHref} from './book';
 import {useTheme} from './theme';
 import {useDashboard} from './data';
 import {istTime} from './format';
@@ -18,13 +19,14 @@ const TITLES = {paper: 'Paper desk', tester: 'Strategy tester', compare: 'Strate
 export default function Portal() {
   const loc = useLocation();
   const route = parseRoute(loc.pathname, loc.search);
+  const book = bookFromSearch(loc.search);
   const {theme, toggle} = useTheme();
   const [refreshKey, setRefreshKey] = useState(0);
   const overview = useDashboard({view: 'overview'}, refreshKey);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { const id = setInterval(() => setNow(Date.now()), 30000); return () => clearInterval(id); }, []);
   useEffect(() => { const id = setInterval(() => setRefreshKey(k => k + 1), 300000); return () => clearInterval(id); }, []);
-  useEffect(() => { document.title = `${TITLES[route.key]} · Atlas Desk`; }, [route.key]);
+  useEffect(() => { document.title = book === ARCHIVE_BOOK ? `${TITLES[route.key]} · Atlas Desk (archive)` : `${TITLES[route.key]} · Atlas Desk`; }, [route.key, book]);
   const market = overview.data?.market;
 
   const shared = {overview, refreshKey, route};
@@ -47,8 +49,14 @@ export default function Portal() {
       <span>{overview.data ? `Ledger read ${istTime(overview.data.readAt)}` : overview.loading ? 'Reading paper ledger…' : 'Ledger not read'}</span>
       <span className="ad-sep"/>
       <span>{new Intl.DateTimeFormat('en-IN', {timeZone: 'Asia/Kolkata', weekday: 'short', day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', hour12: false}).format(now)} IST</span>
+      <span className="ad-sep"/>
+      <nav className="ad-book-switch" aria-label="Book">
+        <Link href={bookHref(loc.pathname + loc.search, ACTIVE_BOOK)} aria-current={book === ACTIVE_BOOK ? 'page' : undefined}>Live · paper_v2</Link>
+        <Link href={bookHref(loc.pathname + loc.search, ARCHIVE_BOOK)} aria-current={book === ARCHIVE_BOOK ? 'page' : undefined}>Archive · paper_v1</Link>
+      </nav>
       <span className="ad-rail-guard"><ShieldCheck size={13}/>Paper only · read-only · no broker access</span>
     </div>
+    {book === ARCHIVE_BOOK && <div className="ad-book-banner"><Callout tone="warn" title={ARCHIVE_LABEL}>Read-only history. No trades are added here. The live book is paper_v2. <Link href={bookHref(loc.pathname + loc.search, ACTIVE_BOOK)}>Back to live book</Link></Callout></div>}
     <main className="ad-main">
       {overview.error && <Callout tone="error" title="Live ledger read failed.">{overview.error}{overview.data ? ' Showing the last successful read; do not treat it as current.' : ''}</Callout>}
       <Suspense fallback={<Loading label="Opening screen…"/>}>
@@ -59,6 +67,6 @@ export default function Portal() {
         {route.key === 'stock' && <StockDetail {...shared}/>}
       </Suspense>
     </main>
-    <footer className="ad-foot">Atlas Desk · live figures from the paper_v1 ledger, research from saved backtest exports · not investment advice</footer>
+    <footer className="ad-foot">Atlas Desk · live figures from the {book} ledger, research from saved backtest exports · not investment advice</footer>
   </div>;
 }

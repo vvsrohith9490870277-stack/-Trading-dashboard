@@ -1,6 +1,7 @@
-// Read-only data hooks. Every number on the portal comes from /api/dashboard (Turso paper_v1)
+// Read-only data hooks. Every number on the portal comes from /api/dashboard (Turso paper book)
 // or from the saved research exports in /public/data. Nothing here invents values.
 import {useEffect, useState} from 'react';
+import {ARCHIVE_BOOK, bookFromSearch} from './book';
 
 const staticCache = new Map();
 
@@ -34,7 +35,8 @@ export function useStatic(path) {
 
 // Generic /api/dashboard reader. `params` must only contain keys the API accepts.
 export function useDashboard(params, refreshKey = 0, enabled = true) {
-  const query = new URLSearchParams({...params, refresh: '1'}).toString();
+  const book = bookFromSearch(window.location.search);
+  const query = new URLSearchParams({...params, ...(book === ARCHIVE_BOOK ? {book} : {}), refresh: '1'}).toString();
   const [state, setState] = useState({query: null, data: null, error: '', loading: enabled});
   useEffect(() => {
     if (!enabled) return undefined;
@@ -60,10 +62,12 @@ export function useDashboard(params, refreshKey = 0, enabled = true) {
 // summarise the record (analytics, daily, history) are computed from the complete set, not a page.
 export const MAX_PAGES = 50;
 export async function fetchAllPages(params, signal) {
+  const all = {...params};
+  if (!all.book && bookFromSearch(window.location.search) === ARCHIVE_BOOK) all.book = ARCHIVE_BOOK;
   const rows = [];
   let total = 0, page = 1, meta = null;
   for (; page <= MAX_PAGES; page++) {
-    const r = await fetch('/api/dashboard?' + new URLSearchParams({...params, page: String(page), limit: '100', refresh: '1'}), {signal, cache: 'no-store'});
+    const r = await fetch('/api/dashboard?' + new URLSearchParams({...all, page: String(page), limit: '100', refresh: '1'}), {signal, cache: 'no-store'});
     const d = await r.json();
     if (!r.ok || d.available === false) throw new Error(d.error?.message ?? d.message ?? 'This read is unavailable.');
     meta ??= d;
@@ -75,7 +79,8 @@ export async function fetchAllPages(params, signal) {
 }
 
 export function useAllPages(params, refreshKey = 0, enabled = true) {
-  const query = new URLSearchParams(params).toString();
+  const book = bookFromSearch(window.location.search);
+  const query = new URLSearchParams({...params, ...(book === ARCHIVE_BOOK ? {book} : {})}).toString();
   const [state, setState] = useState({query: null, data: null, error: '', loading: enabled});
   useEffect(() => {
     if (!enabled) return undefined;
