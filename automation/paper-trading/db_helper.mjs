@@ -41,6 +41,6 @@ rl.on('line',async line=>{
  catch(e){out({id:req.id,ok:false,...classify(e)})}
  finally{inflight--;if(closing&&!inflight)finish()}
 });
-function finish(){try{db.close()}catch{}process.exit(0)}
+function finish(){try{db.close()}catch{/* best-effort close: the process exits next either way */}process.exit(0)}
 rl.on('close',()=>{closing=true;if(!inflight)finish()});
 process.stderr.write(JSON.stringify({event:'helper_ready',pid:process.pid,test:!!testDatabase})+'\n');
