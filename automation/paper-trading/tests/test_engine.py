@@ -265,6 +265,115 @@ class PaperTests(unittest.TestCase):
   self.db.batch([('INSERT INTO paper_circuit_locks(namespace,strategy,symbol,trade_date,direction,locked_price,recorded_at) VALUES(?,?,?,?,?,?,?)',(e.NS,1,'TCS-EQ','2026-11-06','LOWER',80,T.isoformat()))])
   e.monitor(self.db,Feed());self.assertEqual(round(self.db.query('SELECT mark_price FROM paper_positions WHERE namespace=? AND symbol=? AND qty>0',(e.NS,'TCS-EQ'))[0]['mark_price'],2),79.2)
   cleared=e.fill(self.db,self.signal('SELL',symbol='TCS-EQ'),{**self.quote(80),'symbol':'TCS-EQ'},T);self.assertTrue(cleared['filled']);self.assertFalse(self.db.query('SELECT 1 FROM paper_positions WHERE namespace=? AND symbol=? AND qty>0',(e.NS,'TCS-EQ')))
+ def test_circuit_guard_band_overrides_empty_ask_heuristic(self):
+  # ask==0, bid>0, price well inside a known band -> NOT UPPER (the band confirms).
+  g=e.market_guard({'ask':0,'bid':105,'price':100},{'upper_price':110,'lower_price':90})
+  self.assertEqual(g['circuit'],'NONE');self.assertEqual(g['circuit_source'],'price_bands')
+  g=e.market_guard({'ask':0,'bid':105,'price':110},{'upper_price':110,'lower_price':90})
+  self.assertEqual(g['circuit'],'UPPER');self.assertEqual(g['circuit_source'],'price_bands')
+  g=e.market_guard({'ask':0,'bid':105,'price':115},{'upper_price':110,'lower_price':90})
+  self.assertEqual(g['circuit'],'UPPER');self.assertEqual(g['circuit_source'],'price_bands')
+ def test_circuit_guard_band_confirms_lower(self):
+  # bid==0, ask>0, price well inside a known band -> NOT LOWER; at/below the lower band -> LOWER.
+  g=e.market_guard({'bid':0,'ask':95,'price':100},{'upper_price':110,'lower_price':90})
+  self.assertEqual(g['circuit'],'NONE');self.assertEqual(g['circuit_source'],'price_bands')
+  g=e.market_guard({'bid':0,'ask':95,'price':90},{'upper_price':110,'lower_price':90})
+  self.assertEqual(g['circuit'],'LOWER');self.assertEqual(g['circuit_source'],'price_bands')
+  g=e.market_guard({'bid':0,'ask':95,'price':85},{'upper_price':110,'lower_price':90})
+  self.assertEqual(g['circuit'],'LOWER');self.assertEqual(g['circuit_source'],'price_bands')
+ def test_circuit_guard_no_band_keeps_legacy_heuristic_unconfirmed(self):
+  # Zero side of the book and no band anywhere: legacy fail-closed result kept, labelled unconfirmed.
+  g=e.market_guard({'ask':0,'bid':1,'price':100})
+  self.assertEqual(g['circuit'],'UPPER');self.assertEqual(g['circuit_source'],'book_heuristic_unconfirmed')
+  g=e.market_guard({'ask':1,'bid':0,'price':100})
+  self.assertEqual(g['circuit'],'LOWER');self.assertEqual(g['circuit_source'],'book_heuristic_unconfirmed')
+ def test_circuit_guard_depth_band_wins_over_price_bands(self):
+  # Depth band says in-band (NONE) while the paper_price_bands row says UPPER.
+  g=e.market_guard({'ask':0,'bid':105,'price':100,'upper_band':110,'lower_band':90},{'upper_price':100,'lower_price':90})
+  self.assertEqual(g['circuit'],'NONE');self.assertEqual(g['circuit_source'],'depth_band')
+  # Depth band says UPPER while the paper_price_bands row says in-band.
+  g=e.market_guard({'ask':0,'bid':105,'price':100,'upper_band':100,'lower_band':90},{'upper_price':110,'lower_price':90})
+  self.assertEqual(g['circuit'],'UPPER');self.assertEqual(g['circuit_source'],'depth_band')
+ def test_circuit_guard_explicit_wins_over_bands(self):
+  g=e.market_guard({'circuit':'UPPER','ask':1,'bid':1,'price':100,'upper_band':110,'lower_band':90},{'upper_price':110,'lower_price':90})
+  self.assertEqual(g['circuit'],'UPPER');self.assertEqual(g['circuit_source'],'explicit')
+  g=e.market_guard({'circuit':'NONE','ask':0,'bid':105,'price':100,'upper_band':100,'lower_band':90},{'upper_price':100,'lower_price':90})
+  self.assertEqual(g['circuit'],'NONE');self.assertEqual(g['circuit_source'],'explicit')
+ def test_circuit_guard_two_sided_book_no_band_is_none(self):
+  g=e.market_guard({'ask':101,'bid':99,'price':100})
+  self.assertEqual(g['circuit'],'NONE');self.assertEqual(g['circuit_source'],'book_heuristic')
+ def test_false_zero_bid_in_band_sell_fills_without_pending_exit(self):
+  # SELL with a false zero-bid and a known in-band price is NOT turned into pending_exit and gets no haircut.
+  bought=self.signal();self.assertTrue(e.fill(self.db,bought,self.quote(),T)['filled'])
+  self.db.batch([('INSERT INTO paper_price_bands(symbol,trade_date,upper_price,lower_price,series,surveillance,fo_eligible,source) VALUES(?,?,?,?,?,?,?,?)',('RELIANCE-EQ',T.date().isoformat(),110,90,'EQ',None,0,'TEST_BAND'))])
+  sell=self.signal('SELL')
+  r=e.fill(self.db,sell,{**self.quote(100),'bid':0,'ask':105},T)
+  self.assertTrue(r['filled'])
+  self.assertEqual(self.db.query('SELECT COUNT(*) AS n FROM paper_circuit_locks WHERE namespace=?',(e.NS,))[0]['n'],0)
+  self.assertFalse(self.db.query('SELECT 1 FROM paper_positions WHERE namespace=? AND symbol=? AND qty>0',(e.NS,'RELIANCE-EQ')))
+  payload=json.loads(self.db.query("SELECT payload_json FROM paper_decisions WHERE namespace=? AND decision_type='EXIT' AND symbol='RELIANCE-EQ'",(e.NS,))[0]['payload_json'])
+  self.assertEqual(payload['circuit_source'],'price_bands')
+ def test_circuit_locked_decisions_carry_source(self):
+  # BUY blocked by an explicit UPPER carries circuit_source='explicit' in the decision payload.
+  blocked=self.signal()
+  r=e.fill(self.db,blocked,{**self.quote(),'circuit':'UPPER'},T)
+  self.assertFalse(r['filled']);self.assertEqual(r['reason'],'CIRCUIT_LOCKED')
+  payload=json.loads(self.db.query('SELECT payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,blocked['id']))[0]['payload_json'])
+  self.assertEqual(payload['circuit_source'],'explicit')
+  # SELL blocked by a band-confirmed LOWER carries circuit_source='price_bands' and a pending exit.
+  bought=self.signal(symbol='TCS-EQ');self.assertTrue(e.fill(self.db,bought,{**self.quote(),'symbol':'TCS-EQ'},T)['filled'])
+  self.db.batch([('INSERT INTO paper_price_bands(symbol,trade_date,upper_price,lower_price,series,surveillance,fo_eligible,source) VALUES(?,?,?,?,?,?,?,?)',('TCS-EQ',T.date().isoformat(),110,90,'EQ',None,0,'TEST_BAND'))])
+  sell=self.signal('SELL',symbol='TCS-EQ')
+  r=e.fill(self.db,sell,{**self.quote(90),'symbol':'TCS-EQ','bid':0,'ask':95},T)
+  self.assertFalse(r['filled']);self.assertEqual(r['reason'],'CIRCUIT_LOCKED')
+  self.assertEqual(self.db.query('SELECT pending_exit FROM paper_positions WHERE namespace=? AND symbol=? AND qty>0',(e.NS,'TCS-EQ'))[0]['pending_exit'],1)
+  payload=json.loads(self.db.query('SELECT payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,sell['id']))[0]['payload_json'])
+  self.assertEqual(payload['circuit_source'],'price_bands')
+ def test_monitor_confirms_suspicious_quote_with_one_depth_call(self):
+  # A pending BUY whose quote shows a zero ask gets exactly one depth call; an in-band depth band unblocks the fill.
+  buy=self.signal()
+  depth_calls=[]
+  class Feed:
+   def quotes(_,symbols):return {sym:{'symbol':sym,'price':100,'quote_at':T.isoformat(),'ask':0,'bid':105} for sym in symbols}
+   def get(_,route,params):
+    depth_calls.append((route,params))
+    stamp=int((T-timedelta(seconds=3)).timestamp())
+    return {'s':'ok','d':{'NSE:RELIANCE-EQ':{'ltp':100,'ltt':stamp,'o':100,'h':101,'l':99,'upper_ckt':110,'lower_ckt':90,'bids':[{'price':105,'volume':10,'ord':1}],'ask':[{'price':0,'volume':0,'ord':0}]}}}
+  report=e.monitor(self.db,Feed())
+  self.assertEqual(report['fills'],1)
+  self.assertEqual([(r,p.get('symbol')) for r,p in depth_calls],[('depth','NSE:RELIANCE-EQ')])
+  self.assertTrue(self.db.query('SELECT * FROM paper_positions WHERE namespace=? AND symbol=? AND qty>0',(e.NS,'RELIANCE-EQ')))
+ def test_monitor_depth_failure_leaves_exit_unblocked(self):
+  # A depth error never raises and never blocks an exit: the paper_price_bands row still confirms in-band.
+  bought=self.signal();self.assertTrue(e.fill(self.db,bought,self.quote(),T)['filled'])
+  self.db.batch([('INSERT INTO paper_price_bands(symbol,trade_date,upper_price,lower_price,series,surveillance,fo_eligible,source) VALUES(?,?,?,?,?,?,?,?)',('RELIANCE-EQ',T.date().isoformat(),110,90,'EQ',None,0,'TEST_BAND'))])
+  sell=self.signal('SELL')
+  depth_calls=[]
+  class Feed:
+   def quotes(_,symbols):return {sym:{'symbol':sym,'price':100,'quote_at':T.isoformat(),'bid':0,'ask':105} for sym in symbols}
+   def get(_,route,params):
+    depth_calls.append((route,params));raise RuntimeError('market_data_error_-50')
+  report=e.monitor(self.db,Feed())
+  self.assertEqual(report['fills'],1)
+  self.assertEqual(len(depth_calls),1)
+  self.assertFalse(self.db.query('SELECT 1 FROM paper_positions WHERE namespace=? AND symbol=? AND qty>0',(e.NS,'RELIANCE-EQ')))
+ def test_monitor_no_depth_call_for_normal_quotes(self):
+  # Two-sided quotes never trigger a depth confirm; a zero-side symbol with no pending fill attempt neither.
+  buy=self.signal()
+  held=self.signal(symbol='TCS-EQ');self.assertTrue(e.fill(self.db,held,{**self.quote(),'symbol':'TCS-EQ'},T)['filled'])
+  depth_calls=[]
+  class Feed:
+   def quotes(_,symbols):
+    out={}
+    for sym in symbols:
+     if sym=='TCS-EQ':out[sym]={'symbol':sym,'price':100,'quote_at':T.isoformat(),'bid':0,'ask':105}
+     else:out[sym]={'symbol':sym,'price':100,'quote_at':T.isoformat(),'bid':99,'ask':101}
+    return out
+   def get(_,route,params):
+    depth_calls.append((route,params));return {'s':'ok','d':{}}
+  report=e.monitor(self.db,Feed())
+  self.assertEqual(report['fills'],1)
+  self.assertEqual(depth_calls,[])
  def test_gap_stop_fills_the_open(self):
   self.assertTrue(e.fill(self.db,self.signal(strategy=7),self.quote(),T)['filled'])
   class Feed:
