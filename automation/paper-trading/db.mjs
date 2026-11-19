@@ -10,6 +10,8 @@ import freezeLock from './freeze_lock.json' with {type:'json'};
 const ADV_EXCLUDED_SESSIONS=Object.keys(engineConfig.indicator_excluded_sessions||{}).sort();
 const a=JSON.parse(fs.readFileSync(0,'utf8'));const root=path.dirname(fileURLToPath(import.meta.url));
 const testRoot=path.resolve(root,'tests')+path.sep+'test_';if(a.test_database&&(!path.resolve(a.test_database).startsWith(testRoot)||!a.test_database.endsWith('.sqlite')))throw Error('invalid_test_path');
+// box default: the legacy .env path is only read when the file exists;
+// in render mode the process env (TURSO_*) is used instead (else branch).
 const env={};if(!a.test_database){const ef=process.env.PAPER_ENV_FILE||'/workspace/sahil-fyers-turso/.env';if(fs.existsSync(ef)){for(const l of fs.readFileSync(ef,'utf8').split('\n')){const p=l.indexOf('=');if(p>0&&!l.startsWith('#'))env[l.slice(0,p).trim()]=l.slice(p+1).trim().replace(/^(['"])(.*)\1$/,'$2')}}else{for(const k of['TURSO_DATABASE_URL','TURSO_AUTH_TOKEN'])if(process.env[k])env[k]=process.env[k]}}
 const db=createClient(a.test_database?{url:'file:'+a.test_database}:{url:env.TURSO_DATABASE_URL,authToken:env.TURSO_AUTH_TOKEN});let tx;
 const rows=r=>r.rows.map(x=>Object.fromEntries(Object.entries(x).map(([k,v])=>[k,typeof v==='bigint'?Number(v):v])));

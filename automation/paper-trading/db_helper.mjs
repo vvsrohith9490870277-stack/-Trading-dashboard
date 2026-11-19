@@ -9,6 +9,8 @@ const require=createRequire(import.meta.url);const{createClient}=require('@libsq
 const root=path.dirname(fileURLToPath(import.meta.url));const testDatabase=process.argv[2]||'';
 const testRoot=path.resolve(root,'tests')+path.sep+'test_';
 if(testDatabase&&(!path.resolve(testDatabase).startsWith(testRoot)||!testDatabase.endsWith('.sqlite'))){process.stderr.write(JSON.stringify({event:'helper_refused',code:'invalid_test_path'})+'\n');process.exit(2)}
+// box default: the legacy .env path is only read when the file exists;
+// in render mode the process env (TURSO_*) is used instead (else branch).
 const env={};if(!testDatabase){const ef=process.env.PAPER_ENV_FILE||'/workspace/sahil-fyers-turso/.env';if(fs.existsSync(ef)){for(const l of fs.readFileSync(ef,'utf8').split('\n')){const p=l.indexOf('=');if(p>0&&!l.startsWith('#'))env[l.slice(0,p).trim()]=l.slice(p+1).trim().replace(/^(['"])(.*)\1$/,'$2')}}else{for(const k of['TURSO_DATABASE_URL','TURSO_AUTH_TOKEN'])if(process.env[k])env[k]=process.env[k]}}
 const db=createClient(testDatabase?{url:'file:'+testDatabase}:{url:env.TURSO_DATABASE_URL,authToken:env.TURSO_AUTH_TOKEN});
 const rows=r=>r.rows.map(x=>Object.fromEntries(Object.entries(x).map(([k,v])=>[k,typeof v==='bigint'?Number(v):v])));

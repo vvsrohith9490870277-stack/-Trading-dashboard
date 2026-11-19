@@ -98,6 +98,8 @@ def restore_python(cfg, run=subprocess.run):
     req = _requirements(cfg)
     if not req.is_file():
         raise RuntimeError('runtime_deps_requirements_missing')
+    # box default: restore is refused in render mode (see above), so this
+    # /workspace path is only ever used on the box.
     venv = Path(cfg.get('venv_path') or '/workspace/sahil-fyers-turso/.venv')
     venv.parent.mkdir(parents=True, exist_ok=True)
     py = sys.executable
