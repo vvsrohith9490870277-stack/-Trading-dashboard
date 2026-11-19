@@ -116,13 +116,45 @@ def reference_day(t):
  return t.date() if s and t.timetz().replace(tzinfo=None)<s[1] else next_session(t.date())
 def load_env():
  if rm.is_render():
-  # Render mode: Fyers values come from process.env (Task 3 adds the Turso
-  # token store lookup for FYERS_ACCESS_TOKEN when it is not seeded here).
+  # Render mode: Fyers values come from process.env, plus the stored token
+  # from the Turso token store when FYERS_ACCESS_TOKEN is not seeded in env.
   # The legacy .env file is never read.
-  return {k:v for k,v in ((k,os.environ.get(k)) for k in rm.FYERS_ENV_NAMES) if v is not None}
+  env={k:v for k,v in ((k,os.environ.get(k)) for k in rm.FYERS_ENV_NAMES) if v is not None}
+  if 'FYERS_ACCESS_TOKEN' not in env:
+   try:
+    import token_store as ts
+    tok=ts.open_token_store().get_token()
+    if tok:
+     env['FYERS_ACCESS_TOKEN']=tok['access_token']
+     if tok.get('refresh_token'):env['FYERS_REFRESH_TOKEN']=tok['refresh_token']
+   except Exception:
+    pass  # fail closed: no stored token; the login gate decides
+  return env
  sys.path.insert(0,str(LEGACY));from fyers_auth import load_env as f
  return f(LEGACY/'.env')
 def auth_circuit_path():return rm.state_path(ROOT,'auth_circuit.json')
+def _circuit_open():
+ """True when the auth circuit is open (render: Turso kv; box: file)."""
+ if rm.is_render():
+  try:
+   import token_store as ts
+   c=ts.open_token_store().get_circuit()
+   return bool(c.get('open')) and bool(c.get('at')) and (now()-datetime.fromisoformat(c['at'])).total_seconds()<MD['auth_circuit_open_seconds']
+  except Exception:
+   return False
+ p=auth_circuit_path()
+ if not p.exists():return False
+ try:c=json.loads(p.read_text())
+ except Exception:return False
+ return bool(c.get('open')) and (now()-datetime.fromisoformat(c['at'])).total_seconds()<MD['auth_circuit_open_seconds']
+def _circuit_set(is_open):
+ if rm.is_render():
+  try:
+   import token_store as ts
+   ts.open_token_store().put_circuit(is_open,now().isoformat())
+  except Exception:pass
+ else:
+  auth_circuit_path().write_text(js({'open':bool(is_open),'at':now().isoformat()}))
 def last_trade_stamp(ltt):
  """Exchange last-traded epoch seconds -> IST ISO string; None (fail closed) when missing/invalid."""
  if isinstance(ltt,bool) or ltt is None:return None
@@ -147,16 +179,63 @@ def depth_quote(sym,d):
  return row
 
 class RequestBudget:
- """Shared IST-day Fyers Data API budget. Counts every HTTP attempt, including 429s."""
- def __init__(self,path=None,clock=None):
+ """Shared IST-day Fyers Data API budget. Counts every HTTP attempt, including 429s.
+
+ Box mode keeps the file backend (flock) exactly as before. In render mode
+ (token_store given) the counters live in Turso (_global/fyers_budget, or
+ fyers_budget_trial in trial mode): loaded once at start, written behind
+ every 5 s when changed and on flush() (SIGTERM). A cold start with stored
+ state older than 10 s adds restart_safety_requests=20 and treats the
+ per-minute window as full for 5 s. Trial mode enforces min(config, trial cap).
+ """
+ RESTART_SAFETY_REQUESTS=20
+ def __init__(self,path=None,clock=None,token_store=None,trial=None):
   self.path=Path(path or MD.get('budget_state_path') or 'fyers_request_budget.json')
   if not self.path.is_absolute():self.path=rm.state_dir(ROOT)/self.path
   self.clock=clock or now
+  self.token_store=token_store
+  self.trial=trial if trial is not None else (rm.is_render() and rm.render_mode()=='trial')
+  self._mem=None;self._last_flush=0.0;self._dirty=False
+  if token_store is not None:self._mem=self._load_store()
+ def _limits(self):
+  day=int(MD.get('budget_requests_per_day',4000));minute=int(MD.get('budget_requests_per_minute',40));second=int(MD.get('budget_requests_per_second',4));reserve=int(MD.get('budget_reserve_for_session_monitor',1500))
+  if self.trial:
+   import render_trial as rt
+   caps=rt.trial_caps()
+   day=min(day,caps['day']);minute=min(minute,caps['minute']);second=min(second,caps['second']);reserve=0
+  return day,minute,second,reserve
+ def _load_store(self):
+  empty={'day':self._day(self.clock()),'requests':0,'by_route':{},'times':[]}
+  try:state=self.token_store.get_budget(trial=self.trial)
+  except Exception:state=None
+  if not isinstance(state,dict):return dict(empty)
+  if state.get('day')!=empty['day']:return dict(empty)
+  state.setdefault('by_route',{});state.setdefault('times',[]);state.setdefault('requests',0)
+  try:age=(self.clock()-datetime.fromisoformat(state['updated_at'])).total_seconds() if state.get('updated_at') else 9999
+  except Exception:age=9999
+  if age>10:
+   state['requests']=int(state.get('requests') or 0)+self.RESTART_SAFETY_REQUESTS
+   state['minute_full_until']=(self.clock()+timedelta(seconds=5)).isoformat()
+   self._dirty=True
+  return state
+ def _save_store(self,state):
+  try:self.token_store.put_budget(state,trial=self.trial)
+  except Exception:pass
+  self._dirty=False
+ def flush(self):
+  """Write the in-memory counters to Turso now (SIGTERM path). File backend: no-op."""
+  if self.token_store is not None and self._mem is not None and self._dirty:
+   self._mem['updated_at']=self.clock().isoformat();self._save_store(self._mem);self._last_flush=time.monotonic()
  def snapshot(self):
-  state=self._load()
-  return {'day':state['day'],'requests':state['requests'],'by_route':state['by_route'],'per_minute':self._window(state,60),'per_second':self._window(state,1),'limits':{'per_second':int(MD.get('budget_requests_per_second',4)),'per_minute':int(MD.get('budget_requests_per_minute',40)),'per_day':int(MD.get('budget_requests_per_day',4000)),'reserve_for_session_monitor':int(MD.get('budget_reserve_for_session_monitor',1500))},'remaining_today':max(0,int(MD.get('budget_requests_per_day',4000))-state['requests'])}
+  state=self._load();day,minute,second,reserve=self._limits()
+  return {'day':state['day'],'requests':state['requests'],'by_route':state['by_route'],'per_minute':self._window(state,60),'per_second':self._window(state,1),'limits':{'per_second':second,'per_minute':minute,'per_day':day,'reserve_for_session_monitor':reserve},'remaining_today':max(0,day-state['requests'])}
  def _day(self,t):return t.astimezone(IST).date().isoformat()
  def _load(self):
+  if self.token_store is not None:
+   if self._mem is None:self._mem=self._load_store()
+   if self._mem.get('day')!=self._day(self.clock()):
+    self._mem={'day':self._day(self.clock()),'requests':0,'by_route':{},'times':[]};self._dirty=True
+   return self._mem
   empty={'day':self._day(self.clock()),'requests':0,'by_route':{},'times':[]}
   if not self.path.exists():return empty
   try:
@@ -172,14 +251,27 @@ class RequestBudget:
  def check(self,route):
   """Raise market_data_budget_exhausted before sending if this request would breach a cap."""
   state=self._load();t=self.clock()
-  day=int(MD.get('budget_requests_per_day',4000));minute=int(MD.get('budget_requests_per_minute',40));second=int(MD.get('budget_requests_per_second',4))
-  reserve=int(MD.get('budget_reserve_for_session_monitor',1500))
+  day,minute,second,reserve=self._limits()
   used=int(state['requests']);per_min=self._window(state,60);per_sec=self._window(state,1)
+  full_until=state.get('minute_full_until')
+  if full_until:
+   try:
+    if t<datetime.fromisoformat(full_until):per_min=minute
+   except Exception:pass
   if per_sec>=second:raise RuntimeError('market_data_budget_exhausted_second')
   if per_min>=minute:raise RuntimeError('market_data_budget_exhausted_minute')
   if used>=day:raise RuntimeError('market_data_budget_exhausted_day')
   if route=='history' and used>=max(0,day-reserve):raise RuntimeError('market_data_budget_exhausted_reserve')
  def record(self,route):
+  if self.token_store is not None:
+   state=self._load();t=self.clock();day=self._day(t)
+   if state.get('day')!=day:state={'day':day,'requests':0,'by_route':{},'times':[]}
+   state['requests']=int(state.get('requests') or 0)+1
+   state.setdefault('by_route',{});state['by_route'][route]=int(state['by_route'].get(route) or 0)+1
+   times=[x for x in (state.get('times') or []) if x>t.timestamp()-120];times.append(t.timestamp());state['times']=times
+   state['updated_at']=t.isoformat();self._mem=state;self._dirty=True
+   if time.monotonic()-self._last_flush>=5:self.flush()
+   return state
   self.path.parent.mkdir(parents=True,exist_ok=True)
   with self.path.open('a+') as fh:
    fcntl.flock(fh,fcntl.LOCK_EX)
@@ -202,16 +294,39 @@ def quote_trade_stamp(v):
   if stamp:return stamp
  return None
 class MarketData:
- def __init__(self):self.env=load_env();self.refreshed=False;self.last=0;self.budget=RequestBudget()
+ def __init__(self):
+  self.env=load_env();self.refreshed=False;self.last=0
+  if rm.is_render():
+   # Render mode: budget counters live in Turso; fall back to the file
+   # backend (under state_dir) only if the store cannot be opened.
+   try:
+    import token_store as ts
+    self.budget=RequestBudget(token_store=ts.open_token_store())
+   except Exception:
+    self.budget=RequestBudget()
+  else:
+   self.budget=RequestBudget()
  def budget_snapshot(self):return self.budget.snapshot()
  def refresh(self):
   if self.refreshed:
-   auth_circuit_path().write_text(js({'open':True,'at':now().isoformat()}));raise RuntimeError('auth_failed_after_single_refresh')
-  circuit=auth_circuit_path()
-  if circuit.exists():
-   c=json.loads(circuit.read_text())
-   if c.get('open') and (now()-datetime.fromisoformat(c['at'])).total_seconds()<MD['auth_circuit_open_seconds']:raise RuntimeError('auth_circuit_open_30min')
+   _circuit_set(True);raise RuntimeError('auth_failed_after_single_refresh')
+  if _circuit_open():raise RuntimeError('auth_circuit_open_30min')
+  if rm.is_render():
+   # No Fyers login in trial mode, ever: the gate refuses before any
+   # refresh attempt and without changing the circuit.
+   import render_trial as rt
+   if not rt.login_allowed(rm.render_mode(),os.environ):raise RuntimeError('token_unavailable_no_login')
   self.refreshed=True
+  if rm.is_render():
+   try:
+    import fyers_auth as fa
+    import token_store as ts
+    result=fa.refresh_token(self.env)
+    ts.open_token_store().put_token(result)
+   except Exception:
+    _circuit_set(True);raise RuntimeError('token_refresh_failed') from None
+   self.env=load_env();_circuit_set(False);log('auth_refresh',success=True);return
+  circuit=auth_circuit_path()
   src=(LEGACY/'fyers_auth.py').read_text().replace('for url, payload in otp_urls:','for url, payload in otp_urls[:1]:').replace('for label, ident in (("b64", pin_b64), ("sha256", pin_sha), ("raw", pin)):', 'for label, ident in (("b64", pin_b64),):')
   ns={'__file__':str(LEGACY/'fyers_auth.py'),'__name__':'paper_authorized_refresh'};exec(compile(src,str(LEGACY/'fyers_auth.py'),'exec'),ns)
   try:
@@ -222,10 +337,7 @@ class MarketData:
    circuit.write_text(js({'open':True,'at':now().isoformat()}));raise RuntimeError('token_refresh_failed')
   self.env=load_env();circuit.write_text(js({'open':False,'at':now().isoformat()}));log('auth_refresh',success=True)
  def get(self,route,params):
-  circuit=auth_circuit_path()
-  if circuit.exists():
-   c=json.loads(circuit.read_text())
-   if c.get('open') and (now()-datetime.fromisoformat(c['at'])).total_seconds()<MD['auth_circuit_open_seconds']:raise RuntimeError('auth_circuit_open_30min')
+  if _circuit_open():raise RuntimeError('auth_circuit_open_30min')
   assert route in AUTH_ROUTES
   attempts=int(MD['max_attempts'])
   for attempt in range(attempts):

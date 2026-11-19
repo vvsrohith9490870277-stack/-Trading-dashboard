@@ -649,5 +649,10 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
    if watch is not None:watch.__exit__(None,None,None)
    if previous is not None and not state['stop']:signal.signal(signal.SIGTERM,previous)
    if not paused:heartbeat(e,db,'stopped',polls=polls,terminated=state['stop'],db_helper=db.helper_stats() if hasattr(db,'helper_stats') else None)
+   # Render mode: flush the Turso-backed Fyers budget write-behind so a
+   # SIGTERM / session end never loses the counters.
+   try:
+    if api is not None and hasattr(api,'budget'):api.budget.flush()
+   except Exception:pass
    if hasattr(db,'close_helper'):db.close_helper()
   return {'status':'terminated' if state['stop'] else 'session_finished','polls':polls}
