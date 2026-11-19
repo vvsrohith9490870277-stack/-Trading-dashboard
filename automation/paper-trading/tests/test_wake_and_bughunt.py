@@ -61,6 +61,8 @@ class WakeWatchTests(unittest.TestCase):
 class WorkerWakeTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):fixtures.PaperTests.setUpClass.__func__(cls)
+ @classmethod
+ def tearDownClass(cls):fixtures.PaperTests.tearDownClass.__func__(cls)
  setUp=fixtures.PaperTests.setUp
  def test_failure_stranded_by_freeze_is_retried_at_once_and_post_wake_check_logged(self):
   watches=[];logs=[];real_log=e.log
@@ -92,6 +94,8 @@ class WorkerWakeTests(unittest.TestCase):
 class StickySkipTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):fixtures.PaperTests.setUpClass.__func__(cls)
+ @classmethod
+ def tearDownClass(cls):fixtures.PaperTests.tearDownClass.__func__(cls)
  setUp=fixtures.PaperTests.setUp
  signal=fixtures.PaperTests.signal
  seed_adv=fixtures.PaperTests.seed_adv

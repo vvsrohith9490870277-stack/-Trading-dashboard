@@ -14,6 +14,8 @@ class AutomationTests(unittest.TestCase):
   have={r['name'] for r in cls.db.query('PRAGMA table_info(daily_ohlcv)')}
   for name,kind in [('open','REAL'),('high','REAL'),('low','REAL'),('volume','REAL'),('turnover','REAL'),('source','TEXT'),('loaded_at','TEXT')]:
    if name not in have:cls.db.batch([(f'ALTER TABLE daily_ohlcv ADD COLUMN {name} {kind}',())])
+ @classmethod
+ def tearDownClass(cls):fixtures.PaperTests.tearDownClass.__func__(cls)
  def setUp(self):
   fixtures.PaperTests.setUp(self)
   # Existing EOD tests stay closed if bhavcopy is not injected; never hit NSE.

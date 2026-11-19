@@ -99,6 +99,8 @@ class AuditTests(unittest.TestCase):
 class AtomicAuditTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):fixtures.PaperTests.setUpClass.__func__(cls)
+ @classmethod
+ def tearDownClass(cls):fixtures.PaperTests.tearDownClass.__func__(cls)
  setUp=fixtures.PaperTests.setUp;seed_adv=fixtures.PaperTests.seed_adv;signal=fixtures.PaperTests.signal;quote=fixtures.PaperTests.quote
  def test_trade_execution_event_is_atomic_and_idempotent(self):
   s=self.signal();self.assertTrue(e.fill(self.db,s,self.quote(),fixtures.T)['filled']);self.assertFalse(e.fill(self.db,s,self.quote(),fixtures.T)['filled']);rows=self.db.query("SELECT * FROM paper_events WHERE namespace=? AND event_type='paper_order_executed'",(e.NS,));self.assertEqual(len(rows),1);data=json.loads(rows[0]['data_json']);self.assertEqual(data['quantity'],500);self.assertIn('charge_policy_version',data);self.assertEqual(len(self.db.positions()),1)

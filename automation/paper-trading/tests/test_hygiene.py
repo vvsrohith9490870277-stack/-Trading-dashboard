@@ -5,7 +5,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import automation as au
 import engine as e
 T = datetime(2026, 11, 9, 10, tzinfo=e.IST)
-VENV_PY = str(Path(__file__).resolve().parents[3] / '.venv-paper' / 'bin' / 'python')
+# The interpreter running this test (it has the suite's dependencies). Never a hard-coded
+# venv path: a clean checkout (e.g. the verification gate) names its venv differently.
+PY = sys.executable
 
 class HygieneTests(unittest.TestCase):
     """Tests must not write into the runtime tree. The EOD prior trail belongs under
@@ -77,9 +79,31 @@ class HygieneTests(unittest.TestCase):
                         'trail %s is not under out/test-exports/%s' % (trail, self.ns))
         self.assertEqual(self._plain_out_files(), [])
     def test_no_test_sqlite_file_survives_a_test_run(self):
-        # End to end, in a temp copy of the tree: run one real test and assert no
-        # tests/*.sqlite file survives it (tearDownClass must remove the file-backed DB)
-        # and nothing lands directly under out/.
+        # End to end, in a temp copy of the tree: run one real test from EVERY class that
+        # creates a file-backed DB (PaperTests.setUpClass and the classes that call it,
+        # the per-test DBs, and the health-test DB) and assert no tests/*.sqlite file
+        # survives it and nothing lands directly under out/. One test per class is enough:
+        # setUpClass creates the DB and tearDownClass must remove it.
+        # The return code is NOT asserted: test_health_reports_runtime_deps fails on this
+        # VM for an environment reason (runtime_deps ok False) and that failure must not
+        # hide a leak — the file invariants below are the assertion. The run is only
+        # trusted if all 13 tests actually ran (guards against a vacuous pass from a
+        # renamed test or an import error).
+        ids = [
+            'test_engine.PaperTests.test_buy_duplicate_exit_and_pnl',
+            'test_audit_guardian.AtomicAuditTests.test_trade_execution_event_is_atomic_and_idempotent',
+            'test_automation.AutomationTests.test_independent_decimal_fee_vectors',
+            'test_cycle_roundtrips.CycleRoundTripTests.test_marks_loop_skips_band_read_and_extra_positions_read_when_no_action',
+            'test_db_helper.HelperTests.test_query_parity_with_per_call_path',
+            'test_official_close.OfficialCloseEodTests.test_stale_marks_use_official_close_and_do_not_mutate_positions',
+            'test_phase2.LateEntryFillPrice.test_entry_inside_open_window_uses_official_open',
+            'test_prefilter.EntryGuardTests.test_all_seven_entries_fail_closed_without_proofs',
+            'test_wake_and_bughunt.WorkerWakeTests.test_failure_stranded_by_freeze_is_retried_at_once_and_post_wake_check_logged',
+            'test_wake_and_bughunt.StickySkipTests.test_adv_block_is_evaluated_once_per_session_and_exits_are_never_skipped',
+            'test_worker_supervision.WorkerSupervisionTests.test_config_keys_present_and_polling_budget_above_idle',
+            'test_history_sync.HistorySyncTests.test_skips_symbols_already_at_target',
+            'test_runtime_deps.RuntimeDepsTests.test_health_reports_runtime_deps',
+        ]
         src = Path(e.ROOT)
         tmp = Path(tempfile.mkdtemp(prefix='hygiene-copy-'))
         self.addCleanup(shutil.rmtree, tmp, True)
@@ -89,15 +113,15 @@ class HygieneTests(unittest.TestCase):
             'test_*.sqlite', 'test_*.sqlite-wal', 'test_*.sqlite-shm', 'test_*.sqlite-journal'))
         os.symlink(src / 'node_modules', dst / 'node_modules')
         env = dict(os.environ, TZ='Asia/Kolkata')
-        r = subprocess.run([VENV_PY, '-m', 'unittest', 'discover', '-s', 'tests',
-                            '-p', 'test_engine.py', '-k', 'test_buy_duplicate_exit_and_pnl'],
-                           cwd=str(dst), env=env, capture_output=True, text=True, timeout=300)
-        self.assertEqual(r.returncode, 0, r.stderr[-2000:] + r.stdout[-2000:])
+        r = subprocess.run([PY, '-m', 'unittest'] + ids,
+                           cwd=str(dst / 'tests'), env=env, capture_output=True, text=True, timeout=600)
+        out = r.stdout + r.stderr
+        self.assertIn('Ran 13 tests', out, out[-2000:])
         left = sorted(p.name for p in (dst / 'tests').glob('test_*.sqlite*'))
-        self.assertEqual(left, [])
-        out = dst / 'out'
-        plain = [str(p) for p in out.rglob('*') if p.is_file() and 'test-exports' not in p.parts] if out.exists() else []
-        self.assertEqual(plain, [])
+        self.assertEqual(left, [], out[-2000:])
+        outdir = dst / 'out'
+        plain = [str(p) for p in outdir.rglob('*') if p.is_file() and 'test-exports' not in p.parts] if outdir.exists() else []
+        self.assertEqual(plain, [], out[-2000:])
 
 if __name__ == '__main__':
     unittest.main()
