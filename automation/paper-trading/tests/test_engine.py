@@ -166,6 +166,53 @@ class PaperTests(unittest.TestCase):
   self.assertGreater(stress['price'],normal['price'])
   rich=self.signal(strategy=2);self.seed_adv('RELIANCE-EQ',250000000);filled=e.fill(self.db,rich,self.quote(),T)
   self.assertEqual(filled['qty'],500);self.assertEqual(filled['price'],above['price'])
+ def test_exit_slippage_applied_when_adv_ok(self):
+  # Pinned behaviour: a SELL with ADV at/above the floor gets tiered slippage, same model as the BUY.
+  bought=self.signal();self.assertTrue(e.fill(self.db,bought,self.quote(),T)['filled'])
+  sell=self.signal('SELL')
+  r=e.fill(self.db,sell,self.quote(110),T)
+  self.assertTrue(r['filled']);self.assertEqual(r['price'],109.91)
+  payload=json.loads(self.db.query('SELECT payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,sell['id']))[0]['payload_json'])
+  self.assertEqual(payload['slippage_rule'],'tiered_adv_slippage');self.assertTrue(payload['slippage_applied'])
+  direct=self.db.call({'action':'slippage','adv_paise':20000000000,'order_paise':5500000,'reference_paise':11000,'side':'SELL','stress':False})
+  self.assertEqual(direct['base_bps'],8);self.assertEqual(direct['price'],109.91)
+ def test_exit_slippage_unavailable_below_floor_names_the_reason(self):
+  # Pinned behaviour: a SELL below the ADV floor fills at the raw reference price with no slippage.
+  # Visibility (Part A step 2): the fill decision payload and the returned JSON (what the log records)
+  # must say exit_slippage_unavailable with the reason adv_below_floor.
+  bought=self.signal();self.assertTrue(e.fill(self.db,bought,self.quote(),T)['filled'])
+  sell=self.signal('SELL')
+  self.seed_adv('RELIANCE-EQ',90000000)
+  r=e.fill(self.db,sell,self.quote(110),T)
+  self.assertTrue(r['filled']);self.assertEqual(r['price'],110)
+  payload=json.loads(self.db.query('SELECT payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,sell['id']))[0]['payload_json'])
+  self.assertEqual(payload['slippage_rule'],'exit_slippage_unavailable');self.assertFalse(payload['slippage_applied'])
+  self.assertEqual(payload['slippage_reason'],'adv_below_floor')
+  self.assertEqual(r['slippage_rule'],'exit_slippage_unavailable');self.assertEqual(r['slippage_reason'],'adv_below_floor')
+ def test_exit_slippage_unavailable_short_history_names_the_reason(self):
+  # Pinned behaviour: a SELL with no usable ADV history fills at the raw reference price with no slippage.
+  # Visibility (Part A step 2): the reason here is lagged_adv_history_short.
+  bought=self.signal();self.assertTrue(e.fill(self.db,bought,self.quote(),T)['filled'])
+  sell=self.signal('SELL')
+  self.db.batch([('DELETE FROM daily_ohlcv WHERE symbol=?',('RELIANCE-EQ',))])
+  r=e.fill(self.db,sell,self.quote(110),T)
+  self.assertTrue(r['filled']);self.assertEqual(r['price'],110)
+  payload=json.loads(self.db.query('SELECT payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,sell['id']))[0]['payload_json'])
+  self.assertEqual(payload['slippage_rule'],'exit_slippage_unavailable');self.assertFalse(payload['slippage_applied'])
+  self.assertEqual(payload['slippage_reason'],'lagged_adv_history_short')
+  self.assertEqual(r['slippage_rule'],'exit_slippage_unavailable');self.assertEqual(r['slippage_reason'],'lagged_adv_history_short')
+ def test_exit_slippage_be_series_uses_stress(self):
+  # Pinned behaviour: a BE/BZ exit uses the stress multiplier on the same tiered model.
+  sbin=self.signal(symbol='SBIN-EQ');self.assertTrue(e.fill(self.db,sbin,self.quote(),T)['filled'])
+  axis=self.signal(symbol='AXISBANK-EQ');self.assertTrue(e.fill(self.db,axis,self.quote(),T)['filled'])
+  be_exit=e.fill(self.db,self.signal('SELL',symbol='SBIN-EQ'),{**self.quote(110),'symbol':'SBIN-EQ','series':'BE'},T)
+  eq_exit=e.fill(self.db,self.signal('SELL',symbol='AXISBANK-EQ'),{**self.quote(110),'symbol':'AXISBANK-EQ'},T)
+  self.assertTrue(be_exit['filled'] and eq_exit['filled'])
+  self.assertEqual(eq_exit['price'],109.91);self.assertEqual(be_exit['price'],109.86)
+  be_payload=json.loads(self.db.query("SELECT payload_json FROM paper_decisions WHERE namespace=? AND decision_type='EXIT' AND symbol='SBIN-EQ'",(e.NS,))[0]['payload_json'])
+  self.assertEqual(be_payload['slippage_rule'],'tiered_adv_slippage');self.assertTrue(be_payload['series_exit_stress'])
+  eq_payload=json.loads(self.db.query("SELECT payload_json FROM paper_decisions WHERE namespace=? AND decision_type='EXIT' AND symbol='AXISBANK-EQ'",(e.NS,))[0]['payload_json'])
+  self.assertEqual(eq_payload['slippage_rule'],'tiered_adv_slippage');self.assertFalse(eq_payload['series_exit_stress'])
  def test_insufficient_sleeve_cash_keeps_the_entry_pending(self):
   # ₹4,99,500 already spent in paise. ₹500 remains, which cannot fund a ₹50,000 entry plus fees.
   self.db.batch([('INSERT INTO paper_fill_costs(namespace,fill_id,day,strategy,symbol,isin,side,turnover_paise,policy_version,components_json,total_paise,entry_at,gross_cashflow_paise,net_cashflow_paise) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(e.NS,900001,'2026-11-06',1,'RELIANCE-EQ','INE002A01018','BUY',49950000,'FYERS_STANDARD_NSE_DELIVERY_ESTIMATE_2026_11_07_v1','{}',0,'2026-11-06T10:00:00+05:30',-49950000,-49950000))])
