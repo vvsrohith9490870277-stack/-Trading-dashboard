@@ -7,6 +7,20 @@ import {Columns, Lines} from './charts';
 const money = v => <span className={`ad-${tone(v)}`}>{signedInr(v)}</span>;
 const strat = v => <span className="ad-strat"><i style={{background: STRATEGY_HUES[Number(v) - 1]}}/>{strategyName(v)}</span>;
 
+// Phase 2 EOD metrics. A null value is shown as "not enough data yet", never 0, and no P&L
+// number is computed or altered here — every figure is read from the API as stored.
+const NOT_YET = 'not enough data yet';
+const moneyOrNotYet = v => (v === null || v === undefined) ? NOT_YET : money(paiseToInr(v));
+const bpsOrNotYet = v => (v === null || v === undefined) ? NOT_YET : `${fmt(v, 2)} bps`;
+const ratioOrNotYet = v => (v === null || v === undefined) ? NOT_YET : pct(v * 100, 1);
+const OUTAGE_LABELS = {no_monitoring: 'No monitoring', monitor_coverage_low: 'Low monitor coverage', scan_missing: 'Scan missing', eod_missing: 'EOD missing'};
+const outageDetail = o => {
+  const parts = [];
+  if (o.coverage !== null && o.coverage !== undefined) parts.push(`coverage ${pct(o.coverage * 100, 1)}`);
+  if (o.checks !== null && o.checks !== undefined) parts.push(`${o.checks} checks`);
+  return parts.join(' · ');
+};
+
 function CostBook({refreshKey}) {
   const a = useDashboard({view: 'analytics'}, refreshKey);
   const [tab, setTab] = useState('strategies');
@@ -36,13 +50,46 @@ function CostBook({refreshKey}) {
       {key: 'cohort', title: 'Held by', render: v => v.replaceAll('_', ' ')}, {key: 'open_positions', title: 'Open', align: 'right'}, {key: 'closed_trades', title: 'Closed', align: 'right'},
       {key: 'gross_total_paise', title: 'Gross', align: 'right', render: v => money(paiseToInr(v))}, {key: 'net_total_accrued_paise', title: 'Net', align: 'right', render: v => money(paiseToInr(v))},
     ]}/>}
-    {tab === 'eod' && <SortTable caption="end-of-day book" rows={[...(d.eods ?? [])].reverse()} rowKey={r => r.day} columns={[
+    {tab === 'eod' && <>
+      {(() => {
+        const eods = d.eods ?? [];
+        const latestPerf = [...eods].reverse().find(e => e.performance);
+        const perf = latestPerf?.performance?.status === 'ok' ? latestPerf.performance : null;
+        const perfDay = latestPerf?.day;
+        const closed = perf?.expectancy?.closed_trades;
+        return <Section eyebrow={perfDay ? `Latest EOD · ${perfDay}` : 'Latest EOD'} title="Execution quality">
+          <div className="ad-tiles">
+            <Tile label="Expectancy (net)" value={moneyOrNotYet(perf?.expectancy?.expectancy_net_paise)} tone={tone(perf?.expectancy?.expectancy_net_paise)} hint={perf ? (closed === null || closed === undefined ? NOT_YET : `${closed} closed trades`) : NOT_YET}/>
+            <Tile label="Expectancy (gross)" value={moneyOrNotYet(perf?.expectancy?.expectancy_gross_paise)} tone={tone(perf?.expectancy?.expectancy_gross_paise)} hint={perf ? (closed === null || closed === undefined ? NOT_YET : `${closed} closed trades`) : NOT_YET}/>
+            <Tile label="Max drawdown" value={moneyOrNotYet(perf?.drawdown?.max_drawdown_net_paise)} tone={tone(perf?.drawdown?.max_drawdown_net_paise)} hint={perf?.drawdown?.peak_day && perf?.drawdown?.trough_day ? `Peak ${perf.drawdown.peak_day} → trough ${perf.drawdown.trough_day}` : undefined}/>
+            <Tile label="Current drawdown" value={moneyOrNotYet(perf?.drawdown?.current_drawdown_net_paise)} tone={tone(perf?.drawdown?.current_drawdown_net_paise)}/>
+            <Tile label="Cost / gross" value={ratioOrNotYet(perf?.cost_to_gross)} hint={perf ? 'Accrued costs over gross' : NOT_YET}/>
+            <Tile label="Shortfall vs signal close" value={bpsOrNotYet(perf?.implementation_shortfall_bps_vs_signal_close)} hint={perf ? 'Positive = worse than reference' : NOT_YET}/>
+            <Tile label="Shortfall vs session open" value={bpsOrNotYet(perf?.implementation_shortfall_bps_vs_session_open)} hint={perf ? 'Positive = worse than reference' : NOT_YET}/>
+          </div>
+          {latestPerf?.performance?.status === 'unavailable' && <p className="ad-muted ad-fine">Performance unavailable for {perfDay}.</p>}
+          {!latestPerf && <p className="ad-muted ad-fine">No EOD has a performance block yet.</p>}
+        </Section>;
+      })()}
+      <Section eyebrow="Sessions" title="Outages">
+        {(d.outages ?? []).length === 0
+          ? <p className="ad-muted">No outages recorded.</p>
+          : <ul className="ad-outages">{(d.outages ?? []).map(o => <li key={`${o.session_day}-${o.kind}`} className="ad-outage-row">
+            <span className="ad-outage-day">{o.session_day}</span>
+            <span className="ad-outage-kind">{OUTAGE_LABELS[o.kind] ?? o.kind}</span>
+            {outageDetail(o) && <span className="ad-muted ad-fine">{outageDetail(o)}</span>}
+            <span className="ad-muted ad-fine">{istTime(o.detected_at)}</span>
+          </li>)}</ul>}
+      </Section>
+      <SortTable caption="end-of-day book" rows={[...(d.eods ?? [])].reverse()} rowKey={r => r.day} columns={[
       {key: 'day', title: 'Session'}, {key: 'daily_gross_paise', title: 'Daily gross', align: 'right', render: v => money(paiseToInr(v))},
       {key: 'daily_net_accrued_paise', title: 'Daily net', align: 'right', render: v => money(paiseToInr(v))},
       {key: 'net_total_accrued_paise', title: 'Net total', align: 'right', render: v => money(paiseToInr(v))},
       {key: 'closing_valuation_complete', title: 'Close valued', render: v => <Tag tone={v ? 'good' : 'warn'}>{v ? 'complete' : 'incomplete'}</Tag>},
+      {key: 'revaluation', title: 'Revalued', render: (v, r) => (r.revaluation && r.mark_basis === 'official_close_revaluation' ? <Tag tone="good">Revalued from official close</Tag> : '—')},
       {key: 'as_of', title: 'Written', render: v => istTime(v)},
-    ]} empty={{title: 'No end-of-day snapshot yet', text: 'Snapshots are written by the 16:10 IST EOD routine.'}}/>}
+    ]} empty={{title: 'No end-of-day snapshot yet', text: 'Snapshots are written by the 16:10 IST EOD routine.'}}/>
+    </>}
     {tab === 'charges' && <SortTable caption="charges" rows={charges} rowKey={r => r.charge} columns={[{key: 'charge', title: 'Charge'}, {key: 'amount', title: 'Accrued', align: 'right', render: v => inr(v)}]}/>}
   </>;
 }

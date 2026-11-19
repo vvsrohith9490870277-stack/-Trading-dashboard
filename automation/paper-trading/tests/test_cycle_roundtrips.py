@@ -12,6 +12,8 @@ class Feed:
 class CycleRoundTripTests(unittest.TestCase):
  @classmethod
  def setUpClass(cls):fixtures.PaperTests.setUpClass.__func__(cls)
+ @classmethod
+ def tearDownClass(cls):fixtures.PaperTests.tearDownClass.__func__(cls)
  setUp=fixtures.PaperTests.setUp;seed_adv=fixtures.PaperTests.seed_adv;signal=fixtures.PaperTests.signal;quote=fixtures.PaperTests.quote
  def open_position(self,price=100):
   self.assertTrue(e.fill(self.db,self.signal(),self.quote(price),T)['filled'])
@@ -61,6 +63,13 @@ class CycleRoundTripTests(unittest.TestCase):
  def test_heartbeat_failure_event_lands_in_audit_table(self):
   with patch.dict(e.CFG,{'worker_heartbeat_interval_seconds':0.02,'worker_cycle_max_seconds':60}),patch.object(a,'heartbeat',side_effect=RuntimeError('Turso_operation_failed')),patch.object(e,'log'):
    with a.CycleHeartbeat(e,self.db,1):time.sleep(0.1)
-  rows=self.db.query("SELECT severity,outcome FROM paper_events WHERE namespace=? AND event_type='worker_heartbeat_failed'",(e.NS,))
+  # The failure event is written by a background thread that __exit__ does not join, so it may still be in flight
+  # (and hold the SQLite write lock) right after the with-block. Poll briefly instead of racing it.
+  rows=[];deadline=time.monotonic()+10
+  while not rows and time.monotonic()<deadline:
+   try:rows=self.db.query("SELECT severity,outcome FROM paper_events WHERE namespace=? AND event_type='worker_heartbeat_failed'",(e.NS,))
+   except RuntimeError as ex:
+    if 'SQLITE_BUSY' not in str(ex):raise
+   if not rows:time.sleep(0.05)
   self.assertTrue(rows);self.assertEqual(rows[0]['severity'],'WARN');self.assertEqual(rows[0]['outcome'],'failed')
 if __name__=='__main__':unittest.main()

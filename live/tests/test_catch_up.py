@@ -4,6 +4,7 @@ No real Turso, no real simulation: the fake ro answers paper_eod queries and
 the fake eod function records the days it was asked to run.
 """
 import json, sqlite3, sys, tempfile, unittest
+from datetime import datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
@@ -59,6 +60,8 @@ class CatchUpTests(unittest.TestCase):
         kw.setdefault('eod_fn', fake_eod)
         kw.setdefault('marked_days', set())
         kw.setdefault('namespace', 'paper_v1')
+        # Fixed after-hours clock: the market-hours guard must not depend on when the suite runs (it fired 09:00-15:35 IST).
+        kw.setdefault('now_fn', lambda: datetime(2026, 11, 18, 18, 0, tzinfo=ar.IST))
         out = ar.eod_catch_up(**kw)
         return out, calls
 
@@ -176,12 +179,14 @@ class CatchUpTests(unittest.TestCase):
                             'simulation_status': 'BLOCKED_PIT_SERIES_ARCHIVE_P1'}
                 ro = FakeRO({'2026-11-13'})
                 out = ar.eod_catch_up(frm='2026-11-13', to='2026-11-13', ro=ro,
-                                      eod_fn=blocked_eod, marked_days=None, namespace='paper_v1')
+                                      eod_fn=blocked_eod, marked_days=None, namespace='paper_v1',
+                                      now_fn=lambda: datetime(2026, 11, 18, 18, 0, tzinfo=ar.IST))
                 self.assertEqual(calls, ['2026-11-13'])
                 self.assertEqual(out['days'][0]['simulation_status'], 'BLOCKED_PIT_SERIES_ARCHIVE_P1')
                 calls.clear()
                 out = ar.eod_catch_up(frm='2026-11-13', to='2026-11-13', ro=ro,
-                                      eod_fn=blocked_eod, marked_days=None, namespace='paper_v1')
+                                      eod_fn=blocked_eod, marked_days=None, namespace='paper_v1',
+                                      now_fn=lambda: datetime(2026, 11, 18, 18, 0, tzinfo=ar.IST))
                 self.assertEqual(calls, ['2026-11-13'])  # re-run: never counted as done
             finally:
                 ar.CFG['adaptive_db'] = old

@@ -15,6 +15,15 @@ class Base(unittest.TestCase):
  def setUpClass(cls):
   cls.db=e.DB(str(e.ROOT/'tests'/'test_')+uuid.uuid4().hex+'.sqlite');e.NS='test_fixture';e.init(cls.db)
   cls.db.batch([('CREATE TABLE IF NOT EXISTS daily_ohlcv(symbol TEXT,trade_date TEXT,open REAL,close REAL,volume REAL,turnover REAL)',())])
+ @classmethod
+ def tearDownClass(cls):
+  # Same rule as PaperTests: a file-backed test DB must not survive the run.
+  db=getattr(cls,'db',None)
+  if db is None:return
+  try:db.close_helper()
+  except Exception:pass
+  p=Path(db.test_database);p.unlink(missing_ok=True)
+  for suffix in ('-wal','-shm','-journal'):Path(str(p)+suffix).unlink(missing_ok=True)
  def setUp(self):
   e.NS='test_'+uuid.uuid4().hex;e.now=lambda:T;e._SURV_CACHE.clear();e._FULL_NOTED.clear()
   self.saved={k:e.CFG.get(k) for k in ('surveillance_fail_closed','surveillance_fail_closed_in_tests','sessiond_exit_selftest')}
