@@ -69,8 +69,10 @@ class PackagingTests(unittest.TestCase):
                 'suspicious value in .env.render.example: %r' % line)
 
     def test_readme_links_deploy_doc(self):
+        # The link line lives in the backend README (brief Task 8).
         self.assertIn('deploy/render/DEPLOY.md',
-                      (ROOT / 'README.md').read_text())
+                      (ROOT / 'automation' / 'paper-trading'
+                       / 'README.md').read_text())
 
     def test_deploy_doc_mentions_handoff_and_trial(self):
         text = (DEPLOY / 'DEPLOY.md').read_text()
