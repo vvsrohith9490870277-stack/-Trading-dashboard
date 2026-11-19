@@ -21,7 +21,6 @@ import sys
 import time
 from urllib.parse import parse_qs, urlparse
 
-import pyotp
 import requests
 
 ENV_PATH = pathlib.Path(__file__).resolve().parent / ".env"
@@ -121,10 +120,10 @@ def refresh_token(creds: dict[str, str], session=None, verbose: bool = False) ->
     if not request_key:
         raise FyersAuthError("send_otp_failed")
 
-    # 2. verify TOTP
-    remaining = 30 - (time.time() % 30)
-    if remaining < 5:
-        time.sleep(remaining + 0.15)
+    # 2. verify TOTP (imported here, not at module top level: pyotp is a
+    # third-party package, and the install check treats any top-level
+    # import of a name it does not know as a missing sibling module).
+    import pyotp
     totp = pyotp.TOTP(totp_secret).now()
     try:
         r = session.post(f"{BASE_VAGATOR}/verify_otp", json={"request_key": request_key, "otp": totp}, timeout=30)
