@@ -699,7 +699,7 @@ def _cmd_dry_run_fake_clock(args):
             print('refused: %s is not a trial namespace' % namespace,
                   file=sys.stderr)
             return 3
-        if mode != 'trial' and namespace in ('paper_v1', 'paper_demo_v1'):
+        if mode != 'trial' and namespace in ('paper_v1', 'paper_demo_v1'):  # refused: archived namespaces
             print('refused: %s is an archived namespace' % namespace,
                   file=sys.stderr)
             return 3
