@@ -3,7 +3,7 @@ import json, re, sys
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from ro_client import TursoRO
-PROTECTED = ('paper_v1', 'paper_demo_v1')
+PROTECTED = ('paper_v1', 'paper_v2', 'paper_demo_v1')
 db = TursoRO()
 tables = db.query("SELECT name, sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
 qs, keys = [], []

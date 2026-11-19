@@ -1,7 +1,9 @@
-"""P4: compare adaptive Track A replica arms (local adaptive.sqlite) with the live paper_v1 ledger (Turso read-only).
+"""P4: compare adaptive Track A replica arms (local adaptive.sqlite) with the live paper ledger (Turso read-only).
 
-Never writes to Turso or /workspace/paper-trading. Usage:
-  python track_a_parity.py [--session YYYY-MM-DD]
+The live book comes from the Track A config namespace (paper_v2); --book paper_v1
+compares against the paper_v1 archive instead. Never writes to Turso or /workspace/paper-trading.
+Usage:
+  python track_a_parity.py [--session YYYY-MM-DD] [--book paper_v2|paper_v1]
 """
 import argparse, json, sqlite3, sys
 from collections import defaultdict
@@ -17,11 +19,12 @@ from ro_client import TursoRO
 IST = ZoneInfo('Asia/Kolkata')
 CFG = json.loads((HERE / 'adaptive_live_config.json').read_text())
 NS = CFG['namespace']
-TRACK_A_NS = 'paper_v1'
 
 
-def live_ledger(ro, session=None):
-    eod_days = ro.query('SELECT day, as_of, report_json FROM paper_eod WHERE namespace=? ORDER BY day', (TRACK_A_NS,))
+def live_ledger(ro, session=None, ns=None):
+    if ns is None:
+        ns = apath.track_a_namespace(None, CFG)
+    eod_days = ro.query('SELECT day, as_of, report_json FROM paper_eod WHERE namespace=? ORDER BY day', (ns,))
     latest = eod_days[-1] if eod_days else None
     day = session or (latest['day'] if latest else None)
     sleeves = {}
@@ -30,11 +33,11 @@ def live_ledger(ro, session=None):
         sleeves = ((rep.get('capped_master_ledger') or {}).get('sleeves')) or {}
     positions = ro.query(
         'SELECT strategy, symbol, qty, entry_price, entry_at FROM paper_positions WHERE namespace=? AND qty>0 ORDER BY strategy, symbol',
-        (TRACK_A_NS,),
+        (ns,),
     )
     fills = ro.query(
         'SELECT strategy, symbol, side, qty, price, filled_at, execution_path, reason FROM paper_fills WHERE namespace=? ORDER BY filled_at, id',
-        (TRACK_A_NS,),
+        (ns,),
     )
     fills_by_day = defaultdict(list)
     for f in fills:
@@ -164,14 +167,16 @@ def compare(live, adaptive):
 def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument('--session', default=None)
+    ap.add_argument('--book', default=None, choices=['paper_v2', 'paper_v1'])
     a = ap.parse_args(argv)
+    ns = a.book or apath.track_a_namespace(None, CFG)
     ro = TursoRO()
-    live = live_ledger(ro, a.session)
+    live = live_ledger(ro, a.session, ns=ns)
     adaptive = adaptive_state(a.session or live.get('latest_eod_day'))
     cmp = compare(live, adaptive)
     report = {
         'at_ist': datetime.now(IST).isoformat(),
-        'namespace_live': TRACK_A_NS,
+        'namespace_live': ns,
         'namespace_adaptive': NS,
         'live': {k: live[k] for k in live if k != 'fills'},
         'live_fill_count': len(live.get('fills') or []),

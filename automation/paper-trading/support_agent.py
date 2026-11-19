@@ -1791,8 +1791,9 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
     }
 
 
-def build_nov9_replay_fixture(db, namespace='paper_v1'):
+def build_nov9_replay_fixture(db, namespace=None):
     """Populate a deterministic 2026-11-09 session fixture matching the 9 Nov evidence table in Plan v3."""
+    namespace = CFG['namespace'] if namespace is None else namespace
     day = '2026-11-09'
     stmts = [
         # 1. Monitor coverage: first check at 12:27:44, last check at 15:29:58 (no checks 09:15-12:27 -> worker_down + monitor_staleness)
@@ -1839,8 +1840,9 @@ def build_nov9_replay_fixture(db, namespace='paper_v1'):
     db.batch(stmts)
 
 
-def run_virtual_clock_replay(support_db, trading_db, namespace='paper_v1', session_day='2026-11-09', ticks=None, observation_only=True):
+def run_virtual_clock_replay(support_db, trading_db, namespace=None, session_day='2026-11-09', ticks=None, observation_only=True):
     """Run virtual-clock replay across a session day and verify zero duplicate findings on repeat ticks."""
+    namespace = CFG['namespace'] if namespace is None else namespace
     session_day = ist_session_day(session_day)
     if ticks is None:
         ticks = [
@@ -2020,8 +2022,9 @@ def reminder_schedule_for_batch(batch_session_day, cfg=None):
     ][:int(SUPPORT_POLICY['schedule']['max_reminders'])]
 
 
-def write_heartbeat(store_or_dir, namespace='paper_v1', now_at=None, source='systemd_timer'):
+def write_heartbeat(store_or_dir, namespace=None, now_at=None, source='systemd_timer'):
     """Write local sidecar heartbeat so reports can detect blind windows even when routines pause."""
+    namespace = CFG['namespace'] if namespace is None else namespace
     t = parse_ist(now_at) if now_at is not None else ist_now()
     day = t.date().isoformat()
     stamp = t.isoformat()

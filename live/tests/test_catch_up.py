@@ -125,7 +125,7 @@ class CatchUpTests(unittest.TestCase):
         ro = FakeRO({'2026-11-13', '2026-11-16'})
         with self.assertRaises(RuntimeError) as ctx:
             ar.eod_catch_up(frm='2026-11-13', to='2026-11-16', ro=ro, eod_fn=fake_eod,
-                            marked_days=set(), namespace='paper_v1', now_fn=lambda: next(times))
+                            marked_days=set(), namespace='paper_v2', now_fn=lambda: next(times))
         self.assertEqual(calls, ['2026-11-13'])  # day 2 is not run
         self.assertIn('2026-11-13:OK', str(ctx.exception))  # days already done are listed
         self.assertIn('adaptive_eod_refused_in_market_hours_0900_1535_IST', str(ctx.exception))
@@ -179,13 +179,13 @@ class CatchUpTests(unittest.TestCase):
                             'simulation_status': 'BLOCKED_PIT_SERIES_ARCHIVE_P1'}
                 ro = FakeRO({'2026-11-13'})
                 out = ar.eod_catch_up(frm='2026-11-13', to='2026-11-13', ro=ro,
-                                      eod_fn=blocked_eod, marked_days=None, namespace='paper_v1',
+                                      eod_fn=blocked_eod, marked_days=None, namespace='paper_v2',
                                       now_fn=lambda: datetime(2026, 11, 18, 18, 0, tzinfo=ar.IST))
                 self.assertEqual(calls, ['2026-11-13'])
                 self.assertEqual(out['days'][0]['simulation_status'], 'BLOCKED_PIT_SERIES_ARCHIVE_P1')
                 calls.clear()
                 out = ar.eod_catch_up(frm='2026-11-13', to='2026-11-13', ro=ro,
-                                      eod_fn=blocked_eod, marked_days=None, namespace='paper_v1',
+                                      eod_fn=blocked_eod, marked_days=None, namespace='paper_v2',
                                       now_fn=lambda: datetime(2026, 11, 18, 18, 0, tzinfo=ar.IST))
                 self.assertEqual(calls, ['2026-11-13'])  # re-run: never counted as done
             finally:

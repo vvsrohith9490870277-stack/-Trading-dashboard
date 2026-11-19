@@ -126,7 +126,7 @@ change simulation logic, results or the memory cap.
 - Paper-only: nothing places real orders and adaptive never calls Fyers.
 - Turso is read-only for adaptive: SELECT inside a read transaction via
   `live/turso_ro.mjs` only; `batch()` raises `PermissionError`.
-- Adaptive never writes `paper_v1` or `paper_demo_v1` (any table, any form);
+- Adaptive never writes `paper_v1`, `paper_v2` or `paper_demo_v1` (any table, any form);
   the protected-namespace row-count guard runs before and after every `eod`.
 - `adaptive_observation_only` stays `true`: no promotion, no Track C, no
   gate/calibration wiring into the nightly run.

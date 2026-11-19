@@ -14,6 +14,7 @@
   "eod_wait_poll_seconds": 120,
   "protected_namespaces": [
     "paper_v1",
+    "paper_v2",
     "paper_demo_v1"
   ],
   "backfill": {
