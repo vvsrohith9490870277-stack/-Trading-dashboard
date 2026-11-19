@@ -1320,7 +1320,9 @@ def _tree_cpu_seconds(pid):
     return total
 
 
-def main(argv=None):
+def build_parser():
+    """The CLI parser, exposed so tests (and DEPLOY.md checks) can
+    parse a command line with the real parser."""
     parser = argparse.ArgumentParser(description='Render control CLI')
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('trial-init')
@@ -1385,7 +1387,11 @@ def main(argv=None):
     p = sub.add_parser('footprint')
     p.add_argument('--seconds', type=int, default=10)
     p.set_defaults(fn=cmd_footprint)
-    args = parser.parse_args(argv)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
     try:
         return args.fn(args)
     except rt.NamespaceRefused as ex:

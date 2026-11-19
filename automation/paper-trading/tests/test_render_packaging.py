@@ -81,6 +81,68 @@ class PackagingTests(unittest.TestCase):
         self.assertIn('handoff', text.lower())
         self.assertIn('/health', text)
 
+    def test_deploy_md_mentions_required_sections(self):
+        # Brief 01 Task 8.4 / brief 02 Task 3: every section is present.
+        text = (DEPLOY / 'DEPLOY.md').read_text()
+        lower = text.lower()
+        for section in (
+                'what runs where',
+                'free-tier limits',
+                'create the service',
+                'secrets checklist',
+                'keep-awake pinger',
+                'cron-job.org',
+                'uptimerobot',
+                '"ok": true',
+                'trial runbook',
+                'monday handoff',
+                'cutover sequence',
+                'rollback to the box',
+                'never-double-run',
+                'calendar renewal',
+                'troubleshooting',
+                'combined fyers usage check',
+                'adaptive stays on the box',
+                'pin', 'totp',
+                'login invalidates',
+        ):
+            self.assertIn(section, lower, 'missing DEPLOY.md section: %r'
+                          % section)
+
+    def test_deploy_md_commands_parse(self):
+        # Brief 02 Task 3: every render_ctl.py line in DEPLOY.md must
+        # parse with the real argparse parser, and any command that
+        # needs --yes to act must show --yes wherever the text says it
+        # acts (a line that says "dry run" is a preview, not an action).
+        import render_ctl
+        parser = render_ctl.build_parser()
+        text = (DEPLOY / 'DEPLOY.md').read_text()
+        # subcommand + zero or more --flag [value] groups; a value never
+        # starts with --, and backticks / prose end a command.
+        pat = re.compile(
+            r'render_ctl\.py\s+([a-z-]+'
+            r'(?:\s+--[a-z-]+(?:\s+(?!--)[^\s`]+)?)*)')
+        found = []
+        for line in text.splitlines():
+            for m in pat.finditer(line):
+                found.append((line, m.group(1)))
+        self.assertTrue(found, 'no render_ctl.py commands in DEPLOY.md')
+        for line, raw in found:
+            argv = raw.split()
+            try:
+                parsed = parser.parse_args(argv)
+            except SystemExit as ex:
+                self.fail('DEPLOY.md command does not parse: %r '
+                          '(line: %r, %s)' % (raw, line.strip(), ex))
+            if parsed.command in ('handoff', 'trial-purge') \
+                    and 'dry' not in line.lower():
+                self.assertIn('--yes', argv,
+                              'acting %s command without --yes: %r'
+                              % (parsed.command, raw))
+            if parsed.command == 'trial-init':
+                self.assertIn('--bar', argv,
+                              'trial-init without --bar: %r' % raw)
+
 
 if __name__ == '__main__':
     unittest.main()
