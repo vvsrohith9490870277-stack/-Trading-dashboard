@@ -37,7 +37,7 @@ python automation/paper-trading/render_ctl.py publish-token
 2. Fill the prompted env vars from `deploy/render/.env.render.example`:
    `PAPER_RUNTIME=render`, `RENDER_MODE=live`,
    `TURSO_DATABASE_URL`, `TURSO_AUTH_TOKEN`, `TOKEN_ENC_KEY`,
-   `FYERS_AUTO_LOGIN=0`, `PAPER_SESSIOND_DISABLE=1`.
+   `FYERS_AUTO_LOGIN` off, `PAPER_SESSIOND_DISABLE` on.
    Leave `PAPER_NAMESPACE_OVERRIDE` empty for live.
 3. Deploy. The service starts with `active_runner` unset, so it serves
    `/health` as `idle_not_active_runner` (HTTP 200) and runs nothing.
