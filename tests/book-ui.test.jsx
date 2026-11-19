@@ -3,7 +3,7 @@
 import React from 'react';
 import {readFileSync} from 'node:fs';
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {act, cleanup, fireEvent, render, screen, within} from '@testing-library/react';
+import {act, cleanup, fireEvent, render, screen} from '@testing-library/react';
 import Portal from '../src/portal/Portal';
 import {clearStaticCache} from '../src/portal/data';
 
