@@ -142,13 +142,34 @@ class OpsCtlTests(unittest.TestCase):
 
     def test_handoff_cli(self):
         self._run('migrate')
-        r = self._run('handoff', '--to', 'render')
+        r = self._run('handoff', '--to', 'render', '--yes')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual(json.loads(r.stdout)['active_runner'], 'render')
-        r = self._run('handoff', '--to', 'box')
+        r = self._run('handoff', '--to', 'box', '--yes')
         self.assertEqual(json.loads(r.stdout)['active_runner'], 'box')
-        r = self._run('handoff', '--to', 'sideways')
+        r = self._run('handoff', '--to', 'sideways', '--yes')
         self.assertNotEqual(r.returncode, 0)
+
+    def test_handoff_requires_yes(self):
+        self._run('migrate')
+        r = self._run('handoff', '--to', 'render')
+        self.assertNotEqual(r.returncode, 0)
+        # and the flag was not changed
+        r = self._run('status')
+        self.assertNotEqual(json.loads(r.stdout).get('active_runner'),
+                            'render')
+
+    def test_gen_key_not_persisted(self):
+        self._run('migrate')
+        r = self._run('gen-key')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        key = json.loads(r.stdout)['TOKEN_ENC_KEY']
+        # A second key differs, and neither is stored anywhere: the
+        # token store has no token and no key row.
+        r2 = self._run('gen-key')
+        self.assertNotEqual(json.loads(r2.stdout)['TOKEN_ENC_KEY'], key)
+        r = self._run('token-check')
+        self.assertFalse(json.loads(r.stdout)['present'])
 
     def test_gen_key_cli(self):
         r = self._run('gen-key')
@@ -223,14 +244,133 @@ class OpsCtlTests(unittest.TestCase):
         r = self._run('footprint', '--seconds', '5')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         out = json.loads(r.stdout)
-        self.assertLess(out['total_peak_rss_mb'], 512)
-        self.assertGreaterEqual(out['cpu_seconds'], 0)
-        self.assertGreater(out['est_wall_at_0_1_cpu_seconds'], 0)
-        self.assertTrue(out['free_tier_ok'])
+        self._assert_footprint_shape(out)
+
+    def _assert_footprint_shape(self, out):
+        # The exact shape the gate parses (brief Task 7).
+        for name in ('preflight', 'scan', 'eod', 'sync_history',
+                     'support', 'revalue', 'worker_cycle'):
+            self.assertIn(name, out['rows'], name)
+            row = out['rows'][name]
+            self.assertIn('peak_rss_mb', row)
+            self.assertIn('cpu_seconds', row)
+            self.assertIn('est_wall_seconds_at_0.1cpu', row)
+        self.assertLessEqual(out['worker_cpu_seconds_per_cycle'], 2.0)
+        self.assertLessEqual(out['max_peak_rss_mb'], 420)
+        self.assertGreater(out['baseline_idle_rss_mb'], 0)
+
+    def test_footprint_reports_required_fields(self):
+        # The named Task 7 test, on a tiny fixture (short window).
+        r = self._run('footprint', '--seconds', '3')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self._assert_footprint_shape(json.loads(r.stdout))
+
+    def test_status_exit_codes(self):
+        self._run('migrate')
+        # Idle (no flag): healthy.
+        r = self._run('status')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # Flag on render with no lease yet: healthy (starting up).
+        self._run('handoff', '--to', 'render', '--yes')
+        r = self._run('status')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # Flag on render with a stale lease heartbeat and no job today:
+        # stalled (exit 2).
+        store = rs.SqliteStore(self.db_path)
+        lease = rl.Lease(store, 'paper_v2', 'test-owner')
+        self.assertTrue(lease.acquire())
+        store.execute(
+            "UPDATE paper_runner_lease SET heartbeat_at='2026-11-18T00:00:00'"
+            " WHERE namespace='paper_v2'")
+        store.close()
+        r = self._run('status')
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertTrue(json.loads(r.stdout)['stalled'])
+
+    def test_seed_budget_copies_only_counters(self):
+        self._run('migrate')
+        src = Path(self.tmp.name) / 'box-budget.json'
+        src.write_text(json.dumps({
+            'day': '2026-11-20', 'requests': 42,
+            'by_route': {'scan': 40}, 'times': [1, 2, 3],
+            'FYERS_PIN': 'SECRET_PIN', 'TOKEN': 'SECRET_TOKEN'}))
+        r = self._run('seed-budget', '--from-file', str(src))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = self._run('budget-check')
+        state = json.loads(r.stdout)['box']['state']
+        self.assertEqual(state['requests'], 42)
+        self.assertEqual(state['by_route'], {'scan': 40})
+        self.assertEqual(state['times'], [1, 2, 3])
+        self.assertNotIn('SECRET_PIN', json.dumps(state))
+        self.assertNotIn('SECRET_TOKEN', json.dumps(state))
+
+    def test_seed_token_reads_stdin_not_argv(self):
+        self._run('migrate')
+        env = self._env()
+        env['TOKEN_ENC_KEY'] = json.loads(
+            self._run('gen-key').stdout)['TOKEN_ENC_KEY']
+        # The token arrives on stdin; it must not appear in argv.
+        proc = subprocess.run(
+            [sys.executable, str(CTL), 'seed-token'],
+            input=json.dumps({'access_token': 'tok-abc',
+                              'refresh_token': 'ref-abc'}),
+            capture_output=True, text=True, env=env, timeout=60,
+            cwd=str(HERE.parent))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn('tok-abc', proc.stdout)
+        r = self._run('token-check', TOKEN_ENC_KEY=env['TOKEN_ENC_KEY'])
+        out = json.loads(r.stdout)
+        self.assertTrue(out['present'])
+        self.assertEqual(out['access_len'], 7)
+
+    def test_publish_token_reads_only_access_token_key(self):
+        self._run('migrate')
+        env_file = Path(self.tmp.name) / 'box.env'
+        env_file.write_text(
+            'FYERS_ACCESS_TOKEN=tok-xyz\n'
+            'FYERS_REFRESH_TOKEN=ref-xyz\n'
+            'FYERS_PIN=SECRET_PIN\n'
+            'FYERS_TOTP_SECRET=SECRET_TOTP\n'
+            'FYERS_SECRET_ID=SECRET_ID\n'
+            'FYERS_CLIENT_ID=SECRET_CLIENT\n')
+        env = self._env()
+        env['TOKEN_ENC_KEY'] = json.loads(
+            self._run('gen-key').stdout)['TOKEN_ENC_KEY']
+        r = subprocess.run(
+            [sys.executable, str(CTL), 'publish-token',
+             '--env-file', str(env_file)],
+            capture_output=True, text=True, env=env, timeout=60,
+            cwd=str(HERE.parent))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn('SECRET_PIN', r.stdout)
+        self.assertNotIn('SECRET_TOTP', r.stdout)
+        self.assertNotIn('SECRET_ID', r.stdout)
+        self.assertNotIn('SECRET_CLIENT', r.stdout)
+        r = self._run('token-check', TOKEN_ENC_KEY=env['TOKEN_ENC_KEY'])
+        out = json.loads(r.stdout)
+        self.assertTrue(out['present'])
+        self.assertEqual(out['access_len'], 7)
+
+    def test_budget_check_box_file(self):
+        src = Path(self.tmp.name) / 'box-budget.json'
+        src.write_text(json.dumps({'day': '2026-11-20',
+                                   'requests': 4000}))
+        r = self._run('budget-check', '--box-file', str(src))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(json.loads(r.stdout)['within_limits'])
+        src.write_text(json.dumps({'day': '2026-11-20',
+                                   'requests': 4001}))
+        r = self._run('budget-check', '--box-file', str(src))
+        self.assertEqual(r.returncode, 2)
+
+    def test_ctl_refuses_non_test_namespace_for_dry_run(self):
+        r = self._run('dry-run', '--fake-clock', '--minutes', '5',
+                      '--namespace', 'paper_v2')
+        self.assertNotEqual(r.returncode, 0)
 
     def test_status_cli(self):
         self._run('migrate')
-        self._run('handoff', '--to', 'box')
+        self._run('handoff', '--to', 'box', '--yes')
         r = self._run('status')
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         out = json.loads(r.stdout)

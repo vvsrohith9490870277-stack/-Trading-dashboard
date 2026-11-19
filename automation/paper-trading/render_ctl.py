@@ -295,6 +295,18 @@ def cmd_budget_check(args):
                 'box': {'used': box_used, 'limit': box_day,
                         'within': box_used <= box_day}})
         return 0 if within else 2
+    if getattr(args, 'box_file', None):
+        # The box budget file's counters, checked against the box limits.
+        data = json.loads(Path(args.box_file).read_text())
+        box_used = int(data.get('requests', 0))
+        import engine as e
+        box_day = int(e.MD.get('budget_requests_per_day', 4000))
+        within = box_used <= box_day
+        _print({'within_limits': within,
+                'box_file': {'path': args.box_file, 'day': data.get('day'),
+                             'used': box_used, 'limit': box_day,
+                             'within': within}})
+        return 0 if within else 2
     import token_store as ts
     store = _store()
     tstore = ts.TokenStore(store)
@@ -322,7 +334,12 @@ def cmd_budget_check(args):
 
 
 def cmd_status(args):
-    """One-line status: mode, namespace, flag, lease, last jobs."""
+    """One-line status: mode, namespace, flag, lease, last jobs.
+
+    Exit 0 healthy, 2 stalled: stalled means the active runner is render
+    but the lease heartbeat is older than 120 s and no job completed
+    today. Anything else (idle, flag on the box, a fresh lease) is 0.
+    """
     store = _store()
     ok, namespace = True, None
     try:
@@ -342,10 +359,23 @@ def cmd_status(args):
                     rj.last_run_times(store, namespace).items()}
         except Exception:
             pass
+    stalled = False
+    if flag == 'render' and lease:
+        try:
+            from datetime import datetime, timezone
+            hb = datetime.strptime(
+                lease.get('heartbeat_at') or '', '%Y-%m-%dT%H:%M:%S'
+            ).replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - hb).total_seconds()
+            today = datetime.now(IST).date().isoformat()
+            ran_today = any(v[:10] == today for v in jobs.values())
+            stalled = age > 120 and not ran_today
+        except Exception:
+            stalled = False
     _print({'mode': rm.render_mode(), 'namespace': namespace,
             'namespace_ok': ok, 'active_runner': flag,
-            'lease': lease, 'jobs': jobs})
-    return 0
+            'lease': lease, 'jobs': jobs, 'stalled': stalled})
+    return 2 if stalled else 0
 
 
 def cmd_migrate(args):
@@ -357,6 +387,10 @@ def cmd_migrate(args):
 def cmd_handoff(args):
     if args.to not in ('box', 'render'):
         print('handoff --to must be box or render', file=sys.stderr)
+        return 2
+    if not getattr(args, 'yes', False):
+        print('handoff needs --yes (refusing to change the active runner'
+              ' without it)', file=sys.stderr)
         return 2
     import render_app as ra
     ok, namespace = ra.check_namespace()
@@ -376,38 +410,70 @@ def cmd_gen_key(args):
 
 
 def cmd_seed_budget(args):
+    """Seed a budget from --requests, or from a box budget file
+    (--from-file): only the counters day/requests/by_route/times are
+    copied, never credentials or anything else in the file."""
     import token_store as ts
     store = _store()
     tstore = ts.TokenStore(store)
-    day = args.day
-    if not day:
-        from datetime import datetime
-        from zoneinfo import ZoneInfo
-        day = datetime.now(ZoneInfo('Asia/Kolkata')).date().isoformat()
-    state = {'day': day, 'requests': args.requests, 'by_route': {},
-             'times': []}
+    if getattr(args, 'from_file', None):
+        data = json.loads(Path(args.from_file).read_text())
+        day = data.get('day')
+        if not day:
+            from datetime import datetime
+            day = datetime.now(IST).date().isoformat()
+        state = {'day': day, 'requests': int(data.get('requests', 0)),
+                 'by_route': data.get('by_route') or {},
+                 'times': data.get('times') or []}
+    else:
+        day = args.day
+        if not day:
+            from datetime import datetime
+            day = datetime.now(IST).date().isoformat()
+        state = {'day': day, 'requests': args.requests, 'by_route': {},
+                 'times': []}
     tstore.put_budget(state, trial=args.trial)
     _print({'ok': True, 'trial': args.trial, 'state': state})
     return 0
 
 
 def cmd_seed_token(args):
-    """Store a Fyers token from the environment (never printed).
+    """Store a Fyers token (never printed).
 
-    Reads FYERS_ACCESS_TOKEN (+ FYERS_REFRESH_TOKEN) from env and stores it
-    encrypted under _global/fyers_token. Requires TOKEN_ENC_KEY.
+    Reads the token from stdin first — a bare access token on one line,
+    or a JSON object {"access_token": ..., "refresh_token": ...} — so it
+    never appears in argv. Falls back to FYERS_ACCESS_TOKEN /
+    FYERS_REFRESH_TOKEN in the environment when stdin is empty.
+    Requires TOKEN_ENC_KEY.
     """
     import token_store as ts
-    access = os.environ.get('FYERS_ACCESS_TOKEN')
+    access = None
+    refresh = ''
+    try:
+        raw = sys.stdin.read()
+    except Exception:
+        raw = ''
+    if raw and raw.strip():
+        text = raw.strip()
+        if text.startswith('{'):
+            try:
+                data = json.loads(text)
+                access = data.get('access_token')
+                refresh = data.get('refresh_token', '')
+            except Exception:
+                access = None
+        else:
+            access = text.splitlines()[0].strip()
     if not access:
-        print('FYERS_ACCESS_TOKEN is not set', file=sys.stderr)
+        access = os.environ.get('FYERS_ACCESS_TOKEN')
+        refresh = os.environ.get('FYERS_REFRESH_TOKEN', '')
+    if not access:
+        print('no token on stdin and FYERS_ACCESS_TOKEN is not set',
+              file=sys.stderr)
         return 2
     store = _store()
     tstore = ts.TokenStore(store)
-    tstore.put_token({
-        'access_token': access,
-        'refresh_token': os.environ.get('FYERS_REFRESH_TOKEN', ''),
-    })
+    tstore.put_token({'access_token': access, 'refresh_token': refresh})
     _print({'ok': True, 'stored': 'fyers_token'})
     return 0
 
@@ -460,16 +526,22 @@ def cmd_token_check(args):
            'has_refresh': bool(tok.get('refresh_token'))}
     if args.validate:
         import requests
+        # One quotes request for one symbol (the brief's token-check):
+        # it proves the token authenticates and counts as market data,
+        # not an auth-profile call.
         try:
             r = requests.get(
-                'https://api-t1.fyers.in/api/v3/profile',
+                'https://api-t2.fyers.in/data/quotes/',
+                params={'symbols': 'NSE:SBIN-EQ'},
                 headers={'Authorization': 'Bearer ' +
                          tok['access_token']},
                 timeout=10)
             out['valid'] = r.status_code == 200
             out['http_status'] = r.status_code
+            out['ok'] = r.status_code == 200
         except Exception as ex:
             out['valid'] = False
+            out['ok'] = False
             out['error'] = type(ex).__name__
     _print(out)
     return 0
@@ -478,40 +550,87 @@ def cmd_token_check(args):
 def cmd_net_check(args):
     """Outbound connectivity check with no credentialed calls.
 
-    TCP + TLS handshake only (no HTTP request, no token) to the hosts the
-    service needs. --host host:port may repeat; the default list is the
-    Turso host (from TURSO_DATABASE_URL) plus the Fyers API hosts.
+    Default list: HTTPS GETs (status code only, no token) to the Fyers
+    API hosts, the Fyers symbol-master host, the NSE reference-feed hosts
+    and nsearchives, plus the Turso HTTP pipeline (SELECT 1, with the
+    token from env when present). --host host:port keeps the old TCP+TLS
+    probe (used by the local test with a plain listener).
     """
     import socket
     import ssl
-    hosts = list(args.host or [])
-    if not hosts:
-        url = os.environ.get('TURSO_DATABASE_URL', '')
-        if url:
-            host = url.split('://', 1)[-1].split('/', 1)[0].split(':', 1)[0]
-            if host:
-                hosts.append(host + ':443')
-        hosts += ['api-t2.fyers.in:443', 'api-t1.fyers.in:443']
+    import requests
     results = []
-    for hp in hosts:
-        host, _, port = hp.rpartition(':')
-        port = int(port) if port else 443
-        started = __import__('time').time()
-        entry = {'host': hp, 'reachable': False, 'ms': None}
-        try:
-            sock = socket.create_connection((host, port), timeout=10)
+    if args.host:
+        for hp in args.host:
+            host, _, port = hp.rpartition(':')
+            port = int(port) if port else 443
+            started = __import__('time').time()
+            entry = {'host': hp, 'reachable': False, 'ms': None}
             try:
-                ctx = ssl.create_default_context()
-                tls = ctx.wrap_socket(sock, server_hostname=host)
-                tls.close()
-            except Exception:
-                sock.close()
+                sock = socket.create_connection((host, port), timeout=10)
+                try:
+                    ctx = ssl.create_default_context()
+                    tls = ctx.wrap_socket(sock, server_hostname=host)
+                    tls.close()
+                except Exception:
+                    sock.close()
+                entry['reachable'] = True
+            except Exception as ex:
+                entry['error'] = type(ex).__name__
+            entry['ms'] = round(
+                (__import__('time').time() - started) * 1000, 1)
+            results.append(entry)
+        _print({'hosts': results})
+        return 0
+    urls = ['https://api-t2.fyers.in/',
+            'https://api-t1.fyers.in/',
+            'https://public.fyers.in/',
+            'https://www.nseindia.com/',
+            'https://nsearchives.nseindia.com/',
+            'https://www.bseindia.com/']
+    for url in urls:
+        started = __import__('time').time()
+        entry = {'host': url, 'reachable': False, 'http_status': None,
+                 'ms': None}
+        try:
+            r = requests.get(url, timeout=10)
+            entry['http_status'] = r.status_code
             entry['reachable'] = True
         except Exception as ex:
             entry['error'] = type(ex).__name__
         entry['ms'] = round(
             (__import__('time').time() - started) * 1000, 1)
         results.append(entry)
+    # Turso: one pipeline SELECT 1 (needs the token from env; without it
+    # there is nothing credentialed to send, so report that plainly).
+    turso_url = os.environ.get('TURSO_DATABASE_URL', '')
+    turso_token = os.environ.get('TURSO_AUTH_TOKEN', '')
+    if turso_url and turso_token:
+        base = turso_url.replace('libsql://', 'https://').replace(
+            'turso://', 'https://').rstrip('/')
+        started = __import__('time').time()
+        entry = {'host': base + '/v2/pipeline', 'reachable': False,
+                 'http_status': None, 'ms': None}
+        try:
+            r = requests.post(
+                base + '/v2/pipeline',
+                headers={'Authorization': 'Bearer ' + turso_token},
+                json={'requests': [
+                    {'type': 'execute',
+                     'stmt': {'sql': 'SELECT 1'}},
+                    {'type': 'close'}]},
+                timeout=10)
+            entry['http_status'] = r.status_code
+            entry['reachable'] = r.status_code == 200
+        except Exception as ex:
+            entry['error'] = type(ex).__name__
+        entry['ms'] = round(
+            (__import__('time').time() - started) * 1000, 1)
+        results.append(entry)
+    else:
+        results.append({'host': 'turso pipeline',
+                        'reachable': False, 'http_status': None,
+                        'ms': None, 'error': 'no_turso_credentials'})
     _print({'hosts': results})
     return 0
 
@@ -699,6 +818,11 @@ def _cmd_dry_run_fake_clock(args):
             print('refused: %s is not a trial namespace' % namespace,
                   file=sys.stderr)
             return 3
+        if mode != 'trial' and not namespace.startswith('test_'):
+            # A non-trial dry-run never writes a real namespace.
+            print('refused: dry-run namespace %s must start with test_'
+                  % namespace, file=sys.stderr)
+            return 3
         if mode != 'trial' and namespace in ('paper_v1', 'paper_demo_v1'):  # refused: archived namespaces
             print('refused: %s is an archived namespace' % namespace,
                   file=sys.stderr)
@@ -803,63 +927,237 @@ def cmd_dry_run(args):
     return 0
 
 
-def cmd_footprint(args):
-    """Measure the supervisor + worker footprint over --seconds seconds.
+FOOTPRINT_JOBS = [('preflight', 'preflight'), ('scan', 'scan'),
+                  ('eod', 'eod'), ('sync_history', 'sync-history'),
+                  ('support', 'support'), ('revalue', 'revalue-eod')]
+FOOTPRINT_CYCLE_SECONDS = 30  # the worker's cycle length on the box
+FOOTPRINT_SYMBOLS = 50
+FOOTPRINT_STRATEGIES = 7
+FOOTPRINT_POSITIONS_PER_STRATEGY = 9
+FOOTPRINT_BARS = 60
 
-    Starts the supervisor with a fake worker against the configured store,
-    samples RSS of the supervisor and its worker, and estimates the wall
-    time the same CPU work would take at 0.1 CPU (free tier). Reports
-    whether the total stays under the 512 MB free limit.
+
+def _build_footprint_fixture(path):
+    """Create the footprint fixture DB: the full paper schema (via
+    `engine.py init`) plus the render schema, then a realistic book:
+    7 strategies x 9 positions, a 50-symbol universe, 60 bars of
+    daily_ohlcv each, and the active_runner='render' flag so the mutating
+    jobs pass the runner guard. Returns the store."""
+    import subprocess
+    here = Path(__file__).resolve().parent
+    env = dict(os.environ)
+    env.update({'PAPER_RUNTIME': 'render',
+                'PAPER_TEST_DATABASE': str(path),
+                'PAPER_STATE_DIR': str(Path(tempfile.gettempdir())
+                                       / 'render-footprint-state')})
+    r = subprocess.run(
+        [sys.executable, str(here / 'engine.py'), 'init'],
+        capture_output=True, text=True, env=env, timeout=120,
+        cwd=str(here))
+    if r.returncode != 0:
+        raise RuntimeError('footprint fixture init failed: %s'
+                           % (r.stdout + r.stderr)[-500:])
+    store = rs.SqliteStore(path)
+    rs.migrate(store)
+    rl.set_active_runner(store, 'paper_v2', 'render')
+    conn = sqlite3.connect(str(path))
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA busy_timeout=30000')
+    conn.execute(
+        'CREATE TABLE IF NOT EXISTS daily_ohlcv('
+        'trade_date TEXT NOT NULL, symbol TEXT NOT NULL,'
+        ' open REAL, high REAL, low REAL, close REAL, volume INTEGER,'
+        ' turnover REAL, source TEXT, loaded_at TEXT,'
+        ' PRIMARY KEY(trade_date, symbol))')
+    from datetime import date as _date, timedelta as _td
+    first = _date(2026, 9, 1)
+    for i in range(FOOTPRINT_SYMBOLS):
+        symbol = 'SYM%02d' % (i + 1)
+        for b in range(FOOTPRINT_BARS):
+            bar = (first + _td(days=b)).isoformat()
+            conn.execute(
+                'INSERT OR IGNORE INTO daily_ohlcv'
+                '(trade_date, symbol, open, high, low, close, volume,'
+                ' turnover, source, loaded_at)'
+                ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                (bar, symbol, 100.0 + b, 101.0 + b, 99.0 + b, 100.5 + b,
+                 1000 + b, 100500.0 + b * 1000, 'FOOTPRINT_FIXTURE',
+                 '2026-11-18T10:00:00'))
+    for s in range(FOOTPRINT_STRATEGIES):
+        for j in range(FOOTPRINT_POSITIONS_PER_STRATEGY):
+            conn.execute(
+                'INSERT OR IGNORE INTO paper_positions'
+                '(namespace, strategy, symbol, qty, entry_price, entry_at,'
+                ' high_water, updated_at)'
+                ' VALUES(?, ?, ?, ?, ?, ?, ?, ?)',
+                ('paper_v2', s + 1,
+                 'SYM%02d' % ((s * 9 + j) % FOOTPRINT_SYMBOLS + 1),
+                 10 + j, 100.0 + j, '2026-11-18T10:00:00', 101.0 + j,
+                 '2026-11-18T10:00:00'))
+    conn.commit()
+    conn.close()
+    return store
+
+
+def _sample_tree(pid, interval, duration, stop_event=None):
+    """Sample a process tree's RSS every `interval` seconds for `duration`
+    seconds (or until the process exits). Returns (peak_rss_mb, cpu_seconds)
+    where cpu_seconds is the tree's user+sys CPU over the window."""
+    import time
+    start_cpu = _tree_cpu_seconds(pid)
+    peak = 0
+    deadline = time.time() + duration
+    while time.time() < deadline:
+        total = _rss_mb(pid)
+        for child in _child_pids(pid):
+            total += _rss_mb(child)
+        if total > peak:
+            peak = total
+        if stop_event is not None and stop_event():
+            break
+        time.sleep(interval)
+    end_cpu = _tree_cpu_seconds(pid)
+    cpu = None
+    if start_cpu is not None and end_cpu is not None:
+        cpu = max(0.0, end_cpu - start_cpu)
+    return peak, cpu
+
+
+def _measure_command(argv, env, timeout=120):
+    """Run a command as a subprocess, sampling its process tree's RSS
+    every 100 ms. Returns (peak_rss_mb, cpu_seconds, exit_code). The CPU
+    is read while the process is still alive: after it exits,
+    /proc/<pid>/stat is gone and the reading would be lost."""
+    import subprocess
+    import time
+    proc = subprocess.Popen(
+        argv, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    peak = 0
+    cpu_start = _tree_cpu_seconds(proc.pid)
+    cpu_last = cpu_start
+    try:
+        deadline = time.time() + timeout
+        while proc.poll() is None and time.time() < deadline:
+            total = _rss_mb(proc.pid)
+            for child in _child_pids(proc.pid):
+                total += _rss_mb(child)
+            if total > peak:
+                peak = total
+            now = _tree_cpu_seconds(proc.pid)
+            if now is not None:
+                cpu_last = now
+            time.sleep(0.1)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+    cpu = 0.0
+    if cpu_start is not None and cpu_last is not None:
+        cpu = max(0.0, cpu_last - cpu_start)
+    return peak, cpu, proc.returncode
+
+
+def cmd_footprint(args):
+    """Measure the Render footprint: the worker cycle and each job, run as
+    real subprocesses against a fixture DB (7 strategies x 9 positions, a
+    50-symbol universe, 60 bars of history), with a fake provider (no
+    Fyers credentials in the measurement env, so jobs that need market
+    data fail fast after startup — their rows measure startup + attempt,
+    and the row carries its exit code so that is visible).
+
+    Prints exactly:
+    {"rows": {name: {"peak_rss_mb", "cpu_seconds",
+                     "est_wall_seconds_at_0.1cpu"}},
+     "worker_cpu_seconds_per_cycle", "max_peak_rss_mb",
+     "baseline_idle_rss_mb"}
     """
     import signal
     import subprocess
     import time
     seconds = max(1, args.seconds)
+    here = Path(__file__).resolve().parent
+    tmp = Path(tempfile.mkdtemp(prefix='render-footprint-'))
+    fixture = here / 'tests' / 'test_footprint.sqlite'
     env = dict(os.environ)
-    env['PAPER_RUNTIME'] = 'render'
-    env['PAPER_FAKE_WORKER'] = '1'
-    proc = subprocess.Popen(
-        [sys.executable, str(Path(__file__).resolve().parent / 'render_app.py')],
-        env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    peak = {'supervisor': 0, 'worker': 0}
-    cpu_start = _tree_cpu_seconds(proc.pid)
-    cpu_last = cpu_start
+    env.update({'PAPER_RUNTIME': 'render',
+                'PAPER_TEST_DATABASE': str(fixture),
+                'PAPER_STATE_DIR': str(tmp / 'state')})
+    rows = {}
     try:
-        deadline = time.time() + seconds
-        while time.time() < deadline:
-            for label, pid in (('supervisor', proc.pid),):
-                rss = _rss_mb(pid)
-                if rss > peak[label]:
-                    peak[label] = rss
-            # the worker is the supervisor's child
-            for pid in _child_pids(proc.pid):
-                rss = _rss_mb(pid)
-                if rss > peak['worker']:
-                    peak['worker'] = rss
-            now = _tree_cpu_seconds(proc.pid)
-            if now is not None:
-                cpu_last = now
-            time.sleep(1)
-    finally:
-        proc.send_signal(signal.SIGTERM)
+        store = _build_footprint_fixture(fixture)
+        store.close()
+        # Baseline: the idle supervisor + fake worker.
+        sup = subprocess.Popen(
+            [sys.executable, str(here / 'render_app.py')],
+            env={**env, 'PAPER_FAKE_WORKER': '1'},
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
-    cpu_seconds = 0.0
-    if cpu_start is not None and cpu_last is not None:
-        cpu_seconds = max(0.0, cpu_last - cpu_start)
-    total = peak['supervisor'] + peak['worker']
-    _print({
-        'seconds_observed': seconds,
-        'supervisor_peak_rss_mb': peak['supervisor'],
-        'worker_peak_rss_mb': peak['worker'],
-        'total_peak_rss_mb': total,
-        'cpu_seconds': round(cpu_seconds, 2),
-        'est_wall_at_0_1_cpu_seconds': round(cpu_seconds / 0.1, 1),
-        'free_tier_ok': total < 512,
-    })
+            baseline, _cpu = _sample_tree(sup.pid, 0.1, 2)
+        finally:
+            sup.send_signal(signal.SIGTERM)
+            try:
+                sup.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                sup.kill()
+                sup.wait()
+        # Each job, as a real subprocess, sampled every 100 ms.
+        for name, command in FOOTPRINT_JOBS:
+            peak, cpu, rc = _measure_command(
+                [sys.executable, str(here / 'engine.py'), command], env)
+            rows[name] = {
+                'peak_rss_mb': peak,
+                'cpu_seconds': round(cpu, 2),
+                'est_wall_seconds_at_0.1cpu': round(cpu / 0.1, 1),
+                'exit_code': rc,
+            }
+        # The worker cycle: let the worker finish starting up (imports
+        # are a one-off cost, not per-cycle), then measure its CPU over
+        # the observation window and scale it to one 30 s cycle.
+        worker = subprocess.Popen(
+            [sys.executable, str(here / 'engine.py'), 'worker'],
+            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(5)  # warm-up: imports, not per-cycle work
+            worker_peak, worker_cpu = _sample_tree(
+                worker.pid, 0.1, seconds,
+                stop_event=lambda: worker.poll() is not None)
+        finally:
+            if worker.poll() is None:
+                worker.send_signal(signal.SIGTERM)
+                try:
+                    worker.wait(timeout=30)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    worker.wait()
+        worker_cpu = worker_cpu or 0.0
+        rows['worker_cycle'] = {
+            'peak_rss_mb': worker_peak,
+            'cpu_seconds': round(worker_cpu, 2),
+            'est_wall_seconds_at_0.1cpu': round(worker_cpu / 0.1, 1),
+            'exit_code': worker.returncode,
+        }
+        # One monitor poll's own CPU: a monitor-once run minus a bare
+        # import (the long-running worker pays the import only once, so
+        # the difference is the poll's incremental work). This is a
+        # lower bound for a live poll — without Fyers credentials the
+        # poll fails fast at the refresh — plus the idle rate.
+        _imp_peak, import_cpu, _rc = _measure_command(
+            [sys.executable, '-c', 'import engine'], env)
+        _mon_peak, mon_cpu, _rc = _measure_command(
+            [sys.executable, str(here / 'engine.py'), 'monitor-once'], env)
+        idle_scaled = worker_cpu * (FOOTPRINT_CYCLE_SECONDS / seconds)
+        per_cycle = round(
+            max(0.0, mon_cpu - import_cpu) + idle_scaled, 2)
+    finally:
+        try:
+            fixture.unlink()
+        except Exception:
+            pass
+    max_peak = max((r['peak_rss_mb'] for r in rows.values()), default=0)
+    _print({'rows': rows,
+            'worker_cpu_seconds_per_cycle': per_cycle,
+            'max_peak_rss_mb': max_peak,
+            'baseline_idle_rss_mb': baseline})
     return 0
 
 
@@ -933,6 +1231,7 @@ def main(argv=None):
     p = sub.add_parser('budget-check')
     p.add_argument('--fixture-trial', type=int, default=None)
     p.add_argument('--fixture-box', type=int, default=None)
+    p.add_argument('--box-file', default=None)
     p.set_defaults(fn=cmd_budget_check)
     p = sub.add_parser('status')
     p.set_defaults(fn=cmd_status)
@@ -940,11 +1239,13 @@ def main(argv=None):
     p.set_defaults(fn=cmd_migrate)
     p = sub.add_parser('handoff')
     p.add_argument('--to', required=True)
+    p.add_argument('--yes', action='store_true')
     p.set_defaults(fn=cmd_handoff)
     p = sub.add_parser('gen-key')
     p.set_defaults(fn=cmd_gen_key)
     p = sub.add_parser('seed-budget')
-    p.add_argument('--requests', type=int, required=True)
+    p.add_argument('--requests', type=int, default=None)
+    p.add_argument('--from-file', default=None)
     p.add_argument('--day', default=None)
     p.add_argument('--trial', action='store_true')
     p.set_defaults(fn=cmd_seed_budget)

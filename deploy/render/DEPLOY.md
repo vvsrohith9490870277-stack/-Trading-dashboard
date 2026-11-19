@@ -61,9 +61,52 @@ python automation/paper-trading/render_ctl.py publish-token
 
 ## 6. Rollback
 
-`python automation/paper-trading/render_ctl.py handoff --to box` — the
+`python automation/paper-trading/render_ctl.py handoff --to box --yes` — the
 supervisor idles and the box resumes. No data is lost: all state is in
 Turso, and the Render filesystem is ephemeral by design.
+
+## Adaptive stays on the box
+
+The adaptive sidecar is NOT moved to Render. Measured 2026-11-19 on this
+machine (`render_ctl.py` process-tree sampling, /proc every 100 ms):
+
+- Adaptive runner, light phases (`status`, `preflight`): peak RSS 69 MB.
+- Adaptive engine on its fixtures (test_adaptive_engine, phase2, phase3,
+  sim_trades — the engine's real work): peak RSS 88 MB, 21.98 CPU-s.
+
+Both are under the 420 MB limit, so memory is not the blocker. The blocker
+is local state: the sidecar keeps its state in a local SQLite database
+(`adaptive.sqlite`) plus a local market-snapshot archive, which must
+survive restarts. Render free has no persistent disk (the filesystem is
+lost on every redeploy, restart and spin-down), and moving `adaptive.sqlite`
+to Turso is explicitly out of scope for this brief. So the adaptive sidecar
+stays on the box, and `render_schedule.json` keeps the `adaptive` job
+disabled on Render.
+
+## Footprint (measured 2026-11-19, `render_ctl.py footprint --seconds 5`)
+
+Fixture: 7 strategies x 9 positions, a 50-symbol universe, 60 bars of
+daily_ohlcv each. No Fyers credentials in the measurement env, so jobs
+that need market data fail fast after startup; their rows measure startup
++ attempt, and the exit code is shown. Peak RSS of the whole process tree,
+CPU seconds (user+sys), wall time at 0.1 CPU = CPU / 0.1.
+
+| job | peak RSS MB | CPU s | est. wall s at 0.1 CPU | exit |
+| --- | --- | --- | --- | --- |
+| preflight | 82 | 0.75 | 7.5 | 1 (no creds) |
+| scan | 123 | 1.77 | 17.7 | 0 |
+| eod | 85 | 0.83 | 8.3 | 0 |
+| sync_history | 92 | 0.71 | 7.1 | 1 (no creds) |
+| support | 87 | 0.88 | 8.8 | 0 |
+| revalue | 83 | 0.79 | 7.9 | 1 (no creds) |
+| worker_cycle | 91 | 0.00 | 0.0 | 0 |
+
+- `worker_cpu_seconds_per_cycle`: 0.07 s (limit 2.0). Measured as one
+  monitor poll's own CPU (a `monitor-once` run minus a bare import) plus
+  the idle rate; a lower bound for a live poll, which fails fast at the
+  refresh without credentials.
+- `max_peak_rss_mb`: 123 (limit 420).
+- `baseline_idle_rss_mb`: 77 (idle supervisor + fake worker).
 
 ## Free-tier limits that matter
 
