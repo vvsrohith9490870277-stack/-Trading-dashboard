@@ -238,5 +238,186 @@ class OpsCtlTests(unittest.TestCase):
         self.assertEqual(out['active_runner'], 'box')
 
 
+class DryRunSimTests(unittest.TestCase):
+    """Fake-clock dry-run simulator (gate G7c/7d/7e/7l). Each test runs the
+    CLI in a subprocess against a throwaway SQLite store, no network."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / 'dry.sqlite'
+        self.old = {}
+        for k in ('PAPER_RUNTIME', 'RENDER_MODE', 'PAPER_NAMESPACE_OVERRIDE',
+                  'PAPER_TEST_DATABASE', 'PAPER_STATE_DIR',
+                  'TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN',
+                  'FYERS_PIN', 'FYERS_TOTP_SECRET'):
+            self.old[k] = os.environ.pop(k, None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _run(self, *argv, trial=False, canary=False):
+        env = dict(os.environ)
+        env.update({
+            'PAPER_RUNTIME': 'render',
+            'PAPER_TEST_DATABASE': str(self.db_path),
+            'PAPER_STATE_DIR': self.tmp.name,
+        })
+        if trial:
+            env.update({
+                'RENDER_MODE': 'trial',
+                'PAPER_NAMESPACE_OVERRIDE': 'paper_render_trial_v1',
+            })
+        else:
+            env['RENDER_MODE'] = 'live'
+        if canary:
+            env.update({'FYERS_PIN': 'CANARY_PIN',
+                        'FYERS_TOTP_SECRET': 'CANARY_TOTP'})
+        return subprocess.run(
+            [sys.executable, str(CTL), *argv],
+            capture_output=True, text=True, env=env, timeout=300,
+            cwd=str(HERE.parent))
+
+    def test_fake_clock_day_each_job_once(self):
+        # G7c: full compressed day, test namespace, no network, each job once.
+        r = self._run('dry-run', '--fake-clock', '--minutes', '660')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertTrue(d['namespace'].startswith('test_'))
+        self.assertFalse(d['double_run_detected'])
+        for name, v in d['jobs'].items():
+            if v.get('enabled', True):
+                self.assertEqual(v['runs'], 1, name)
+
+    def test_kill_restart_catch_up(self):
+        # G7d: kill the supervisor mid-day, restart on the same store:
+        # jobs due must run once, done jobs must not rerun.
+        r = self._run('dry-run', '--fake-clock', '--minutes', '660',
+                      '--kill-restart-at', '16:30')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertFalse(d['double_run_detected'])
+        self.assertGreaterEqual(d['catch_ups'], 1)
+
+    def test_two_supervisors_one_active(self):
+        # G7e: two supervisors, one store: only one active.
+        r = self._run('dry-run', '--fake-clock', '--minutes', '120',
+                      '--supervisors', '2')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertEqual(d['max_simultaneous_active'], 1)
+
+    def test_trial_dry_run_with_fake_box(self):
+        # G7l: trial dry-run next to a fake box runner — isolation, budget,
+        # no login, and no secret (CANARY) value anywhere in the output.
+        r = self._run('dry-run', '--fake-clock', '--trial', '--with-fake-box',
+                      '--minutes', '660', trial=True, canary=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertNotIn('CANARY', r.stdout)
+        d = json.loads(r.stdout)
+        self.assertEqual(d['mode'], 'trial')
+        self.assertEqual(d['namespace'], 'paper_render_trial_v1')
+        self.assertEqual(d['box_rows_changed'], 0)
+        self.assertEqual(d['shared_table_rows_changed'], 0)
+        self.assertEqual(d['login_calls'], 0)
+        self.assertLessEqual(d['trial_budget']['day_used'], 1000)
+        self.assertLessEqual(d['trial_budget']['peak_minute'], 8)
+        self.assertLessEqual(d['trial_budget']['peak_second'], 1)
+        self.assertEqual(d['max_simultaneous_active'], 2)
+        self.assertFalse(d['double_run_detected'])
+        self.assertIs(d['jobs']['preflight']['enabled'], False)
+        self.assertIs(d['jobs']['sync_history']['enabled'], False)
+
+
+class FixtureCtlTests(unittest.TestCase):
+    """--fixture modes of the trial commands (gate G7l). The fixture is a
+    small paper_v2 baseline at bar 2026-11-18, built fresh per invocation."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / 'fix.sqlite'
+        self.old = {}
+        for k in ('PAPER_RUNTIME', 'RENDER_MODE', 'PAPER_NAMESPACE_OVERRIDE',
+                  'PAPER_TEST_DATABASE', 'PAPER_STATE_DIR',
+                  'TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN'):
+            self.old[k] = os.environ.pop(k, None)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _run(self, *argv):
+        env = dict(os.environ)
+        env.update({
+            'PAPER_RUNTIME': 'render',
+            'RENDER_MODE': 'trial',
+            'PAPER_NAMESPACE_OVERRIDE': 'paper_render_trial_v1',
+            'PAPER_TEST_DATABASE': str(self.db_path),
+            'PAPER_STATE_DIR': self.tmp.name,
+        })
+        return subprocess.run(
+            [sys.executable, str(CTL), *argv],
+            capture_output=True, text=True, env=env, timeout=120,
+            cwd=str(HERE.parent))
+
+    def test_trial_init_fixture(self):
+        r = self._run('trial-init', '--namespace', 'paper_render_trial_v1',
+                      '--bar', '2026-11-18', '--fixture')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertIs(d['watermarks_match_paper_v2'], True)
+
+    def test_trial_init_fixture_bar_after_completed_day(self):
+        r = self._run('trial-init', '--namespace', 'paper_render_trial_v1',
+                      '--bar', '2026-12-31', '--fixture')
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_trial_compare_fixture(self):
+        r = self._run('trial-compare', '--namespace', 'paper_render_trial_v1',
+                      '--session', '2026-11-20', '--fixture')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertEqual(d['day'], '2026-11-20')
+
+    def test_trial_purge_fixture_refuses_live(self):
+        r = self._run('trial-purge', '--namespace', 'paper_v2',
+                      '--yes', '--fixture')
+        self.assertNotEqual(r.returncode, 0)
+
+    def test_trial_purge_fixture_dry_run_default(self):
+        r = self._run('trial-purge', '--namespace', 'paper_render_trial_v1',
+                      '--fixture')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertIs(d['dry_run'], True)
+
+    def test_trial_purge_fixture_yes_isolated(self):
+        r = self._run('trial-purge', '--namespace', 'paper_render_trial_v1',
+                      '--yes', '--fixture')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertEqual(d['other_namespaces_changed'], 0)
+
+    def test_budget_check_fixture(self):
+        r = self._run('budget-check', '--fixture-trial', '1000',
+                      '--fixture-box', '4000')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertIs(d['within_limits'], True)
+
+    def test_budget_check_fixture_box_over(self):
+        r = self._run('budget-check', '--fixture-trial', '1000',
+                      '--fixture-box', '4001')
+        self.assertEqual(r.returncode, 2)
+
+
 if __name__ == '__main__':
     unittest.main()
