@@ -19,7 +19,7 @@ async function fixture(){
 }
 const now=new Date('2026-11-09T10:00:00Z');const run=db=>async(sql,args)=>(await db.execute({sql,args})).rows;
 const read=(db,q)=>readDashboard(parseOptions(q),run(db),now);
-const pos=(db,strategy,symbol,qty,entry,hw,mark,entryAt='2026-11-06T09:15:00+05:30')=>db.execute({sql:'INSERT INTO paper_positions VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v1',strategy,symbol,qty,entry,entryAt,hw,mark,mark===null?null:'2026-11-09T15:29:59+05:30','2026-11-09T15:30:00+05:30']});
+const pos=(db,strategy,symbol,qty,entry,hw,mark,entryAt='2026-11-06T09:15:00+05:30')=>db.execute({sql:'INSERT INTO paper_positions VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v2',strategy,symbol,qty,entry,entryAt,hw,mark,mark===null?null:'2026-11-09T15:29:59+05:30','2026-11-09T15:30:00+05:30']});
 const days=n=>{const out=[];const d=new Date('2026-07-01T00:00:00Z');while(out.length<n){const w=d.getUTCDay();if(w>0&&w<6)out.push(d.toISOString().slice(0,10));d.setUTCDate(d.getUTCDate()+1);}return out;};
 async function bars(db,symbol,list){for(const b of list)await db.execute({sql:'INSERT INTO daily_ohlcv(trade_date,symbol,open,high,low,close) VALUES(?,?,?,?,?,?)',args:[b.d,symbol,b.o,b.h,b.l,b.c]});}
 
@@ -86,10 +86,10 @@ describe('API (isolated fixture)',()=>{
  it('positions carry the S7 trail stop, S1 rule level from stored bars, charges, break-even and no target',async()=>{
   const db=await fixture();
   await pos(db,7,'ABB-EQ',10,100,120,115);await pos(db,1,'ACC-EQ',2,50,50,52);await pos(db,3,'CUPID-EQ',1,10,10,null);
-  for(const [s,sym] of [[7,'ABB-EQ'],[1,'ACC-EQ'],[3,'CUPID-EQ']])await db.execute({sql:'INSERT INTO paper_watermarks VALUES(?,?,?,?)',args:['paper_v1',s,sym,'2026-11-06']});
+  for(const [s,sym] of [[7,'ABB-EQ'],[1,'ACC-EQ'],[3,'CUPID-EQ']])await db.execute({sql:'INSERT INTO paper_watermarks VALUES(?,?,?,?)',args:['paper_v2',s,sym,'2026-11-06']});
   const closes=Array.from({length:12},(_,i)=>50+i);const d=['2026-10-21','2026-10-22','2026-10-23','2026-10-26','2026-10-27','2026-10-28','2026-10-29','2026-10-30','2026-11-02','2026-11-03','2026-11-04','2026-11-06'];
   await bars(db,'ACC-EQ',closes.map((c,i)=>({d:d[i],o:c,h:c+1,l:c-1,c})));await bars(db,'ACC-EQ',[{d:'2026-11-09',o:1,h:1,l:0.1,c:1}]);
-  await db.execute({sql:'INSERT INTO paper_fill_costs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v1',1,'2026-11-06',7,'ABB-EQ','INE117A01022','BUY',100000,'P','{}',2500,'2026-11-06T09:15:00+05:30',-100000,-102500]});
+  await db.execute({sql:'INSERT INTO paper_fill_costs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v2',1,'2026-11-06',7,'ABB-EQ','INE117A01022','BUY',100000,'P','{}',2500,'2026-11-06T09:15:00+05:30',-100000,-102500]});
   const r=await read(db,{view:'positions'});const abb=r.rows.find(x=>x.symbol==='ABB-EQ'),acc=r.rows.find(x=>x.symbol==='ACC-EQ'),cup=r.rows.find(x=>x.symbol==='CUPID-EQ');
   expect(abb.exit_plan.stop).toMatchObject({kind:'trail',level:trailLevel(120),high_water:120});expect(abb.exit_plan.target.label).toBe(NO_TARGET);expect(abb.exit_plan.risk_reward.value).toBeNull();
   expect(abb.gross_pnl_paise).toBe(15000);expect(abb.entry_charges_paise).toBe(2500);expect(abb.est_exit_charges_paise).toBe(exitChargesPaise(11500n,10,true));
@@ -102,21 +102,21 @@ describe('API (isolated fixture)',()=>{
  });
  it('pending orders: exits carry the S7 stop and held qty; entries carry policy notional context, never a fake qty/limit',async()=>{
   const db=await fixture();await pos(db,7,'ABB-EQ',4,100,110,105);
-  await db.execute({sql:'INSERT INTO paper_signals VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v1','x1',7,'ABB-EQ','2026-11-06','SELL','pending','daily_exit:2026-11-06T09:15:00+05:30','2026-11-06T16:00:00+05:30','2026-11-09']});
-  await db.execute({sql:'INSERT INTO paper_signals VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v1','b1',2,'ACC-EQ','2026-11-06','BUY','pending','daily_entry:beta_momentum_v1','2026-11-06T16:00:00+05:30','2026-11-09']});
-  await db.execute({sql:'INSERT INTO paper_qualifier_states VALUES(?,?,?,?,?,?,?,?)',args:['paper_v1','2026-11-06',2,'ACC-EQ',1,'{}','{"reference_close":2510.5,"reference_bar":"2026-11-06"}','2026-11-06T16:00:00+05:30']});
-  await db.execute({sql:'INSERT INTO paper_quote_audit(namespace,symbol,observed_at,quote_at,price,accepted,reason,source) VALUES(?,?,?,?,?,?,?,?)',args:['paper_v1','ACC-EQ','2026-11-09T09:20:00+05:30','2026-11-09T09:19:59+05:30',2520,1,'fresh','FYERS_QUOTES']});
+  await db.execute({sql:'INSERT INTO paper_signals VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v2','x1',7,'ABB-EQ','2026-11-06','SELL','pending','daily_exit:2026-11-06T09:15:00+05:30','2026-11-06T16:00:00+05:30','2026-11-09']});
+  await db.execute({sql:'INSERT INTO paper_signals VALUES(?,?,?,?,?,?,?,?,?,?)',args:['paper_v2','b1',2,'ACC-EQ','2026-11-06','BUY','pending','daily_entry:beta_momentum_v1','2026-11-06T16:00:00+05:30','2026-11-09']});
+  await db.execute({sql:'INSERT INTO paper_qualifier_states VALUES(?,?,?,?,?,?,?,?)',args:['paper_v2','2026-11-06',2,'ACC-EQ',1,'{}','{"reference_close":2510.5,"reference_bar":"2026-11-06"}','2026-11-06T16:00:00+05:30']});
+  await db.execute({sql:'INSERT INTO paper_quote_audit(namespace,symbol,observed_at,quote_at,price,accepted,reason,source) VALUES(?,?,?,?,?,?,?,?)',args:['paper_v2','ACC-EQ','2026-11-09T09:20:00+05:30','2026-11-09T09:19:59+05:30',2520,1,'fresh','FYERS_QUOTES']});
   const r=await read(db,{view:'signals',status:'pending'});const x=r.rows.find(v=>v.id==='x1'),b=r.rows.find(v=>v.id==='b1');
   expect(x.exit_plan.stop.level).toBe(trailLevel(110));expect(x.position.qty).toBe(4);
   expect(b.entry_plan).toMatchObject({signal_close:2510.5,target:{defined:false}});expect(b.entry_plan.target_notional_inr).toBeGreaterThan(0);expect(b).not.toHaveProperty('qty');expect(b.current_price).toBe(2520);
  });
  it('closed stop exits show the threshold from the risk_hit event; others show none and no invented target',async()=>{
   const db=await fixture();
-  const fill=(id,sig,side,price,at,reason)=>db.execute({sql:'INSERT INTO paper_fills(id,namespace,signal_id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl,cashflow) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',args:[id,'paper_v1',sig,7,'ABB-EQ',side,2,price,at,at,reason,side==='SELL'?(price-100)*2:0,0]});
+  const fill=(id,sig,side,price,at,reason)=>db.execute({sql:'INSERT INTO paper_fills(id,namespace,signal_id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl,cashflow) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',args:[id,'paper_v2',sig,7,'ABB-EQ',side,2,price,at,at,reason,side==='SELL'?(price-100)*2:0,0]});
   await fill(1,'b1','BUY',100,'2026-11-06T09:15:00+05:30','daily_entry:beta_momentum_v1');await fill(2,'s1','SELL',97.2,'2026-11-09T10:00:00+05:30','trail_touch');
-  await db.execute({sql:'INSERT INTO paper_events(namespace,event_id,run_id,session_day,source_at,recorded_at,event_type,severity,outcome,strategy,symbol,data_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v1','e1','r1','2026-11-09','2026-11-09T09:59:59+05:30','2026-11-09T09:59:59+05:30','risk_hit','INFO','ok',7,'ABB-EQ','{"price":97.2,"threshold":97.2,"reason":"trail_touch","secret":"x"}']});
-  await db.execute({sql:'INSERT INTO paper_fill_costs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v1',1,'2026-11-06',7,'ABB-EQ','INE117A01022','BUY',20000,'P','{}',30,'2026-11-06T09:15:00+05:30',-20000,-20030]});
-  await db.execute({sql:'INSERT INTO paper_fill_costs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v1',2,'2026-11-09',7,'ABB-EQ','INE117A01022','SELL',19440,'P','{}',40,'2026-11-06T09:15:00+05:30',19440,19400]});
+  await db.execute({sql:'INSERT INTO paper_events(namespace,event_id,run_id,session_day,source_at,recorded_at,event_type,severity,outcome,strategy,symbol,data_json) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v2','e1','r1','2026-11-09','2026-11-09T09:59:59+05:30','2026-11-09T09:59:59+05:30','risk_hit','INFO','ok',7,'ABB-EQ','{"price":97.2,"threshold":97.2,"reason":"trail_touch","secret":"x"}']});
+  await db.execute({sql:'INSERT INTO paper_fill_costs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v2',1,'2026-11-06',7,'ABB-EQ','INE117A01022','BUY',20000,'P','{}',30,'2026-11-06T09:15:00+05:30',-20000,-20030]});
+  await db.execute({sql:'INSERT INTO paper_fill_costs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',args:['paper_v2',2,'2026-11-09',7,'ABB-EQ','INE117A01022','SELL',19440,'P','{}',40,'2026-11-06T09:15:00+05:30',19440,19400]});
   const r=await read(db,{view:'trades'});const t=r.rows[0];
   expect(t.exit_reason).toBe('trail_touch');expect(t.exit_plan.stop).toMatchObject({hit:true,threshold:97.2,rule:'trail_touch'});expect(t.exit_plan.target.defined).toBe(false);expect(t.exit_plan.risk_reward.value).toBeNull();
   expect(t.break_even).toBe(closedBreakEven(100,2,70));expect(t.net_pnl_pct).toBeCloseTo(-630/20000*100);expect(t.entry_reason).toBe('daily_entry:beta_momentum_v1');expect(JSON.stringify(t)).not.toContain('secret');
