@@ -27,13 +27,6 @@ NODE_ENV=production LOCAL_TURSO_ENV_FILE=/absolute/path/to/existing.env PORT=517
 
 Do not use `vite preview` alone for live data: it has no API. Both provided dev/preview commands host the same API. The local server binds loopback only; its localhost URL is on the box, not the viewer's own computer. Port is configurable with `PORT`.
 
-## Render deployment (Track A backend) — see deploy/render/DEPLOY.md
-
-The paper-trading backend (supervisor + engine) can run on Render's free
-tier with all state in Turso; the dashboard and the adaptive sidecar stay
-where they are. The service starts idle and runs nothing until the
-`active_runner` handoff flag names `render`.
-
 ## Vercel deployment — next steps, not automatically deployed
 
 1. Import this GitHub repository in Vercel. Select Vite; build `npm run build`, output `dist`, Node 24.x. The root `api/dashboard.js` is a Node serverless function; `vercel.json` supplies runtime/security configuration. No SPA deep-link routes are required: sections switch in React at `/`.
