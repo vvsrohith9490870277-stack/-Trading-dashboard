@@ -4,6 +4,7 @@ from datetime import datetime,date,timedelta,time as walltime
 from decimal import Decimal,ROUND_HALF_UP
 from pathlib import Path
 import audit as al
+import runtime_mode as rm
 import runtime_deps as rd
 import official_close as oc
 import capital as cap
@@ -537,6 +538,7 @@ def health(e,db):
  inst=_install_report(e)
  return {'paper_only':True,'automation_session_open':active(e,e.now()),'calendar_valid_through':e.CFG['calendar_valid_through'],'calendar_verified':e.session(e.now().date()) is not None,'heartbeat':r,'heartbeat_stale':bool(active(e,e.now()) and (not r or heartbeat_is_stale(e,r))),'scheduler_required':True,'poll_seconds':e.CFG['poll_seconds'],'calendar_review_warning':(date.fromisoformat(e.CFG['calendar_valid_through'])-e.now().date()).days<=14,'policy_review_warning':(date.fromisoformat(json.loads((e.ROOT/'charge_policy.json').read_text())['valid_through'])-e.now().date()).days<=14,'runtime_deps':{'ok':deps.get('ok'),'python_ok':deps.get('python_ok'),'node_ok':deps.get('node_ok'),'python_reason':deps.get('python_reason'),'node_reason':deps.get('node_reason'),'extra_ok':deps.get('extra_ok'),'extra_projects':deps.get('extra_projects')},'install':inst,'install_ok':bool(inst.get('ok'))}
 def preflight(e,db):
+ if rm.is_render() and os.environ.get('PAPER_SESSIOND_DISABLE')!='1':raise RuntimeError('sessiond_not_disabled_in_render')
  r=rd.ensure();info=rd.report_for_audit(r)
  al.emit(e,db,info['event'],python_ok=r.get('python_ok'),node_ok=r.get('node_ok'),restored=r.get('restored') or [],outcome='ok' if r.get('ok') else 'failed',severity='INFO' if r.get('ok') else 'ERROR')
  try:audit=al.ensure_daily_export(e,db,str(e.now().date()),force=False)
@@ -546,16 +548,22 @@ def preflight(e,db):
   reference=e.refresh_reference(db,day) if not ready.get('ready') else {'status':'already_loaded','surveillance_status':ready}
   reference={'trade_day':str(day),'surveillance_status':reference.get('surveillance_status'),'sources':{k:(v or {}).get('status') for k,v in (reference.get('sources') or {}).items()}}
  except Exception as ex:reference={'status':'unavailable','reason':safe_error(ex)}
- try:import sessiond as sd;daemon=sd.ensure(e)
- except Exception as ex:daemon={'status':'unavailable','reason':safe_error(ex)}
- inst=_install_report(e)
+ if rm.is_render():
+  # Render mode: the supervisor replaces sessiond, so preflight never starts
+  # it (PAPER_SESSIOND_DISABLE=1 is asserted above); the install path checks
+  # are skipped and only the Python/Node import check decides status.
+  daemon={'status':'disabled','started':False};inst={'ok':True,'skipped':'render_mode'}
+ else:
+  try:import sessiond as sd;daemon=sd.ensure(e)
+  except Exception as ex:daemon={'status':'unavailable','reason':safe_error(ex)}
+  inst=_install_report(e)
  status='ok' if r.get('ok') and inst.get('ok') else ('runtime_deps_restore_incomplete' if not r.get('ok') else 'install_incomplete')
  return {'paper_only':True,'status':status,'runtime_deps':r,'audit_export':audit,'reference_feeds':reference,'sessiond':daemon,'calendar_verified':e.session(e.now().date()) is not None,'at_IST':e.now().isoformat(),'install':inst,'install_ok':bool(inst.get('ok'))}
 
 def ensure_monitor(e,db,defer_stale_signal=False):
  if not active(e,e.now()):return {'status':'market_closed_or_calendar_unverified','started':False}
  reap_children()
- with (e.ROOT/'monitor.lock').open('a+') as lock:
+ with (rm.state_path(e.ROOT,'monitor.lock')).open('a+') as lock:
   replaced=None
   try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:
@@ -572,7 +580,7 @@ def ensure_monitor(e,db,defer_stale_signal=False):
     except (OSError,ValueError,IndexError):pass
    if replaced is None:return {'status':'unhealthy_worker_needs_attention' if h['heartbeat_stale'] else 'already_running','started':False,**h}
   # Lock is an OS lease; a stale PID alone never causes process termination or prevents restart.
-  with (e.ROOT/'logs/monitor-worker.log').open('a') as out:
+  with (rm.state_path(e.ROOT,'logs/monitor-worker.log')).open('a') as out:
    p=subprocess.Popen([sys.executable,str(e.ROOT/'engine.py'),'worker'],stdin=subprocess.DEVNULL,stdout=out,stderr=out,start_new_session=True,cwd=e.ROOT,pass_fds=(lock.fileno(),),env={**os.environ,'PAPER_MONITOR_LOCK_FD':str(lock.fileno())})
   if callable(getattr(p,'poll',None)):_children.append(p)
   if replaced is not None:return {'status':'stale_owned_worker_replaced','started':True,'pid':p.pid,'replaced_pid':replaced,'singleton_enforced_by_child':True}
@@ -581,8 +589,8 @@ def ensure_monitor(e,db,defer_stale_signal=False):
 def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
  if not active(e,e.now()):return {'status':'closed','polls':0}
  fd=os.environ.get('PAPER_MONITOR_LOCK_FD')
- if fd and os.fstat(int(fd)).st_ino!=(e.ROOT/'monitor.lock').stat().st_ino:raise RuntimeError('invalid_inherited_monitor_lease')
- with (os.fdopen(int(fd),'a+') if fd else (e.ROOT/'monitor.lock').open('a+')) as lease:
+ if fd and os.fstat(int(fd)).st_ino!=(rm.state_path(e.ROOT,'monitor.lock')).stat().st_ino:raise RuntimeError('invalid_inherited_monitor_lease')
+ with (os.fdopen(int(fd),'a+') if fd else (rm.state_path(e.ROOT,'monitor.lock')).open('a+')) as lease:
   try:fcntl.flock(lease,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:return {'status':'already_running','polls':0}
   failures=0;polls=0;last_pnl=-1000;api=None;paused=False;factory=api_factory or e.MarketData
@@ -599,7 +607,7 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
   try:
    while active(e,e.now()) and (max_polls is None or polls<max_polls) and not state['stop']:
     start=time.monotonic();delay=e.CFG['poll_seconds'];full_cooloff=False;gen=watch.wakes if watch is not None else 0
-    with (e.ROOT/'engine.lock').open('a+') as lock:
+    with (rm.state_path(e.ROOT,'engine.lock')).open('a+') as lock:
      try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
      except BlockingIOError:
       heartbeat(e,db,'waiting_for_engine_lock');al.emit(e,db,'worker_waiting',reason='singleton_busy',poll_seconds=delay);nap(delay);continue

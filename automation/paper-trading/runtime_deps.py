@@ -11,6 +11,7 @@ blocks the paper-trading engine.
 from __future__ import annotations
 import fcntl, json, os, subprocess, sys
 from pathlib import Path
+import runtime_mode as rm
 
 ROOT = Path(__file__).resolve().parent
 STAMP = ROOT / 'out' / 'runtime_deps_last.json'
@@ -24,8 +25,12 @@ def load_cfg(root=None):
     return d
 
 def venv_python(cfg=None):
+    if rm.is_render():
+        # Render mode: the container python itself is the venv; the box
+        # venv_path default (/workspace/...) must never be used.
+        return Path(sys.executable)
     cfg = cfg or load_cfg()
-    return Path(cfg.get('venv_path') or '/workspace/sahil-fyers-turso/.venv') / 'bin' / 'python'
+    return Path(cfg.get('venv_path') or '/workspace/sahil-fyers-turso/.venv') / 'bin' / 'python'  # box default
 
 def _requirements(cfg):
     p = Path(cfg.get('requirements_path') or 'requirements.txt')
@@ -57,6 +62,10 @@ def _node_ok(cfg):
     for name in _node_packages(cfg):
         pkg = root / 'node_modules' / Path(*name.split('/')) / 'package.json'
         if not pkg.is_file():
+            # Render mode: @libsql/client may also resolve from LIBSQL_NODE_PATH.
+            alt = os.environ.get('LIBSQL_NODE_PATH')
+            if alt and (Path(alt) / 'node_modules' / Path(*name.split('/')) / 'package.json').is_file():
+                continue
             missing.append(name)
     if missing:
         return False, 'node_modules_missing:' + ','.join(missing)
@@ -79,10 +88,13 @@ def check(cfg=None):
     }
 
 def _write_stamp(result):
-    STAMP.parent.mkdir(parents=True, exist_ok=True)
-    STAMP.write_text(json.dumps(result, separators=(',', ':')))
+    stamp = rm.state_path(ROOT, 'out', 'runtime_deps_last.json')
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.write_text(json.dumps(result, separators=(',', ':')))
 
 def restore_python(cfg, run=subprocess.run):
+    if rm.is_render():
+        raise RuntimeError('runtime_deps_restore_disabled_in_render')
     req = _requirements(cfg)
     if not req.is_file():
         raise RuntimeError('runtime_deps_requirements_missing')
@@ -99,6 +111,8 @@ def restore_python(cfg, run=subprocess.run):
     return 'venv'
 
 def restore_node(cfg, run=subprocess.run):
+    if rm.is_render():
+        raise RuntimeError('runtime_deps_restore_disabled_in_render')
     lock = _lock(cfg)
     if not lock.is_file():
         raise RuntimeError('runtime_deps_package_lock_missing')
@@ -131,6 +145,10 @@ def _packages_ok(root, packages):
     return missing
 
 def check_extra_projects(cfg=None):
+    if rm.is_render():
+        # Extra node projects are box-only (/workspace/adaptive-live); the
+        # Render image never restores or checks them.
+        return []
     cfg = cfg or load_cfg()
     items = []
     for proj in list(cfg.get('extra_node_projects') or []):
@@ -161,6 +179,8 @@ def restore_extra_node(proj, run=subprocess.run):
 
 def ensure_extra_projects(cfg=None, run=subprocess.run):
     """Restore extra node_modules from their lockfiles. Skip while a project lock is held."""
+    if rm.is_render():
+        return [], []
     cfg = cfg or load_cfg()
     results = []
     restored = []
@@ -196,8 +216,19 @@ def ensure_extra_projects(cfg=None, run=subprocess.run):
     return results, restored
 
 def ensure(cfg=None, run=subprocess.run):
-    """Check runtime dirs and restore from lockfiles if missing. Never deletes them."""
+    """Check runtime dirs and restore from lockfiles if missing. Never deletes them.
+
+    Render mode: check only (imports + node packages). The image is built with
+    its dependencies; nothing is restored at runtime.
+    """
     cfg = cfg or load_cfg()
+    if rm.is_render():
+        state = check(cfg)
+        result = {**state, 'restored': [], 'healed': False, 'extra_projects': [], 'extra_ok': True}
+        _write_stamp(result)
+        if not result['ok']:
+            result['error'] = 'runtime_deps_restore_incomplete'
+        return result
     state = check(cfg)
     restored = []
     if not state['python_ok']:

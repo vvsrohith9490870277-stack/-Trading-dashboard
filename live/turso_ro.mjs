@@ -40,11 +40,16 @@ export function assertReadOnly(sql) {
 async function main() {
   const req = JSON.parse(fs.readFileSync(0, 'utf8'));
   const queries = (req.queries || []).map(q => ({sql: assertReadOnly(q.sql), args: q.args || []}));
-  const envFile = process.env.PAPER_ENV_FILE || '/workspace/sahil-fyers-turso/.env';
+  const envFile = process.env.PAPER_ENV_FILE || '/workspace/sahil-fyers-turso/.env'; // box default
   const env = {};
-  for (const l of fs.readFileSync(envFile, 'utf8').split('\n')) {
-    const p = l.indexOf('=');
-    if (p > 0 && !l.startsWith('#')) env[l.slice(0, p).trim()] = l.slice(p + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
+  if (fs.existsSync(envFile)) {
+    for (const l of fs.readFileSync(envFile, 'utf8').split('\n')) {
+      const p = l.indexOf('=');
+      if (p > 0 && !l.startsWith('#')) env[l.slice(0, p).trim()] = l.slice(p + 1).trim().replace(/^(['"])(.*)\1$/, '$2');
+    }
+  } else {
+    // Render mode: no env file; Turso creds come from process.env.
+    for (const k of ['TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN']) if (process.env[k]) env[k] = process.env[k];
   }
   const db = createClient({url: env.TURSO_DATABASE_URL, authToken: env.TURSO_AUTH_TOKEN});
   const tx = await db.transaction('read');

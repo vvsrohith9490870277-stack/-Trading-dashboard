@@ -11,6 +11,7 @@ import automation as au
 import prefilter as pf
 import session_inputs as si
 import audit as al
+import runtime_mode as rm
 import guardian as gd
 import history_repair as hr
 import capital as cap
@@ -20,13 +21,17 @@ import support_agent as sa
 import reference_feeds as rf
 import exit_selftest as xst
 import db_helper as dbh
-ROOT=Path(__file__).resolve().parent; LEGACY=Path('/workspace/sahil-fyers-turso'); IST=ZoneInfo('Asia/Kolkata'); CFG=json.loads((ROOT/'config.json').read_text()); PY=sys.executable
+ROOT=Path(__file__).resolve().parent; LEGACY=Path('/workspace/sahil-fyers-turso')  # box default; render mode never reads it
+IST=ZoneInfo('Asia/Kolkata'); CFG=json.loads((ROOT/'config.json').read_text()); PY=sys.executable
 RULES=json.loads((ROOT/'strategy_rules.json').read_text());ISINS={r['db_symbol']:r['ISIN Code'] for r in csv.DictReader((ROOT/'universe.csv').open())}
 RULE_HASH={str(k):hashlib.sha256(json.dumps(v,sort_keys=True,separators=(',',':')).encode()).hexdigest() for k,v in RULES.items() if str(k).isdigit()}
-for folder in ['logs','out','tests']:(ROOT/folder).mkdir(exist_ok=True)
+if rm.is_render():
+ for folder in ['logs','out']:(rm.state_dir(ROOT)/folder).mkdir(parents=True,exist_ok=True)
+else:
+ for folder in ['logs','out','tests']:(ROOT/folder).mkdir(exist_ok=True)
 if CFG.get('paper_only') is not True:raise SystemExit('PAPER_ONLY_MODE_REQUIRED')
 cap.assert_freeze()
-NS=CFG['namespace']; MD=CFG['market_data']; AUTH_ROUTES=dict(MD['routes'])
+NS=rm.resolve_namespace(CFG); MD=CFG['market_data']; AUTH_ROUTES=dict(MD['routes'])
 REGULAR_SESSION=tuple(dt_time.fromisoformat(x) for x in CFG['regular_session']); COMPLETED_CUTOFF=dt_time.fromisoformat(CFG['completed_bar_cutoff'])
 # Strategy 07 trail: the fraction is config, but it must equal the frozen rule text (".9*H" for 0.9), so a config edit cannot silently change the frozen formula.
 TRAIL=float(CFG['strategy_07_trail_fraction'])
@@ -36,9 +41,20 @@ if STOP_FILL!='intraday_cross_fixed_prior_close_level' or 'trail_touch' not in R
 def trail_level(high_water):return round(TRAIL*high_water,2)
 def now():return datetime.now(IST)
 def js(v):return json.dumps(v,default=str,allow_nan=False)
+LOG_ROTATE_BYTES=20*1024*1024
 def log(kind,**data):
  r={'at_IST':now().isoformat(),'namespace':NS,'kind':kind,**data}
- with (ROOT/('logs/tests.jsonl' if NS.startswith('test_') else 'logs/engine.jsonl')).open('a') as f:f.write(js(r)+'\n')
+ line=js(r)+'\n'
+ p=rm.state_path(ROOT,('logs/tests.jsonl' if NS.startswith('test_') else 'logs/engine.jsonl'))
+ p.parent.mkdir(parents=True,exist_ok=True)
+ if rm.is_render():
+  # Render mode: also mirror each JSON line to stdout (structured logs) and
+  # rotate the ephemeral file at 20 MB so the small disk never fills.
+  try:
+   if p.exists() and p.stat().st_size>=LOG_ROTATE_BYTES:p.replace(Path(str(p)+'.1'))
+  except OSError:pass
+  sys.stdout.write(line);sys.stdout.flush()
+ with p.open('a') as f:f.write(line)
  return r
 class DB:
  def __init__(self,test_database=None):self.test_database=test_database;self.helper=None
@@ -99,8 +115,14 @@ def reference_day(t):
  s=session(t.date())
  return t.date() if s and t.timetz().replace(tzinfo=None)<s[1] else next_session(t.date())
 def load_env():
+ if rm.is_render():
+  # Render mode: Fyers values come from process.env (Task 3 adds the Turso
+  # token store lookup for FYERS_ACCESS_TOKEN when it is not seeded here).
+  # The legacy .env file is never read.
+  return {k:v for k,v in ((k,os.environ.get(k)) for k in rm.FYERS_ENV_NAMES) if v is not None}
  sys.path.insert(0,str(LEGACY));from fyers_auth import load_env as f
  return f(LEGACY/'.env')
+def auth_circuit_path():return rm.state_path(ROOT,'auth_circuit.json')
 def last_trade_stamp(ltt):
  """Exchange last-traded epoch seconds -> IST ISO string; None (fail closed) when missing/invalid."""
  if isinstance(ltt,bool) or ltt is None:return None
@@ -128,7 +150,7 @@ class RequestBudget:
  """Shared IST-day Fyers Data API budget. Counts every HTTP attempt, including 429s."""
  def __init__(self,path=None,clock=None):
   self.path=Path(path or MD.get('budget_state_path') or 'fyers_request_budget.json')
-  if not self.path.is_absolute():self.path=ROOT/self.path
+  if not self.path.is_absolute():self.path=rm.state_dir(ROOT)/self.path
   self.clock=clock or now
  def snapshot(self):
   state=self._load()
@@ -184,8 +206,8 @@ class MarketData:
  def budget_snapshot(self):return self.budget.snapshot()
  def refresh(self):
   if self.refreshed:
-   (ROOT/'auth_circuit.json').write_text(js({'open':True,'at':now().isoformat()}));raise RuntimeError('auth_failed_after_single_refresh')
-  circuit=ROOT/'auth_circuit.json'
+   auth_circuit_path().write_text(js({'open':True,'at':now().isoformat()}));raise RuntimeError('auth_failed_after_single_refresh')
+  circuit=auth_circuit_path()
   if circuit.exists():
    c=json.loads(circuit.read_text())
    if c.get('open') and (now()-datetime.fromisoformat(c['at'])).total_seconds()<MD['auth_circuit_open_seconds']:raise RuntimeError('auth_circuit_open_30min')
@@ -200,7 +222,7 @@ class MarketData:
    circuit.write_text(js({'open':True,'at':now().isoformat()}));raise RuntimeError('token_refresh_failed')
   self.env=load_env();circuit.write_text(js({'open':False,'at':now().isoformat()}));log('auth_refresh',success=True)
  def get(self,route,params):
-  circuit=ROOT/'auth_circuit.json'
+  circuit=auth_circuit_path()
   if circuit.exists():
    c=json.loads(circuit.read_text())
    if c.get('open') and (now()-datetime.fromisoformat(c['at'])).total_seconds()<MD['auth_circuit_open_seconds']:raise RuntimeError('auth_circuit_open_30min')
@@ -649,7 +671,7 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  for sym,decisions in strategy_audit.items():audit_events.append(al.event(sys.modules[__name__],'strategy_decisions',symbol=sym,bar_date=str(target),decisions=decisions))
  for sym in sorted(set(skipped)):audit_events.append(al.event(sys.modules[__name__],'strategy_decisions',outcome='not_evaluated',symbol=sym,bar_date=str(target),decisions=[{'strategy':i,'outcome':'not_evaluated','reason':'stale_stock_or_benchmark'} for i in range(1,8)]))
  stm+=al.statements(audit_events)
- if not NS.startswith('test_'):pd.DataFrame(qual).to_csv(ROOT/'out/latest_qualifiers.csv',index=False)
+ if not NS.startswith('test_'):pd.DataFrame(qual).to_csv(rm.state_path(ROOT,'out/latest_qualifiers.csv'),index=False)
  report={'input_validation':input_audit,'target_completed_bar':str(target),'bootstrap':bootstrap,'funnel':funnel,'universe_symbols':len(syms),'frozen_universe_symbols':len(universe()),'excluded_audit_symbols':len(exclusions),'original_audit_universe':len(universe())+len(exclusions),'signals_queued':created,'latest_qualifiers':len(qual),'unavailable_current_symbols':skipped,'invalid_rows_excluded':int((~valid).sum()),'sync':sync_report,'no_backlog_fills':True,'screen_only':snapshot_only,'prefilter_policy':pf.POLICY,'prefilter_counts':{k:sum(r['status']==k for r in gates.values()) for k in ['PASS','FAIL','UNAVAILABLE']},'benchmark_sync_error':benchmark_error,'history_repair':repair_report,'reference_feeds':reference_report,'data_refresh_status':repair_report.get('status') if repair_report else 'not_requested'};stm.append(('INSERT INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace,bar_date) DO UPDATE SET scanned_at=excluded.scanned_at,status=excluded.status,report_json=excluded.report_json',(NS,str(target),t.isoformat(),'partial' if skipped else 'ok',js(report))));db.batch(stm);db.run('scan','partial' if skipped else 'ok',**report);return report
 
 def missed_trail_touch(p,g,previous):
@@ -866,6 +888,12 @@ def uses_engine_lock(command):
     """Exclusive engine.lock is for mutating market/session work only. Read-only reports, reference-feeds (its own lock), and exit-selftest (its own lock and namespace) do not take it."""
     return command not in SUPERVISION_COMMANDS and command not in READ_ONLY_COMMANDS and command not in ('reference-feeds', 'exit-selftest')
 
+def _db():
+ """DB for CLI runs. PAPER_TEST_DATABASE (render/test hook only) points the
+ engine at a local SQLite file instead of Turso; it is honoured only when
+ PAPER_RUNTIME=render, so a stray value can never redirect the box engine.
+ Unset (or on the box) it behaves exactly as before."""
+ return DB(os.environ.get('PAPER_TEST_DATABASE')) if rm.is_render() else DB()
 def main():
  parser=argparse.ArgumentParser(description='Paper-only Fyers-data/Turso-ledger engine; never broker orders.')
  parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history','exit-selftest','sessiond','ensure-sessiond','record-outages','revalue-eod']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);parser.add_argument('--cleanup-only',action='store_true');parser.add_argument('--keep',action='store_true');parser.add_argument('--max-seconds',type=int,default=1200);parser.add_argument('--max-quotes',type=int,default=40);args=parser.parse_args()
@@ -873,7 +901,7 @@ def main():
  if args.command in SUPERVISION_COMMANDS:
   # Supervision must remain reachable even while a worker/scan holds engine.lock.
   try:
-   db=DB();e=sys.modules[__name__]
+   db=_db();e=sys.modules[__name__]
    if args.command=='export-logs':
     if not args.session or not 1<=args.max_events<=200000:raise ValueError('export_arguments')
     print(js(al.export(e,db,args.session,args.format,args.max_events)))
@@ -892,7 +920,7 @@ def main():
  if not uses_engine_lock(args.command):
   # Read-only reports (and reference-feeds, which has its own lock) must not contend with the worker or the 08:45 scan.
   try:
-   db=DB();e=sys.modules[__name__]
+   db=_db();e=sys.modules[__name__]
    if args.command=='reference-feeds':
     with al.scope(e,db,args.command):
      out=refresh_reference(db,reference_day(now()));log('command_completed',command=args.command,namespace=NS);print(js(out))
@@ -913,10 +941,10 @@ def main():
   except Exception as ex:
    print(js({'status':'failed','error':au.safe_error(ex),'paper_only':True}));sys.exit(1)
   return
- with (ROOT/'engine.lock').open('a+') as lock:
+ with (rm.state_path(ROOT,'engine.lock')).open('a+') as lock:
   try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
   except BlockingIOError:print(js({'status':'another_engine_command_running'}));return
-  db=DB()
+  db=_db()
   audit_scope=al.scope(sys.modules[__name__],db,args.command) if args.command!='init' else contextlib.nullcontext()
   try:
    with audit_scope:
@@ -932,7 +960,7 @@ def main():
       status='fyers_rate_limited' if 'rate_limit' in reason else ('fyers_budget_exhausted' if 'budget' in reason else 'failed')
       out.update({'status':status,'error':reason,'token_refreshed':api.refreshed,'fyers_budget':api.budget_snapshot(),'lockout_or_rate_limit':status=='fyers_rate_limited'})
       db.run('probe',status,**out)
-    elif args.command=='repair-history':out=hr.repair(sys.modules[__name__],db,MarketData(),completed_day(now()),budget=args.max_history_requests,deadline_seconds=args.max_history_seconds,progress=str(ROOT/'out/history-repair-progress.json'))
+    elif args.command=='repair-history':out=hr.repair(sys.modules[__name__],db,MarketData(),completed_day(now()),budget=args.max_history_requests,deadline_seconds=args.max_history_seconds,progress=str(rm.state_path(ROOT,'out/history-repair-progress.json')))
     elif args.command in ['bootstrap','scan','screen-only']:out=scan(db,MarketData(),args.sync,args.command=='bootstrap',args.command=='screen-only')
     elif args.command=='sync-history':out=sync_history(db,MarketData())
     elif args.command=='monitor-once':

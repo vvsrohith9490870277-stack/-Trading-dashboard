@@ -10,6 +10,7 @@ import json, os
 from pathlib import Path
 import bhavcopy_compare as bc
 import capital as cap
+import runtime_mode as rm
 
 # Freeze plan B1: 260-bar point-in-time warmup. Value lives in config.json reconciliation_warmup_bars.
 WARMUP_BARS = int(json.loads((Path(__file__).resolve().parent / 'config.json').read_text())['reconciliation_warmup_bars'])
@@ -45,14 +46,16 @@ NAMED_CAUSES = frozenset({
 
 def check_live_prerequisites(env_path=None, bhavcopy_dir=None):
     """Check whether live Turso credentials and NSE bhavcopy files are present."""
-    env_file = Path(env_path or os.environ.get('PAPER_ENV_FILE') or '/workspace/sahil-fyers-turso/.env')
+    env_file = Path(env_path or os.environ.get('PAPER_ENV_FILE') or '/workspace/sahil-fyers-turso/.env')  # box default
     blockers = []
-    if not env_file.exists():
-        blockers.append('missing_turso_credentials_env')
-    else:
+    if env_file.exists():
         text = env_file.read_text(encoding='utf8', errors='ignore')
         if 'TURSO_DATABASE_URL=' not in text or 'TURSO_AUTH_TOKEN=' not in text:
             blockers.append('incomplete_turso_credentials_env')
+    elif rm.is_render() and os.environ.get('TURSO_DATABASE_URL') and os.environ.get('TURSO_AUTH_TOKEN'):
+        pass  # render mode: Turso creds come from process.env, no file needed
+    else:
+        blockers.append('missing_turso_credentials_env')
     bhav_dir = Path(bhavcopy_dir) if bhavcopy_dir else None
     if not bhav_dir or not bhav_dir.exists() or not list(bhav_dir.glob('*.csv')):
         blockers.append('missing_nse_bhavcopy_month_archive')

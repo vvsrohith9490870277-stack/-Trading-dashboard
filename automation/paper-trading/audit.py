@@ -3,6 +3,7 @@ import contextlib,contextvars,csv,fcntl,hashlib,json,math,os,re,time,uuid
 from datetime import datetime,timezone,date
 from pathlib import Path
 from zoneinfo import ZoneInfo
+import runtime_mode as rm
 IST=ZoneInfo('Asia/Kolkata');CTX=contextvars.ContextVar('paper_audit',default=None)
 SCHEMA="""CREATE TABLE IF NOT EXISTS paper_events(namespace TEXT NOT NULL,event_id TEXT NOT NULL,run_id TEXT NOT NULL,session_day TEXT NOT NULL,source_at TEXT NOT NULL,recorded_at TEXT NOT NULL,event_type TEXT NOT NULL,severity TEXT NOT NULL,outcome TEXT NOT NULL,strategy INTEGER,symbol TEXT,bar_date TEXT,signal_id TEXT,policy_version TEXT,input_policy_version TEXT,data_json TEXT NOT NULL,persisted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f+00:00','now')),PRIMARY KEY(namespace,event_id));CREATE INDEX IF NOT EXISTS paper_events_session ON paper_events(namespace,session_day,recorded_at,event_id);CREATE INDEX IF NOT EXISTS paper_events_run ON paper_events(namespace,run_id);"""
 COLUMNS='namespace,event_id,run_id,session_day,source_at,recorded_at,event_type,severity,outcome,strategy,symbol,bar_date,signal_id,policy_version,input_policy_version,data_json'.split(',')
@@ -54,7 +55,7 @@ def event(e,kind,outcome='ok',severity='INFO',source_at=None,event_id=None,**dat
  return (e.NS,identity,rid,ctx.get('session_day',t.date().isoformat()),utc(source_at or t),utc(datetime.now(timezone.utc)),kind,severity,outcome if re.fullmatch('[A-Za-z0-9_:]{1,80}',str(outcome)) else 'unclassified',data.get('strategy') if data.get('strategy') in range(1,8) else None,clean(data.get('symbol'),'symbol'),str(data['bar_date']) if re.fullmatch(r'\d{4}-\d{2}-\d{2}',str(data.get('bar_date',''))) else None,data.get('signal_id') if re.fullmatch('[a-f0-9]{1,80}',str(data.get('signal_id',''))) else None,getattr(getattr(e,'pf',None),'POLICY',{}).get('version','beta_momentum_v1'),getattr(getattr(e,'si',None),'POLICY',{}).get('version','verified_live_inputs_v1'),raw)
 def statements(events):return [('INSERT OR IGNORE INTO paper_events('+','.join(COLUMNS)+') VALUES('+','.join('?' for _ in COLUMNS)+')',tuple(r)) for r in events]
 def spool_dir(e,db):
- suffix=hashlib.sha256((str(getattr(db,'test_database',None) or 'turso')+'|'+e.NS).encode()).hexdigest()[:16];p=e.ROOT/'logs'/'audit-spool'/suffix;p.mkdir(parents=True,exist_ok=True,mode=0o700);return p
+ suffix=hashlib.sha256((str(getattr(db,'test_database',None) or 'turso')+'|'+e.NS).encode()).hexdigest()[:16];p=rm.state_path(e.ROOT,'logs','audit-spool',suffix);p.mkdir(parents=True,exist_ok=True,mode=0o700);return p
 def spool(e,db,events):
  p=spool_dir(e,db)
  for i in range(0,len(events),20):
@@ -116,7 +117,7 @@ RUNTIME_ROOT=Path(__file__).resolve().parent
 def out_dir(e):
  """Export directory. Test namespaces running inside a real runtime tree write under out/test-exports/<ns>/ so a test
  run can never overwrite the production out/audit-<day>.jsonl files (Phase 2 item 8)."""
- out=Path(e.ROOT)/'out';ns=str(getattr(e,'NS','') or '')
+ out=rm.state_path(e.ROOT,'out');ns=str(getattr(e,'NS','') or '')
  if ns.startswith('test_') and Path(e.ROOT).resolve()==RUNTIME_ROOT:out=out/'test-exports'/ns
  out.mkdir(parents=True,exist_ok=True);return out
 def export(e,db,session,fmt='jsonl',max_events=200000):
