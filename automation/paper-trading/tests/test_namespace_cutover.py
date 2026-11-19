@@ -1,6 +1,8 @@
-"""paper_v2 cutover (Task 1): config namespace, protected books, support-agent defaults."""
-import hashlib, inspect, json, sys, tempfile, unittest, uuid
-from datetime import datetime
+"""paper_v2 cutover (Task 1): config namespace, protected books, support-agent defaults.
+
+Task 5: proof nothing writes paper_v1 (static literal scan + live engine run)."""
+import hashlib, inspect, json, re, sys, tempfile, unittest, uuid
+from datetime import datetime, timedelta
 from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -109,6 +111,168 @@ class CutoverTests(unittest.TestCase):
                 self.assertEqual(explicit['namespace'], 'paper_v1')
         finally:
             sa.CFG['namespace'] = prev
+
+    # ---- Task 5: proof nothing writes paper_v1 ----
+
+    def test_no_paper_v1_write_literals(self):
+        repo = Path(__file__).resolve().parents[3]
+        pat = re.compile(r"INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER|namespace\s*=|NS\s*=|['\"]namespace['\"]\s*:|namespace:")
+        allowed = {
+            # Cleanup return payload reports the paper_v1 snapshot (read-only);
+            # the cleanup itself runs under TEST_NS.
+            'automation/paper-trading/exit_selftest.py:506': 'cleanup report key, not a write',
+        }
+        excluded, bad = [], []
+        skip_dirs = {'node_modules', 'tests', 'docs', 'reports'}
+        for p in sorted(repo.rglob('*')):
+            if not p.is_file():
+                continue
+            rel = p.relative_to(repo)
+            if any(part in skip_dirs or part.startswith('.venv') for part in rel.parts):
+                continue
+            if p.suffix == '.md':
+                continue
+            if p.suffix == '.json' and str(rel) != 'live/adaptive_live_config.json':
+                continue
+            try:
+                text = p.read_text(errors='replace')
+            except Exception:
+                continue
+            for i, line in enumerate(text.splitlines(), 1):
+                if 'paper_v1' not in line or not pat.search(line):
+                    continue
+                key = f'{rel}:{i}'
+                if key in allowed:
+                    excluded.append(f'{key}: {allowed[key]}')
+                else:
+                    bad.append(f'{key}: {line.strip()[:160]}')
+        print('excluded paper_v1 write-pattern hits:')
+        for hit in excluded:
+            print(' ', hit)
+        self.assertEqual(bad, [], 'paper_v1 lines matching write patterns:\n' + '\n'.join(bad))
+
+    def _seed_adv(self, symbol, turnover, sessions=40):
+        self.db.batch([('DELETE FROM daily_ohlcv WHERE symbol=?', (symbol,))])
+        if sessions:
+            self.db.batch([('INSERT INTO daily_ohlcv(symbol,trade_date,close,turnover) VALUES(?,?,?,?)',
+                            (symbol, (T.date() - timedelta(days=i)).isoformat(), 100, turnover))
+                           for i in range(1, sessions + 1)])
+
+    def _signal(self, side='BUY', symbol='RELIANCE-EQ', strategy=1, eligible='2026-11-09'):
+        self._seed_adv(symbol, 200000000)
+        s = {'id': uuid.uuid4().hex, 'strategy': strategy, 'symbol': symbol, 'side': side,
+             'bar_date': '2026-11-08', 'eligible_date': eligible, 'reason': 'fixture'}
+        self.db.batch([('INSERT INTO paper_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                        (e.NS, s['id'], strategy, symbol, s['bar_date'], side, 'pending', 'fixture', T.isoformat(), eligible))])
+        if side == 'BUY':
+            self.db.batch([('INSERT OR REPLACE INTO paper_entry_input_proofs VALUES(?,?,?,?,?)',
+                            (e.NS, s['id'], e.si.POLICY['version'], s['bar_date'], T.isoformat())),
+                           ('INSERT OR REPLACE INTO paper_prefilter_states VALUES(?,?,?,?,?,?,?)',
+                            (e.NS, s['bar_date'], symbol, e.pf.POLICY['version'], 'PASS', '{}', T.isoformat())),
+                           ('INSERT OR REPLACE INTO paper_entry_gate_proofs VALUES(?,?,?,?,?)',
+                            (e.NS, s['id'], s['bar_date'], symbol, e.pf.POLICY['version'])),
+                           ('INSERT OR IGNORE INTO paper_qualifier_states VALUES(?,?,?,?,?,?,?,?)',
+                            (e.NS, s['bar_date'], strategy, symbol, 1,
+                             e.js({'input_policy': {'version': e.si.POLICY['version']}}), '{}', T.isoformat()))])
+        return s
+
+    def _quote(self, p=100, age=0):
+        return {'symbol': 'RELIANCE-EQ', 'price': p, 'quote_at': (T - timedelta(seconds=age)).isoformat()}
+
+    def _hash_ns_rows(self, ns):
+        out = {}
+        for table in xst.namespaced_tables(e, self.db):
+            rows = self.db.query(f'SELECT * FROM {table} WHERE namespace=? ORDER BY rowid', (ns,))
+            out[table] = hashlib.sha256(json.dumps(rows, sort_keys=True, default=str).encode()).hexdigest()
+        return out
+
+    def _seed_v1_row(self, table):
+        cols = self.db.query(f'PRAGMA table_info({table})')
+        sql = self.db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,))[0]['sql']
+        pk_cols = [c for c in cols if c['pk']]
+        rowid_alias = len(pk_cols) == 1 and (pk_cols[0]['type'] or '').upper() == 'INTEGER'
+        first_in = {}
+        for m in re.finditer(r"CHECK\s*\(\s*(\w+)\s+IN\s*\(([^)]*)\)", sql, re.I):
+            vals = [v.strip().strip("'\"") for v in m.group(2).split(',') if v.strip()]
+            if vals:
+                first_in[m.group(1)] = vals[0]
+        names, values = [], []
+        for c in cols:
+            name, typ = c['name'], (c['type'] or '').upper()
+            if rowid_alias and c['pk']:
+                continue  # single INTEGER PRIMARY KEY is the rowid alias, auto-assigned
+            if name == 'namespace':
+                names.append(name)
+                values.append(NS_V1)
+                continue
+            if c['dflt_value'] is not None:
+                continue  # server default fills it
+            if not c['notnull']:
+                continue  # nullable, leave NULL
+            if name in first_in:
+                raw = first_in[name]
+                if 'INT' in typ:
+                    try:
+                        raw = int(raw)
+                    except ValueError:
+                        pass
+                elif 'REAL' in typ or 'FLOA' in typ or 'DOUB' in typ:
+                    try:
+                        raw = float(raw)
+                    except ValueError:
+                        pass
+                names.append(name)
+                values.append(raw)
+                continue
+            if 'INT' in typ:
+                v = 1
+            elif 'REAL' in typ or 'FLOA' in typ or 'DOUB' in typ:
+                v = 1.0
+            else:
+                v = 'x'
+            names.append(name)
+            values.append(v)
+        self.db.batch([(f"INSERT INTO {table}({','.join(names)}) VALUES({','.join('?' * len(names))})", tuple(values))])
+
+    def test_engine_run_as_paper_v2_leaves_paper_v1_untouched(self):
+        e.NS = NS_V2
+        q = {'symbol': 'RELIANCE-EQ', 'price': 100, 'open': 100, 'low': 99, 'high': 102,
+             'quote_at': T.isoformat(), 'provider_status': 'ok', 'source': 'FYERS_QUOTES'}
+        # The surveillance gate is live for a real namespace: record all sources ok.
+        e.record_reference_status(self.db, '2026-11-09',
+                                  {'sources': {'asm': {'status': 'ok'}, 'gsm': {'status': 'ok'},
+                                              'series': {'status': 'ok'}}})
+        s = self._signal()
+        for table in xst.namespaced_tables(e, self.db):
+            self._seed_v1_row(table)
+        for table in xst.namespaced_tables(e, self.db):
+            n = self.db.query(f'SELECT COUNT(*) AS n FROM {table} WHERE namespace=?', (NS_V1,))[0]['n']
+            self.assertGreaterEqual(n, 1, f'{table} has no paper_v1 seed row')
+        before = self._hash_ns_rows(NS_V1)
+        # Spy installed AFTER seeding: seeding itself binds paper_v1.
+        seen = []
+        orig_batch, orig_call = self.db.batch, self.db.call
+
+        def spy_batch(statements):
+            seen.append({'batch': [{'sql': sql, 'args': list(args)} for sql, args in statements]})
+            return orig_batch(statements)
+
+        def spy_call(a):
+            seen.append({'call': a})
+            return orig_call(a)
+
+        self.db.batch, self.db.call = spy_batch, spy_call
+        try:
+            r = e.fill(self.db, s, self._quote(), T)
+            self.assertTrue(r['filled'], r)
+            mon = e.monitor(self.db, FakeAPI({'RELIANCE-EQ': q}))
+            self.assertIn('status', mon)
+        finally:
+            self.db.batch, self.db.call = orig_batch, orig_call
+        self.assertEqual(before, self._hash_ns_rows(NS_V1),
+                         'paper_v1 rows changed while the engine ran as paper_v2')
+        self.assertNotIn('paper_v1', json.dumps(seen, default=str),
+                         'a write/read statement bound paper_v1 while the engine ran as paper_v2')
 
 
 if __name__ == '__main__':

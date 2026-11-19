@@ -184,3 +184,16 @@ describe('dashboard handler cache is per book', () => {
     expect(reader).not.toHaveBeenCalled();
   });
 });
+
+describe('server read modules contain no write SQL', () => {
+  it('no INSERT/UPDATE/DELETE/REPLACE/DROP/ALTER/CREATE/TRUNCATE in read modules', () => {
+    const files = ['server/data.mjs', 'server/automation-read.mjs', 'server/ledger-read.mjs', 'server/exit-plan.mjs', 'server/capped-ledger.mjs', 'server/books.mjs', 'api/dashboard.js'];
+    const write = /\b(INSERT|UPDATE|DELETE|REPLACE|DROP|ALTER|CREATE|TRUNCATE)\b/;
+    for (const f of files) {
+      const src = readFileSync(f, 'utf8');
+      for (const line of src.split('\n')) {
+        expect(line.replace(/\/\/.*$/, '')).not.toMatch(write);
+      }
+    }
+  });
+});
