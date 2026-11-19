@@ -1,0 +1,36 @@
+# Render blueprint: Track A paper-trading backend (free tier).
+# One web service + in-process supervisor; all state in Turso.
+# Env vars are sync: false: they are prompted at Blueprint creation and
+# never stored in this repo.
+services:
+  - type: web
+    name: signal-atlas-paper
+    env: python
+    region: singapore
+    plan: free
+    autoDeployTrigger: "off"  # quoted: unquoted off parses as boolean false
+    healthCheckPath: /health
+    maxShutdownDelaySeconds: 30
+    dockerfilePath: deploy/render/Dockerfile
+    dockerContext: .
+    envVars:
+      - key: PAPER_RUNTIME
+        value: render
+        sync: false
+      - key: RENDER_MODE
+        value: live
+        sync: false
+      - key: PAPER_NAMESPACE_OVERRIDE
+        sync: false
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: TOKEN_ENC_KEY
+        sync: false
+      - key: FYERS_AUTO_LOGIN
+        value: "0"
+        sync: false
+      - key: PAPER_SESSIOND_DISABLE
+        value: "1"
+        sync: false

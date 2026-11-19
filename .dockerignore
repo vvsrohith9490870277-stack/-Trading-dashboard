@@ -1,0 +1,14 @@
+.git
+node_modules
+.venv
+.venv-adaptive
+.venv-paper
+__pycache__
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+logs
+out
+dist
+.env
+.env.local
