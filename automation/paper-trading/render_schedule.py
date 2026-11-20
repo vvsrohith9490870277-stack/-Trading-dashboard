@@ -39,6 +39,25 @@ def load_schedule(path=SCHEDULE_PATH, mode='live'):
     }
 
 
+def trial_job(path=SCHEDULE_PATH, name=None):
+    """The trial-mode job named `name`, or None.
+
+    Ignores RENDER_DISABLED_JOBS (the run-once bypasses that env
+    switch only) but respects the schedule's own `enabled` flag: a
+    job disabled in the trial schedule is never returned. Falls back
+    to the live jobs when the trial section has no 'jobs' key, like
+    load_schedule does.
+    """
+    data = json.loads(Path(path).read_text())
+    jobs = data.get('modes', {}).get('trial', {}).get('jobs')
+    if jobs is None:
+        jobs = data.get('jobs', [])
+    for job in jobs:
+        if job.get('name') == name:
+            return job if job.get('enabled', True) else None
+    return None
+
+
 def is_trading_day(day):
     """True when the market has a session on `day` (not a weekend/holiday).
 

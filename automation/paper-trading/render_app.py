@@ -268,8 +268,8 @@ class Supervisor:
         self.stopping = False
         self.store_error = None
         self._job_thread = None
-        # One-shot boot action (Task 1: quote probe) runs once per
-        # supervisor boot, on the first tick where the lease is held.
+        # One-shot boot actions (Tasks 1-2) run once per supervisor
+        # boot, on the first tick where the lease is held.
         self._boot_actions_done = False
         self._lock = threading.Lock()
         self.last_flag = None
@@ -343,14 +343,20 @@ class Supervisor:
             self.worker.start()
 
     # -- jobs -----------------------------------------------------------
-    def _run_job_sync(self, job):
+    def _job_runner(self, job):
+        """The runner run_job uses for a job: engine.py <command> as a
+        child with the memory guard (run_job_streaming). Shared by the
+        scheduler and the one-shot run (Task 2)."""
         def runner(name):
             cmd = [sys.executable, 'engine.py', job['command']]
             return run_job_streaming(cmd, self._child_env(), timeout=1800)
+        return runner
+
+    def _run_job_sync(self, job):
         day = datetime.now(IST).date().isoformat()
         try:
             rj.run_job(self.store, self.namespace, job['name'], day,
-                       self.owner_id, runner)
+                       self.owner_id, self._job_runner(job))
         except Exception:
             pass  # recorded in paper_job_runs; the next tick retries in-window
 
@@ -486,14 +492,68 @@ class Supervisor:
                   flush=True)
         return result
 
+    def _maybe_run_once_job(self):
+        """Run the one-shot trial job (Task 2) when requested.
+
+        Returns a status record, or None when RENDER_RUN_ONCE is
+        unset. The job goes through the normal job runner (paper_job_
+        runs, RSS cap, crash-loop breaker) even though it is in
+        RENDER_DISABLED_JOBS, and a done-marker keyed by date+job is
+        written after the run settles, so a restart never repeats it.
+        A refusal or an open breaker writes no marker and starts
+        nothing. Never raises into the tick."""
+        import render_boot as rb
+        job_name = rb.run_once_requested()
+        if job_name is None:
+            return None
+        ok, reason = rb.guard_ok(self.mode, self.namespace)
+        if not ok:
+            print('run-once refused: %s' % reason, flush=True)
+            return {'status': 'refused', 'reason': reason, 'job': job_name}
+        day = datetime.now(IST).date().isoformat()
+        if rb.run_once_done(self.store, self.namespace, job_name, day) \
+                is not None:
+            return {'status': 'already_done', 'job': job_name, 'day': day}
+        job = rb.find_run_once_job(job_name)
+        if job is None:
+            print('run-once refused: no enabled trial job %r' % job_name,
+                  flush=True)
+            return {'status': 'refused', 'reason': 'job_not_found',
+                    'job': job_name}
+        if rj.breaker_open(self.store, self.namespace, job_name, day):
+            print('run-once skipped: breaker open for %s' % job_name,
+                  flush=True)
+            return {'status': 'skipped', 'reason': 'breaker_open',
+                    'job': job_name, 'day': day}
+        if self._job_thread is not None and self._job_thread.is_alive():
+            return {'status': 'skipped', 'reason': 'job_already_running',
+                    'job': job_name, 'day': day}
+
+        def _run():
+            try:
+                rj.run_job(self.store, self.namespace, job['name'], day,
+                           self.owner_id, self._job_runner(job))
+                outcome = {'status': 'ok'}
+            except Exception as ex:
+                outcome = {'status': 'error',
+                           'error': type(ex).__name__}
+            try:
+                rb.mark_run_once(self.store, self.namespace, job_name,
+                                 day, outcome)
+            except Exception:
+                pass
+
+        self._job_thread = threading.Thread(target=_run, daemon=True)
+        self._job_thread.start()
+        return {'status': 'started', 'job': job_name, 'day': day}
+
     def _run_boot_actions(self):
-        """One-shot boot action (Task 1: quote probe), once per
-        supervisor boot.
+        """One-shot boot actions (Tasks 1-2), once per supervisor boot.
 
         Runs on the first tick where the lease is held (so this
         supervisor is the active runner), before the worker starts.
-        Never raises into the tick; a failure is printed (type only,
-        never a secret).
+        Each action never raises into the tick; a failure is printed
+        (type only, never a secret) and the other action still runs.
         """
         if getattr(self, '_boot_actions_done', False):
             return
@@ -502,6 +562,10 @@ class Supervisor:
             self._maybe_run_quote_probe()
         except Exception as ex:
             print('quote probe error: %s' % type(ex).__name__, flush=True)
+        try:
+            self._maybe_run_once_job()
+        except Exception as ex:
+            print('run-once error: %s' % type(ex).__name__, flush=True)
 
     # -- main tick ------------------------------------------------------
     def tick(self):
@@ -543,8 +607,8 @@ class Supervisor:
             if not self.lease_held:
                 self.last_snapshot = self.snapshot(flag)
                 return self.last_snapshot
-        # One-shot boot action (quote probe) on the first tick where
-        # this supervisor holds the lease.
+        # One-shot boot actions (probe + run-once) on the first tick
+        # where this supervisor holds the lease.
         self._run_boot_actions()
         # worker first (the primary process), then due jobs
         self._manage_worker()

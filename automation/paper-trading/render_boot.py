@@ -1,5 +1,5 @@
-"""Boot-time one-shot action for the Render supervisor (muse-tonight-20-nov
-Task 1: quote probe).
+"""Boot-time one-shot actions for the Render supervisor (muse-tonight-20-nov
+Tasks 1-2).
 
 Pure helpers the supervisor wires into its first active tick:
 
@@ -7,9 +7,13 @@ Pure helpers the supervisor wires into its first active tick:
   Fyers quote batch for RELIANCE + TCS in a short-lived child
   (render_quote_probe.py) and records the result in paper_runtime_kv
   (key 'quote_probe') and in an audit event 'render_quote_probe'.
+- Task 2 (run-once): env RENDER_RUN_ONCE=scan|eod runs that one job
+  through the normal job runner even though it is in
+  RENDER_DISABLED_JOBS, and stores a done-marker keyed by date+job so
+  a restart never repeats it.
 
-The probe refuses unless RENDER_MODE=trial AND the resolved namespace
-is exactly paper_render_trial_v1 (brief section 3); a refusal never
+Both refuse unless RENDER_MODE=trial AND the resolved namespace is
+exactly paper_render_trial_v1 (brief section 3); a refusal never
 writes to the store.
 """
 from __future__ import annotations
@@ -24,6 +28,8 @@ IST = ZoneInfo('Asia/Kolkata')
 TRIAL_NAMESPACE = 'paper_render_trial_v1'
 PROBE_SYMBOLS = ('RELIANCE', 'TCS')
 PROBE_ENV = 'RENDER_QUOTE_PROBE_ON_BOOT'
+RUN_ONCE_ENV = 'RENDER_RUN_ONCE'
+RUN_ONCE_JOBS = ('scan', 'eod')
 QUOTE_PROBE_KEY = 'quote_probe'
 
 
@@ -33,10 +39,21 @@ def probe_enabled(env=None):
     return str(env.get(PROBE_ENV, '')) == '1'
 
 
-def guard_ok(mode, namespace):
-    """(True, None) when the boot action may run, else (False, reason).
+def run_once_requested(env=None):
+    """The RENDER_RUN_ONCE job ('scan' or 'eod'), or None.
 
-    The probe refuses unless the mode is trial AND the resolved
+    Anything else (including an empty value) means no one-shot run:
+    the env is an operator switch, not a free-form job name.
+    """
+    env = os.environ if env is None else env
+    value = str(env.get(RUN_ONCE_ENV, '') or '').strip()
+    return value if value in RUN_ONCE_JOBS else None
+
+
+def guard_ok(mode, namespace):
+    """(True, None) when the boot actions may run, else (False, reason).
+
+    Both actions refuse unless the mode is trial AND the resolved
     namespace is exactly paper_render_trial_v1. The check is on the
     resolved namespace (the supervisor's), never on config.json alone.
     """
@@ -82,6 +99,43 @@ def kv_put(store, scope, key, value):
         ' updated_at=excluded.updated_at',
         (scope, key, json.dumps(value), now))
     return value
+
+
+def run_once_marker_key(job, day):
+    """The done-marker key for (job, IST day)."""
+    return 'run_once:%s:%s' % (job, day)
+
+
+def run_once_done(store, namespace, job, day):
+    """The done-marker for (job, day), or None when it has not run yet."""
+    return kv_get(store, namespace, run_once_marker_key(job, day))
+
+
+def mark_run_once(store, namespace, job, day, outcome):
+    """Write the done-marker for (job, day) and return it.
+
+    `outcome` carries the run's terminal status ('ok'/'error'/...).
+    The marker is written only after the run settles: a supervisor
+    killed mid-run writes no marker, so the next boot retries.
+    """
+    marker = {'job': job, 'day': day, 'status': outcome.get('status'),
+              'at': datetime.now(IST).isoformat()}
+    if outcome.get('error'):
+        marker['error'] = str(outcome['error'])[:140]
+    return kv_put(store, namespace, run_once_marker_key(job, day), marker)
+
+
+def find_run_once_job(job_name):
+    """The trial-schedule job for a run-once request, or None.
+
+    The lookup ignores RENDER_DISABLED_JOBS (that is the point of the
+    one-shot) but respects the schedule's own `enabled` flag, and only
+    accepts the jobs RENDER_RUN_ONCE allows ('scan'/'eod').
+    """
+    import render_schedule as rsch
+    if job_name not in RUN_ONCE_JOBS:
+        return None
+    return rsch.trial_job(name=job_name)
 
 
 def probe_failed_result(error_code, error_detail):

@@ -28,6 +28,9 @@ sys.path.insert(0, str(HERE))
 
 import audit as al
 import render_boot as rb
+import render_health as rh
+import render_jobs as rj
+import render_schedule as rsch
 import render_state as rs
 
 TRIAL_NS = 'paper_render_trial_v1'
@@ -97,6 +100,16 @@ class EnvTests(unittest.TestCase):
                     {'RENDER_QUOTE_PROBE_ON_BOOT': 'yes'}):
             self.assertFalse(rb.probe_enabled(env), env)
 
+    def test_run_once_requested(self):
+        self.assertEqual(rb.run_once_requested({'RENDER_RUN_ONCE': 'scan'}),
+                         'scan')
+        self.assertEqual(rb.run_once_requested({'RENDER_RUN_ONCE': 'eod'}),
+                         'eod')
+        for env in ({}, {'RENDER_RUN_ONCE': ''},
+                    {'RENDER_RUN_ONCE': 'bogus'},
+                    {'RENDER_RUN_ONCE': 'sync_history'}):
+            self.assertIsNone(rb.run_once_requested(env), env)
+
 
 class KvTests(unittest.TestCase):
     def setUp(self):
@@ -125,6 +138,68 @@ class KvTests(unittest.TestCase):
             ' VALUES(?, ?, ?, ?)',
             (TRIAL_NS, 'quote_probe', 'not json{', '2026-11-20T00:00:00'))
         self.assertIsNone(rb.kv_get(self.store, TRIAL_NS, 'quote_probe'))
+
+
+class RunOnceMarkerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = rs.SqliteStore(Path(self.tmp.name) / 'kv.sqlite')
+        rs.migrate(self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def test_marker_keyed_by_date_and_job(self):
+        self.assertEqual(rb.run_once_marker_key('scan', '2026-11-21'),
+                         'run_once:scan:2026-11-21')
+        self.assertIsNone(rb.run_once_done(self.store, TRIAL_NS, 'scan',
+                                           '2026-11-21'))
+        marker = rb.mark_run_once(self.store, TRIAL_NS, 'scan',
+                                  '2026-11-21', {'status': 'ok'})
+        self.assertEqual(marker['job'], 'scan')
+        self.assertEqual(marker['day'], '2026-11-21')
+        self.assertEqual(marker['status'], 'ok')
+        got = rb.run_once_done(self.store, TRIAL_NS, 'scan', '2026-11-21')
+        self.assertEqual(got['status'], 'ok')
+        # A different day is a different marker (a re-run tomorrow works).
+        self.assertIsNone(rb.run_once_done(self.store, TRIAL_NS, 'scan',
+                                           '2026-11-22'))
+        # A different job is a different marker.
+        self.assertIsNone(rb.run_once_done(self.store, TRIAL_NS, 'eod',
+                                           '2026-11-21'))
+
+
+class TrialJobTests(unittest.TestCase):
+    def test_trial_job_scan_and_eod(self):
+        scan = rsch.trial_job(name='scan')
+        self.assertEqual(scan['name'], 'scan')
+        self.assertEqual(scan['command'], 'scan')
+        self.assertTrue(scan['enabled'])
+        eod = rsch.trial_job(name='eod')
+        self.assertEqual(eod['name'], 'eod')
+        self.assertEqual(eod['command'], 'eod')
+        self.assertTrue(eod['enabled'])
+
+    def test_trial_job_respects_enabled_flag(self):
+        # sync_history is enabled:false in the trial schedule: the
+        # run-once bypasses RENDER_DISABLED_JOBS only, never the
+        # schedule's own enabled flag.
+        self.assertIsNone(rsch.trial_job(name='sync_history'))
+        self.assertIsNone(rsch.trial_job(name='preflight'))
+        self.assertIsNone(rsch.trial_job(name='no_such_job'))
+
+    def test_trial_job_disabled_in_file(self):
+        data = json.loads((HERE.parent / 'render_schedule.json').read_text())
+        data['modes']['trial']['jobs'][1]['enabled'] = False  # scan
+        with tempfile.NamedTemporaryFile('w', suffix='.json',
+                                        delete=False) as f:
+            json.dump(data, f)
+            path = f.name
+        try:
+            self.assertIsNone(rsch.trial_job(path=path, name='scan'))
+        finally:
+            Path(path).unlink(missing_ok=True)
 
 
 class ProbeRunTests(unittest.TestCase):
@@ -541,3 +616,117 @@ class SupervisorProbeTests(_SupBase):
         self.assertEqual(res['error_code'], 'probe_child_failed')
 
 
+class FakeRunner:
+    def __init__(self, fail=False):
+        self.calls = []
+        self.fail = fail
+
+    def __call__(self, job_name):
+        self.calls.append(job_name)
+        if self.fail:
+            raise RuntimeError('scan_failed')
+        return {'exit_code': 0, 'stdout_tail': '', 'stderr_tail': '',
+                'peak_rss_mb': 120}
+
+
+class SupervisorRunOnceTests(_SupBase):
+    def test_run_once_off_by_default(self):
+        sup = self._sup()
+        runner = FakeRunner()
+        sup._job_runner = lambda job: runner
+        self.assertIsNone(sup._maybe_run_once_job())
+        self.assertEqual(runner.calls, [])
+        self.assertIsNone(rb.run_once_done(self.store, TRIAL_NS, 'scan',
+                                           self._today()))
+
+    def test_run_once_refused_live_mode(self):
+        os.environ['RENDER_RUN_ONCE'] = 'scan'
+        sup = self._sup(mode='live', namespace='paper_v2')
+        runner = FakeRunner()
+        sup._job_runner = lambda job: runner
+        res = sup._maybe_run_once_job()
+        self.assertEqual(res['status'], 'refused')
+        self.assertEqual(runner.calls, [])
+
+    def test_run_once_scan_runs_and_marks_done(self):
+        # scan is in RENDER_DISABLED_JOBS (the trial runs worker-only):
+        # the scheduled run stays blocked, but the one-shot still runs.
+        os.environ['RENDER_RUN_ONCE'] = 'scan'
+        os.environ['RENDER_DISABLED_JOBS'] = 'scan,eod'
+        self.assertNotIn('scan', [j['name'] for j in
+                                  rsch.load_schedule(mode='trial')['jobs']])
+        sup = self._sup()
+        runner = FakeRunner()
+        sup._job_runner = lambda job: runner
+        res = sup._maybe_run_once_job()
+        self.assertEqual(res['status'], 'started')
+        sup._job_thread.join(timeout=10)
+        self.assertEqual(runner.calls, ['scan'])
+        marker = rb.run_once_done(self.store, TRIAL_NS, 'scan',
+                                  self._today())
+        self.assertIsNotNone(marker)
+        self.assertEqual(marker['status'], 'ok')
+        rows = self.store.execute(
+            "SELECT status FROM paper_job_runs WHERE namespace=?"
+            " AND job='scan'", (TRIAL_NS,))
+        self.assertEqual(rows[0]['status'], 'ok')
+
+    def test_run_once_second_boot_is_noop(self):
+        os.environ['RENDER_RUN_ONCE'] = 'eod'
+        sup = self._sup()
+        runner = FakeRunner()
+        sup._job_runner = lambda job: runner
+        self.assertEqual(sup._maybe_run_once_job()['status'], 'started')
+        sup._job_thread.join(timeout=10)
+        self.assertEqual(runner.calls, ['eod'])
+        # A second boot (new supervisor, same store) does not repeat it.
+        sup2 = self._sup()
+        runner2 = FakeRunner()
+        sup2._job_runner = lambda job: runner2
+        res = sup2._maybe_run_once_job()
+        self.assertEqual(res['status'], 'already_done')
+        self.assertEqual(runner2.calls, [])
+
+    def test_run_once_breaker_open_skips(self):
+        os.environ['RENDER_RUN_ONCE'] = 'scan'
+        day = self._today()
+        for _ in range(3):
+            rj.run_job(self.store, TRIAL_NS, 'scan', day,
+                       owner_id='render:h:1:1',
+                       runner=lambda name: {
+                           'exit_code': -9, 'stdout_tail': '',
+                           'stderr_tail': '', 'killed_reason': 'memory_cap',
+                           'rss_cap_mb': 350})
+        self.assertTrue(rj.breaker_open(self.store, TRIAL_NS, 'scan', day))
+        sup = self._sup()
+        runner = FakeRunner()
+        sup._job_runner = lambda job: runner
+        res = sup._maybe_run_once_job()
+        self.assertEqual(res['status'], 'skipped')
+        self.assertEqual(res['reason'], 'breaker_open')
+        self.assertEqual(runner.calls, [])
+        self.assertIsNone(rb.run_once_done(self.store, TRIAL_NS, 'scan',
+                                           day))
+
+    def test_run_once_failing_runner_marks_error(self):
+        os.environ['RENDER_RUN_ONCE'] = 'scan'
+        sup = self._sup()
+        runner = FakeRunner(fail=True)
+        sup._job_runner = lambda job: runner
+        self.assertEqual(sup._maybe_run_once_job()['status'], 'started')
+        sup._job_thread.join(timeout=10)
+        marker = rb.run_once_done(self.store, TRIAL_NS, 'scan',
+                                  self._today())
+        self.assertEqual(marker['status'], 'error')
+        rows = self.store.execute(
+            "SELECT status FROM paper_job_runs WHERE namespace=?"
+            " AND job='scan'", (TRIAL_NS,))
+        self.assertEqual(rows[0]['status'], 'error')
+
+    def test_run_once_invalid_job_is_ignored(self):
+        os.environ['RENDER_RUN_ONCE'] = 'bogus'
+        sup = self._sup()
+        runner = FakeRunner()
+        sup._job_runner = lambda job: runner
+        self.assertIsNone(sup._maybe_run_once_job())
+        self.assertEqual(runner.calls, [])
