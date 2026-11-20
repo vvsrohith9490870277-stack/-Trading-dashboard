@@ -14,8 +14,9 @@ measurement driver, so the same fixture measures the same scan on any day.
 Environment notes (this machine): /usr/bin/time does not exist, so peak
 RSS is measured by sampling /proc/<pid>/status VmRSS of the scan process
 tree every 50 ms, plus resource.getrusage(RUSAGE_CHILDREN) for the largest
-single child. /workspace/sahil-fyers-turso/.env does not exist here, so no
-live Turso read is attempted (the brief's optional read is skipped).
+single child. The brief's optional Turso read is skipped: its .env path
+does not exist on this machine (no such directory here), so no live read
+is attempted.
 
 Usage:
   python tests/render_mem_fixture.py --build [--db PATH] [--symbols N]
