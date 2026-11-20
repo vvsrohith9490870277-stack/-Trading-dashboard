@@ -44,27 +44,43 @@ class FakeTursoSession:
         results = []
         for req in (json or {}).get('requests', []):
             if req.get('type') == 'close':
-                results.append({'type': 'ok'})
+                results.append({'type': 'ok', 'response': {'type': 'close'}})
                 continue
             stmt = req.get('stmt') or {}
             sql = stmt.get('sql', '')
-            args = stmt.get('args', [])
+            # real Hrana protocol: args are typed values, not raw Python
+            args = []
+            for a in stmt.get('args', []):
+                assert isinstance(a, dict) and 'type' in a, 'untyped arg %r' % (a,)
+                args.append(None if a['type'] == 'null' else
+                            int(a['value']) if a['type'] == 'integer' else
+                            float(a['value']) if a['type'] == 'float' else a.get('value'))
             try:
                 cur = self.conn.execute(sql, args)
                 if cur.description is not None:
                     cols = [d[0] for d in cur.description]
-                    rows = [list(r) for r in cur.fetchall()]
-                    results.append({'type': 'ok', 'cols': [{'name': c} for c in cols],
-                                    'rows': rows, 'affected_row_count': 0,
-                                    'last_insert_rowid': 0, 'rows_read': len(rows),
-                                    'rows_written': 0, 'query_duration_ms': 0})
+                    def tv(v):
+                        if v is None:
+                            return {'type': 'null'}
+                        if isinstance(v, int):
+                            return {'type': 'integer', 'value': str(v)}
+                        if isinstance(v, float):
+                            return {'type': 'float', 'value': v}
+                        return {'type': 'text', 'value': str(v)}
+                    rows = [[tv(v) for v in r] for r in cur.fetchall()]
+                    results.append({'type': 'ok', 'response': {'type': 'execute', 'result': {
+                        'cols': [{'name': c} for c in cols],
+                        'rows': rows, 'affected_row_count': 0,
+                        'last_insert_rowid': None, 'rows_read': len(rows),
+                        'rows_written': 0, 'query_duration_ms': 0}}})
                 else:
                     self.conn.commit()
-                    results.append({'type': 'ok', 'cols': [], 'rows': [],
-                                    'affected_row_count': cur.rowcount,
-                                    'last_insert_rowid': cur.lastrowid or 0,
-                                    'rows_read': 0, 'rows_written': cur.rowcount,
-                                    'query_duration_ms': 0})
+                    results.append({'type': 'ok', 'response': {'type': 'execute', 'result': {
+                        'cols': [], 'rows': [],
+                        'affected_row_count': cur.rowcount,
+                        'last_insert_rowid': str(cur.lastrowid or 0),
+                        'rows_read': 0, 'rows_written': cur.rowcount,
+                        'query_duration_ms': 0}}})
             except Exception as ex:
                 results.append({'type': 'error', 'error': {'message': str(ex), 'code': 'SQLITE_ERROR'}})
         return FakeResponse({'baton': None, 'base_url': url, 'results': results})
@@ -162,7 +178,8 @@ class TursoHttpTests(unittest.TestCase):
         self.assertEqual(call['headers'].get('Authorization'), 'Bearer TOKENXYZ')
         reqs = call['json']['requests']
         self.assertEqual(reqs[0]['type'], 'execute')
-        self.assertEqual(reqs[0]['stmt']['args'], ['_global', 'k', 'v', '2026-11-19T00:00:00+05:30'])
+        self.assertEqual(reqs[0]['stmt']['args'], [{'type': 'text', 'value': v} for v in
+                         ('_global', 'k', 'v', '2026-11-19T00:00:00+05:30')])
         self.assertEqual(reqs[-1]['type'], 'close')
         self.assertNotIn('TOKENXYZ', json.dumps(call['json']))
 

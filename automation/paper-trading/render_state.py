@@ -105,6 +105,39 @@ class SqliteStore:
                 pass
 
 
+def _hrana_arg(v):
+    """Python value -> Turso HTTP (Hrana) typed value."""
+    if v is None:
+        return {'type': 'null'}
+    if isinstance(v, bool):
+        return {'type': 'integer', 'value': str(int(v))}
+    if isinstance(v, int):
+        return {'type': 'integer', 'value': str(v)}
+    if isinstance(v, float):
+        return {'type': 'float', 'value': v}
+    if isinstance(v, (bytes, bytearray)):
+        import base64
+        return {'type': 'blob', 'base64': base64.b64encode(bytes(v)).decode()}
+    return {'type': 'text', 'value': str(v)}
+
+
+def _hrana_val(c):
+    """Turso HTTP (Hrana) typed value -> Python value."""
+    if not isinstance(c, dict):
+        return c
+    t = c.get('type')
+    if t == 'null':
+        return None
+    if t == 'integer':
+        return int(c.get('value'))
+    if t == 'float':
+        return float(c.get('value'))
+    if t == 'blob':
+        import base64
+        return base64.b64decode(c.get('base64') or '')
+    return c.get('value')
+
+
 class TursoHttpStore:
     """Turso backend over the HTTP pipeline API (no Node helper needed)."""
 
@@ -144,23 +177,27 @@ class TursoHttpStore:
                     err = res.get('error') or {}
                     msg = str(err.get('message') or err.get('code') or 'turso_error')
                     raise TursoHttpError('turso_error:' + msg[:120])
-            return results
+            # ok shape: {'type': 'ok', 'response': {'type': 'execute',
+            # 'result': {'cols', 'rows', 'affected_row_count', ...}}}
+            return [((res.get('response') or {}).get('result') or {})
+                    if res.get('type') == 'ok' else res for res in results]
 
     @staticmethod
     def _rows(res):
         cols = [(c or {}).get('name') for c in res.get('cols') or []]
-        return [dict(zip(cols, row)) for row in res.get('rows') or []]
+        return [dict(zip(cols, [_hrana_val(c) for c in row]))
+                for row in res.get('rows') or []]
 
     def execute(self, sql, args=()):
         read_only = sql.strip().upper().startswith(('SELECT', 'WITH'))
         results = self._pipeline([
-            {'type': 'execute', 'stmt': {'sql': sql, 'args': list(args)}},
+            {'type': 'execute', 'stmt': {'sql': sql, 'args': [_hrana_arg(a) for a in args]}},
             {'type': 'close'},
         ], read_only=read_only)
         return self._rows(results[0]) if results else []
 
     def execute_many(self, statements):
-        reqs = [{'type': 'execute', 'stmt': {'sql': s, 'args': list(a)}}
+        reqs = [{'type': 'execute', 'stmt': {'sql': s, 'args': [_hrana_arg(x) for x in a]}}
                 for s, a in statements]
         reqs.append({'type': 'close'})
         results = self._pipeline(reqs)
@@ -169,7 +206,7 @@ class TursoHttpStore:
 
     def affected_rows(self, sql, args=()):
         results = self._pipeline([
-            {'type': 'execute', 'stmt': {'sql': sql, 'args': list(args)}},
+            {'type': 'execute', 'stmt': {'sql': sql, 'args': [_hrana_arg(a) for a in args]}},
             {'type': 'close'},
         ])
         return int((results[0] or {}).get('affected_row_count') or 0) if results else 0
