@@ -19,6 +19,7 @@ import support_agent as sa   # noqa: E402  (library copy, not the installed runt
 import snapshot              # noqa: E402
 import support_finding_verify as sfv  # noqa: E402
 import support_render as srender  # noqa: E402  (read-only Render checks, A3)
+import support_summary as ss  # noqa: E402  (compact summary, A4)
 
 IST = ZoneInfo('Asia/Kolkata')
 LIVE_ROOT = Path(os.environ.get('TRACK_A_ROOT', '/workspace/paper-trading'))
@@ -119,6 +120,23 @@ def build_parser():
                     help='Render /health URL (default: $SUPPORT_RENDER_HEALTH_URL or https://signal-atlas-paper.onrender.com/health)')
     ap.add_argument('--no-render', action='store_true', help='skip the read-only Render checks (A3)')
     return ap
+
+
+def support_status_line(compact, path):
+    """One-line status for stdout: SUPPORT_STATUS=<status> critical=<n> file=<path>."""
+    return f"SUPPORT_STATUS={compact['status']} critical={compact['counts']['critical']} file={path}"
+
+
+def write_compact_summary(out_dir, findings, session_day, namespace, runner, not_evaluable, now_ist):
+    """Build the compact summary (A4) and write summary.compact.json in the report folder.
+
+    Returns (path, compact). Writes only this one file, inside out_dir.
+    """
+    out_dir = Path(out_dir)
+    compact = ss.build_compact(findings, session_day, namespace, runner, not_evaluable, now_ist)
+    path = out_dir / 'summary.compact.json'
+    path.write_text(json.dumps(compact, indent=2, default=str))
+    return path, compact
 
 
 def run_render_check(namespace, session_day, now_ist, health_url=None, no_render=False):
@@ -250,12 +268,34 @@ def main(argv=None):
         parity.update(audit_events=len(ids), turso_events=len(db_ids), only_in_audit=len(ids - db_ids),
                       only_in_turso=len(db_ids - ids), top_event_types=types.most_common(8))
     du = shutil.disk_usage('/workspace')
-    findings = replay['findings']
+    # A2: audit spool not replayed (only_in_audit > 0 after the session ended).
+    # only_in_turso is ignored here (expected, harmless). Appended before the
+    # extended findings are read so it appears in the summary and compact JSON.
+    if audit.exists():
+        session_ended = now_dt >= sa.parse_ist(f'{day}T16:35:00+05:30')
+        spool = sa.audit_spool_status(parity.get('only_in_audit', 0),
+                                      parity.get('only_in_turso', 0), session_ended)
+        if spool is not None:
+            sa.append_finding(store, ns, spool['detector'], f"{spool['detector']}:{day}",
+                              now_dt.isoformat(), day, severity=spool['severity'],
+                              status='OPEN', details=spool['details'],
+                              observation_only=True, recorded_at=now_dt.isoformat())
+    # Detector findings (for verification, unchanged behaviour) plus the
+    # Render / spool findings appended to the store (for the summary).
+    detector_findings = replay['findings']
+    findings = sa.current_findings(store, ns, day)
     latest = {}
     for f in findings:
         latest[f['finding_id']] = f
     sev = Counter(f['severity'] for f in latest.values())
     det = Counter((f['severity'], f['detector']) for f in latest.values())
+    # A4: compact summary next to SUMMARY.md / summary.json, plus the
+    # one-line status on stdout.
+    compact_not_evaluable = ([{'detector': k, 'reason': v} for k, v in (replay['not_evaluable'] or {}).items()]
+                             + list(render_not_evaluable))
+    compact_path, compact = write_compact_summary(out_dir, findings, day, ns, render_info,
+                                                  compact_not_evaluable, now_dt)
+    print(support_status_line(compact, compact_path))
     summary = {
         'session_day': day, 'namespace_read': ns, 'mode': 'read_only_findings', 'observation_only': True,
         'started_at_ist': started.isoformat(), 'finished_at_ist': datetime.now(IST).isoformat(),
@@ -266,12 +306,20 @@ def main(argv=None):
         'actions_taken': 'none (no patch, no install, no notification, no orders)',
         'engine_log': str(engine_path), 'engine_log_exists': engine_path.exists(),
         'session_fills': sa.session_ledger_fills(trading, ns, day),
+        'compact_summary': {'path': str(compact_path), 'status': compact['status']},
     }
     (out_dir / 'summary.json').write_text(json.dumps(summary, indent=2, default=str))
     md = [f'# Support Agent findings — {day} (read-only)', '',
           f"Findings: **{summary['findings_total']}** — " + ', '.join(f'{k}: {v}' for k, v in summary['by_severity'].items()), '',
           '| Severity | Detector | Count |', '|---|---|---|']
     md += [f"| {x['severity']} | {x['detector']} | {x['count']} |" for x in summary['by_detector']]
+    # A2: CRITICAL block at the top of the report: <detector>: <action>.
+    critical = [f for f in findings if f['severity'] in ('SEV1', 'CRITICAL')]
+    if critical:
+        md += ['', '## CRITICAL', '']
+        for f in sorted(critical, key=lambda x: x['detector']):
+            action = (f.get('details') or {}).get('action') or ''
+            md.append(f"- **{f['detector']}**: {action}")
     fills = summary.get('session_fills') or []
     if fills:
         md += ['', '## Session fills (ledger `paper_fills.price`, not the raw quote)', '',
@@ -288,7 +336,7 @@ def main(argv=None):
         # Independent verification stage (read-only). Does not mutate finding status.
     now_for_v = a.now if a.now else datetime.now(IST)
     verification = sfv.verify_findings(
-        findings,
+        detector_findings,
         snapshot_path=snap_path,
         engine_path=engine_path,
         audit_path=audit,
