@@ -12,6 +12,7 @@ from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 import reconciliation as rec
 import capital
+import support_taxonomy as taxonomy
 
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text(encoding='utf8'))
@@ -1161,6 +1162,9 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         f for f in fills
         if f.get('filled_at') and ist_session_day(f['filled_at']) == session_day and parse_ist(f['filled_at']) <= now_ist
     ]
+    # A1: host-pause windows (from host_freeze_detected events) explain
+    # monitor-staleness gaps that overlap them; computed once, used in §2 and §4.
+    host_pause_windows = taxonomy.pause_windows(events)
     signals = reader.query('SELECT * FROM paper_signals WHERE namespace=?', (namespace,))
     sig_by_id = {str(s['id']): s for s in signals}
     try:
@@ -1332,6 +1336,9 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                         'from_ist': a.strftime('%H:%M:%S'),
                         'to_ist': b.strftime('%H:%M:%S'),
                         'gap_seconds': gap_s,
+                        # A1: a gap overlapping a host-pause window is explained
+                        # by the pause (severity unchanged; unexplained gaps stay).
+                        'explained_by_host_pause': taxonomy.gap_explained_by_host_pause(a, b, host_pause_windows),
                     })
             if initial_gap > float(w_exp['grace_seconds']) or max_gap > stale_s or late_last:
                 ms_details = {
@@ -1411,20 +1418,51 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                 results.append({**ep, 'detector': 'lock_blocked_gap'})
 
     # 4. Worker errors -> error_taxonomy_gap (SEV3)
+    # A1: events that classify to a known class (support_taxonomy) are no
+    # longer counted as unclassified. error_taxonomy_gap fires only for truly
+    # unknown ones and lists counts per (event_type, outcome).
+    classified = []
     unclassified_events = []
     for ev in events:
         raw = str(ev.get('data_json') or '')
         if ev['event_type'] == 'worker_error_unclassified' or ERROR_TAXONOMY_PATTERN.search(raw) or ev.get('outcome') == 'unclassified_condition':
-            unclassified_events.append(ev)
+            cls = taxonomy.classify_event(ev)
+            if cls['class'] == 'unclassified':
+                unclassified_events.append(ev)
+            else:
+                classified.append((ev, cls))
     for dec in day_decisions:
         raw = str(dec.get('payload_json') or '')
         if ERROR_TAXONOMY_PATTERN.search(raw) or dec.get('cause') == 'unclassified_condition':
-            unclassified_events.append(dec)
+            cls = taxonomy.classify_event({'event_type': 'paper_decision', 'outcome': dec.get('cause'), 'data_json': raw})
+            if cls['class'] == 'unclassified':
+                unclassified_events.append(dec)
+            else:
+                classified.append((dec, cls))
+    pause_events = [(ev, cls) for ev, cls in classified if cls['class'] == 'box_host_pause']
+    resume_events = [(ev, cls) for ev, cls in classified if cls['class'] == 'box_host_resume']
+    if pause_events:
+        pause_rows = [ev for ev, _ in pause_events]
+        windows = taxonomy.pause_windows(pause_rows)
+        emit('box_host_pause', f'box_host_pause:{session_day}', pause_events[0][0]['source_at'], 'WARN', {
+            'pause_count': len(pause_events),
+            'resume_count': len(resume_events),
+            'total_paused_seconds': taxonomy.total_paused_seconds(pause_rows),
+            'pauses': [
+                {'event_id': ev.get('event_id'), 'started': w['started'], 'stopped': w['stopped'], 'frozen_seconds': w['frozen_seconds']}
+                for ev, w in zip(pause_rows, windows)
+            ],
+        })
     if unclassified_events:
         first_src = unclassified_events[0].get('source_at') or f'{session_day}T09:15:00+05:30'
         last_src = unclassified_events[-1].get('source_at') or first_src
+        counts_by_type = {}
+        for x in unclassified_events:
+            key = f"{x.get('event_type') or 'paper_decision'}|{x.get('outcome') or x.get('cause') or ''}"
+            counts_by_type[key] = counts_by_type.get(key, 0) + 1
         emit('error_taxonomy_gap', f'error_taxonomy_gap:{session_day}', first_src, 'SEV3', {
             'unclassified_count': len(unclassified_events),
+            'counts_by_type': counts_by_type,
             'events': [str(x.get('event_id') or x.get('correlation_id')) for x in unclassified_events],
             'last_at': last_src,
         })
