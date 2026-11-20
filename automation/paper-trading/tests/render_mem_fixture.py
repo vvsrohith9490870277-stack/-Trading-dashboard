@@ -296,7 +296,7 @@ def measure_scan(db_path, frozen_now=FROZEN_NOW, real_clock=False,
     else:
         env['RENDER_SCAN_FROZEN_NOW'] = frozen_now
         cmd = [sys.executable, str(HERE / 'render_mem_fixture.py'),
-               '--run-scan']
+               '--run-scan', 'scan']
     out_path = '/tmp/paper-state-rendermem/scan.out'
     Path('/tmp/paper-state-rendermem').mkdir(parents=True, exist_ok=True)
     peak_tree = 0

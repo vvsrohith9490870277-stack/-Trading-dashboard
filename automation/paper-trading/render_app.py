@@ -82,6 +82,58 @@ def check_namespace():
         return False, None
 
 
+def run_job_streaming(cmd, env, timeout=1800):
+    """Run a job child streaming stdout/stderr (render-deploy-03 Task 1).
+
+    The child's output is read as it arrives in fixed 64 KiB chunks
+    (never readline: a single very long line must not be buffered) and
+    only the last 2000 characters of each stream are kept, so a chatty
+    job cannot grow the supervisor's memory — the base version used
+    capture_output=True and buffered the whole output. Returns
+    {'exit_code', 'stdout_tail', 'stderr_tail'}. Raises
+    subprocess.TimeoutExpired on timeout, like subprocess.run.
+    """
+    import threading
+    tails = {'out': '', 'err': ''}
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, env=env)
+
+    def _drain(stream, key):
+        try:
+            while True:
+                chunk = stream.read(65536)
+                if not chunk:
+                    break
+                tails[key] = (tails[key] + chunk)[-2000:]
+        except Exception:
+            pass
+        finally:
+            try:
+                stream.close()
+            except Exception:
+                pass
+
+    threads = [threading.Thread(target=_drain, args=(proc.stdout, 'out'),
+                                daemon=True),
+               threading.Thread(target=_drain, args=(proc.stderr, 'err'),
+                                daemon=True)]
+    for th in threads:
+        th.start()
+    try:
+        rc = proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except Exception:
+            pass
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    for th in threads:
+        th.join(timeout=10)
+    return {'exit_code': rc, 'stdout_tail': tails['out'],
+            'stderr_tail': tails['err']}
+
+
 class Worker:
     """The engine worker subprocess, with crash backoff and a memory guard."""
 
@@ -239,11 +291,7 @@ class Supervisor:
     def _run_job_sync(self, job):
         def runner(name):
             cmd = [sys.executable, 'engine.py', job['command']]
-            p = subprocess.run(cmd, env=self._child_env(),
-                               capture_output=True, text=True, timeout=1800)
-            return {'exit_code': p.returncode,
-                    'stdout_tail': p.stdout[-2000:],
-                    'stderr_tail': p.stderr[-2000:]}
+            return run_job_streaming(cmd, self._child_env(), timeout=1800)
         day = datetime.now(IST).date().isoformat()
         try:
             rj.run_job(self.store, self.namespace, job['name'], day,

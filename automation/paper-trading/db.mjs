@@ -15,6 +15,10 @@ const testRoot=path.resolve(root,'tests')+path.sep+'test_';if(a.test_database&&(
 const env={};if(!a.test_database){const ef=process.env.PAPER_ENV_FILE||'/workspace/sahil-fyers-turso/.env';if(fs.existsSync(ef)){for(const l of fs.readFileSync(ef,'utf8').split('\n')){const p=l.indexOf('=');if(p>0&&!l.startsWith('#'))env[l.slice(0,p).trim()]=l.slice(p+1).trim().replace(/^(['"])(.*)\1$/,'$2')}}else{for(const k of['TURSO_DATABASE_URL','TURSO_AUTH_TOKEN'])if(process.env[k])env[k]=process.env[k]}}
 const db=createClient(a.test_database?{url:'file:'+a.test_database}:{url:env.TURSO_DATABASE_URL,authToken:env.TURSO_AUTH_TOKEN});let tx;
 const rows=r=>r.rows.map(x=>Object.fromEntries(Object.entries(x).map(([k,v])=>[k,typeof v==='bigint'?Number(v):v])));
+// Tuples form of a query result (render-deploy-03 Task 1): column names
+// plus one array per row, so the Python side never builds a per-row
+// dict list for the scan's history reads. Same bigint conversion.
+const rowArrays=r=>r.rows.map(x=>r.columns.map(c=>{const v=x[c];return typeof v==='bigint'?Number(v):v}));
 const GENESIS='0'.repeat(64);
 // Policy numbers are read only from the locked JSON files; refuse to run if any differs from freeze_lock.json.
 {const lockDigest=v=>crypto.createHash('sha256').update(stable(v)).digest('hex');const locked={'capital_policy.json':capitalPolicy,'charge_policy.json':policy,'charge_rates.json':rates};for(const [name,value] of Object.entries(locked))if(lockDigest(value)!==freezeLock.files?.[name])throw Error('freeze_policy_lock_mismatch');if(capitalPolicy.version!==freezeLock.capital_policy_version)throw Error('freeze_policy_lock_mismatch')}
@@ -75,7 +79,7 @@ async function laggedAdv(tx,symbol,day){
 }
 try{
 if(a.action==='register_policy'){const val=JSON.stringify(policy);await db.execute({sql:'INSERT OR IGNORE INTO paper_charge_policies(version,policy_json) VALUES(?,?)',args:[policy.version,val]});const r=rows(await db.execute({sql:'SELECT policy_json FROM paper_charge_policies WHERE version=?',args:[policy.version]}))[0];if(r.policy_json!==val)throw Error('immutable_policy_changed');console.log(JSON.stringify({policy_version:policy.version}));}
-else if(a.action==='query'){const r=await db.execute({sql:a.sql,args:a.args||[]});console.log(JSON.stringify(rows(r)))}
+else if(a.action==='query'){const r=await db.execute({sql:a.sql,args:a.args||[]});console.log(JSON.stringify(a.tuples?{columns:r.columns,rows:rowArrays(r)}:rows(r)))}
 else if(a.action==='batch'){await db.batch(a.statements,'write');console.log('{}')}
 else if(a.action==='decision'){
  tx=await db.transaction('write');

@@ -71,7 +71,10 @@ class DB:
   h=self.helper
   if h is not None:h.reset(reason)
  def call(self,a):
-  if self.helper is not None and a.get('action') in ('query','batch'):return self.helper.call(a)
+  # A tuples query bypasses the persistent helper: the helper protocol
+  # returns row objects only, and the scan (the only tuples caller)
+  # never enables the helper. The helper contract is unchanged.
+  if self.helper is not None and a.get('action') in ('query','batch') and not a.get('tuples'):return self.helper.call(a)
   return self._call_per_process(a)
  def _call_timeout(self):
   h=CFG.get('db_helper') or {}
@@ -85,7 +88,13 @@ class DB:
    except (ValueError,AttributeError):code='Turso_operation_failed'
    raise RuntimeError(code if len(code)<90 and all(c.isalnum() or c=='_' for c in code) else 'Turso_operation_failed')
   return json.loads(r.stdout)
- def query(self,sql,args=()):return self.call({'action':'query','sql':sql,'args':list(args)})
+ def query(self,sql,args=(),tuples=False):
+  """Query rows. With tuples=True the node helper returns
+  {'columns': [...], 'rows': [[...], ...]} instead of a list of dicts:
+  the scan reads history this way so a chunk's rows never become a
+  per-row dict list (render-deploy-03 Task 1)."""
+  if tuples:return self.call({'action':'query','sql':sql,'args':list(args),'tuples':True})
+  return self.call({'action':'query','sql':sql,'args':list(args)})
  def batch(self,statements):
   if statements:self.call({'action':'batch','statements':[{'sql':s,'args':list(a)} for s,a in statements]})
  def run(self,kind,run_status,**detail):self.batch([('INSERT INTO paper_runs(namespace,kind,at,status,details_json) VALUES(?,?,?,?,?)',(NS,kind,now().isoformat(),run_status,js(detail)))])
@@ -684,11 +693,57 @@ def sync_history(db,api=None):
  report={'status':'partial' if stock.get('deferred') or stock.get('stopped') or benchmark_error else 'ok','target_completed_bar':str(target),'sync':stock,'benchmark_sync_error':benchmark_error,'history_repair':repair,'fyers_budget':budget,'universe_symbols':len(syms)}
  al.emit(e,db,'sync_completed',target_completed_bar=str(target),symbols_count=len(syms),job='sync-history',requests=stock.get('requests'),deferred=stock.get('deferred'),stopped=stock.get('stopped'),fyers_budget=budget)
  log('sync_history',**{k:report[k] for k in report if k!='history_repair'});db.run('sync-history',report['status'],**{k:v for k,v in report.items() if k!='history_repair'});return report
+_HISTORY_COLS=['symbol','trade_date','open','high','low','close','volume']
 def read_history(db,symbols,target):
+ """One chunk's history as a DataFrame (render-deploy-03 Task 1).
+
+ The caller streams symbols in RENDER_SCAN_CHUNK_SYMBOLS-sized chunks
+ and frees each chunk frame, so the full universe is never held at
+ once (the base version built one 1M-row dict list, ~854 MiB, and one
+ full frame). Rows come back as tuples, not dicts; the frame stays
+ float64 (never downcast). `symbols` is already the chunk; the
+ 25-symbol sub-chunking is kept so a single query never exceeds the
+ old shape."""
  rows=[]
  for i in range(0,len(symbols),25):
-  sy=symbols[i:i+25];rows+=db.query('SELECT symbol,trade_date,open,high,low,close,volume FROM daily_ohlcv WHERE symbol IN ('+','.join('?'*len(sy))+') AND trade_date<=? ORDER BY symbol,trade_date',sy+[str(target)])
- return pd.DataFrame(rows)
+  sy=symbols[i:i+25];rows+=db.query('SELECT symbol,trade_date,open,high,low,close,volume FROM daily_ohlcv WHERE symbol IN ('+','.join('?'*len(sy))+') AND trade_date<=? ORDER BY symbol,trade_date',sy+[str(target)],tuples=True)['rows']
+ return pd.DataFrame(rows,columns=_HISTORY_COLS)
+def _scan_chunk_symbols():
+ """Symbols per scan chunk (env RENDER_SCAN_CHUNK_SYMBOLS, default 10:
+ the largest size measured to keep the scan tree under 300 MiB)."""
+ try:return max(1,int(os.environ.get('RENDER_SCAN_CHUNK_SYMBOLS','10')))
+ except ValueError:return 10
+def _scan_batch_max():
+ """Max statements per db.batch call (env RENDER_SCAN_BATCH_MAX)."""
+ try:return max(1,int(os.environ.get('RENDER_SCAN_BATCH_MAX','200')))
+ except ValueError:return 200
+def _flush_stm(db,stm):
+ """Flush buffered scan statements in bounded batches (Task 1): each
+ db.batch call holds at most RENDER_SCAN_BATCH_MAX statements, in the
+ same order. The list is drained in place."""
+ n=_scan_batch_max()
+ while stm:db.batch(stm[:n]);del stm[:n]
+def _stm_append(db,stm,stmt):
+ """Append one scan statement, flushing as soon as the buffer reaches
+ the batch bound, so no single db.batch call ever exceeds it."""
+ stm.append(stmt)
+ if len(stm)>=_scan_batch_max():_flush_stm(db,stm)
+def _valid_history_mask(raw):
+ """The OHLC validity mask (identical computation to the base scan).
+ An empty chunk frame has object-dtype columns (no rows to infer
+ from), and np.isfinite rejects those, so it short-circuits to an
+ empty mask."""
+ if not len(raw):return pd.Series([],dtype=bool,index=raw.index)
+ return (raw[['open','high','low','close']]>0).all(axis=1)&np.isfinite(raw[['open','high','low','close']]).all(axis=1)&(raw.high>=raw[['open','close','low']].max(axis=1))&(raw.low<=raw[['open','close','high']].min(axis=1))
+def _merge_input_audit(total,chunk):
+ """Merge one chunk's filter_history audit into the running total so
+ the report's input_validation is identical to the single-frame
+ computation (counts sum; excluded_by_date merges per date)."""
+ if total is None:
+  out=dict(chunk);out['excluded_by_date']=dict(chunk['excluded_by_date']);return out
+ total['raw_rows']+=chunk['raw_rows'];total['live_rows']+=chunk['live_rows'];total['excluded_rows']+=chunk['excluded_rows'];total['legacy_before_coverage_rows_retained']+=chunk['legacy_before_coverage_rows_retained'];total['unverified_recent_symbols']+=chunk['unverified_recent_symbols']
+ for d,c in chunk['excluded_by_date'].items():total['excluded_by_date'][d]=total['excluded_by_date'].get(d,0)+c
+ return total
 def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  t=now()
  if not bootstrap and not snapshot_only and (t.weekday()>=5 or not session(t.date())):return {'status':'not_verified_weekday_scan','signals_queued':0}
@@ -706,85 +761,122 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
   # Plan A6/A7 inputs (corporate actions, ASM/GSM, BE/BZ). Fail-soft: a feed outage is reported, never invented.
   try:reference_report=rf.refresh(sys.modules[__name__],db,reference_day(t))
   except Exception as ex:reference_report={'status':'failed','error':au.safe_error(ex)}
- raw=read_history(db,syms,target);assert len(raw)>0
- raw,input_details,input_audit=si.filter_history(raw,benchmark)
- gates={}
- for sym,g in raw.groupby('symbol'):
-  gates[sym]=pf.evaluate(g,benchmark,target);gates[sym]['earliest_stored_history']=str(g.trade_date.min());gates[sym]['input_policy']=input_details[sym]
-  if input_details[sym]['unverified_recent_dates']:gates[sym].update(status='UNAVAILABLE',reasons=['unverified_stock_session_dates'])
+ # Two passes over the universe in RENDER_SCAN_CHUNK_SYMBOLS-sized
+ # chunks (Task 1). Pass A builds the prefilter gates; pass B runs the
+ # strategy loop. Only one chunk frame, the gates dict (one small dict
+ # per symbol) and the audit-event list are held across chunks, so the
+ # scan tree stays under 300 MiB. The two passes preserve the base
+ # scan's statement and audit-event order exactly: all prefilter rows,
+ # then data-audit rows, then exclusions, then pending expiries, then
+ # the strategy rows, then the skipped rows, then the audit events,
+ # then the scan_batches row.
+ chunk=_scan_chunk_symbols()
+ gates={};input_audit=None;invalid_count=0;skipped_set=set();saw_rows=False
+ audit_events=[];stm=[];data_audit_stm=[]
+ for i in range(0,len(syms),chunk):
+  chunk_syms=syms[i:i+chunk]
+  raw_c=read_history(db,chunk_syms,target)
+  saw_rows=saw_rows or len(raw_c)>0
+  raw_c,details_c,audit_c=si.filter_history(raw_c,benchmark)
+  input_audit=_merge_input_audit(input_audit,audit_c)
+  valid_c=_valid_history_mask(raw_c)
+  invalid_count+=int((~valid_c).sum())
+  for x in raw_c[~valid_c].itertuples(index=False):data_audit_stm.append(('INSERT OR IGNORE INTO paper_data_audit(namespace,symbol,bar_date,reason,observed_at) VALUES(?,?,?,?,?)',(NS,x.symbol,x.trade_date,'nonpositive_nonfinite_or_inconsistent_OHLC',t.isoformat())))
+  clean_syms=set(raw_c.symbol) if len(raw_c) else set()
+  valid_syms=set(raw_c[valid_c].symbol) if len(raw_c) else set()
+  for s in chunk_syms:
+   if s not in clean_syms or s not in valid_syms:skipped_set.add(s)
+  for sym,g in raw_c.groupby('symbol'):
+   gate=pf.evaluate(g,benchmark,target);gate['earliest_stored_history']=str(g.trade_date.min());gate['input_policy']=details_c[sym]
+   if details_c[sym]['unverified_recent_dates']:gate.update(status='UNAVAILABLE',reasons=['unverified_stock_session_dates'])
+   gates[sym]=gate
+  del raw_c,details_c,audit_c,valid_c
+ assert saw_rows
+ input_audit['excluded_by_date']=dict(sorted(input_audit['excluded_by_date'].items()))
  if isinstance(benchmark,pd.DataFrame) and len(benchmark)>0:
   coverage=db.query("SELECT symbol,SUM(outcome='NO_PROVIDER_BAR') absent,SUM(outcome='PROVIDER_REJECTED_RANGE') rejected FROM paper_history_gap_checks WHERE namespace=? AND trade_date>=? AND trade_date<=? GROUP BY symbol",(NS,str(benchmark.iloc[-min(pf.POLICY['beta_intervals']+1,len(benchmark))].trade_date),str(target)))
   for evidence in coverage:
    if evidence['symbol'] in gates:gates[evidence['symbol']].update(provider_absent_sessions=evidence['absent'],provider_rejected_sessions=evidence['rejected'])
  for sym in syms:
   if sym not in gates:gates[sym]=pf.evaluate(pd.DataFrame(),benchmark,target)
- audit_events=[]
- for sym,r in gates.items():audit_events.append(al.event(sys.modules[__name__],'prefilter_decision',outcome=r['status'],symbol=sym,bar_date=str(target),**{k:v for k,v in r.items() if k not in ['status','symbol','bar_date']},excluded_rows=input_details.get(sym,{}).get('excluded_rows',0)))
- valid=(raw[['open','high','low','close']]>0).all(axis=1)&np.isfinite(raw[['open','high','low','close']]).all(axis=1)&(raw.high>=raw[['open','close','low']].max(axis=1))&(raw.low<=raw[['open','close','high']].min(axis=1))
- stm=[('INSERT INTO paper_prefilter_states(namespace,bar_date,symbol,policy_version,status,metrics_json,observed_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,symbol,policy_version) DO UPDATE SET status=excluded.status,metrics_json=excluded.metrics_json,observed_at=excluded.observed_at',(NS,str(target),sym,pf.POLICY['version'],r['status'],js(r),t.isoformat())) for sym,r in gates.items()]
- stm +=[('INSERT OR IGNORE INTO paper_data_audit(namespace,symbol,bar_date,reason,observed_at) VALUES(?,?,?,?,?)',(NS,x.symbol,x.trade_date,'nonpositive_nonfinite_or_inconsistent_OHLC',t.isoformat())) for x in raw[~valid].itertuples(index=False)]
+ skipped=[s for s in syms if s in skipped_set]
+ for sym,r in gates.items():audit_events.append(al.event(sys.modules[__name__],'prefilter_decision',outcome=r['status'],symbol=sym,bar_date=str(target),**{k:v for k,v in r.items() if k not in ['status','symbol','bar_date']},excluded_rows=r.get('input_policy',{}).get('excluded_rows',0)))
+ for sym,r in gates.items():_stm_append(db,stm,('INSERT INTO paper_prefilter_states(namespace,bar_date,symbol,policy_version,status,metrics_json,observed_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,symbol,policy_version) DO UPDATE SET status=excluded.status,metrics_json=excluded.metrics_json,observed_at=excluded.observed_at',(NS,str(target),sym,pf.POLICY['version'],r['status'],js(r),t.isoformat())))
+ _flush_stm(db,stm)
+ _flush_stm(db,data_audit_stm)
  exclusions=json.loads((ROOT/'prefilter_exclusions.json').read_text())
  for row in exclusions:
   r={'status':'UNAVAILABLE','reasons':[row['reason']],'audit_excluded':True,'policy_version':pf.POLICY['version']}
   audit_events.append(al.event(sys.modules[__name__],'prefilter_decision',outcome='UNAVAILABLE',symbol=row['symbol'],bar_date=str(target),reasons=r['reasons']))
   audit_events.append(al.event(sys.modules[__name__],'strategy_decisions',outcome='not_evaluated',symbol=row['symbol'],bar_date=str(target),decisions=[{'strategy':i,'outcome':'not_evaluated','reason':'original_audit_exclusion'} for i in range(1,8)]))
-  stm.append(('INSERT INTO paper_prefilter_states VALUES(?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,symbol,policy_version) DO UPDATE SET status=excluded.status,metrics_json=excluded.metrics_json,observed_at=excluded.observed_at',(NS,str(target),row['symbol'],pf.POLICY['version'],'UNAVAILABLE',js(r),t.isoformat())))
- raw=raw[valid].copy();wm={(r['strategy'],r['symbol']):r['bar_date'] for r in db.query('SELECT * FROM paper_watermarks WHERE namespace=?',(NS,))};pos={(p['strategy'],p['symbol']):p for p in positions};pending_rows=db.query("SELECT * FROM paper_signals WHERE namespace=? AND status='pending'",(NS,));pending=set()
+  _stm_append(db,stm,('INSERT INTO paper_prefilter_states VALUES(?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,symbol,policy_version) DO UPDATE SET status=excluded.status,metrics_json=excluded.metrics_json,observed_at=excluded.observed_at',(NS,str(target),row['symbol'],pf.POLICY['version'],'UNAVAILABLE',js(r),t.isoformat())))
+ _flush_stm(db,stm)
+ wm={(r['strategy'],r['symbol']):r['bar_date'] for r in db.query('SELECT * FROM paper_watermarks WHERE namespace=?',(NS,))};pos={(p['strategy'],p['symbol']):p for p in positions};pending_rows=db.query("SELECT * FROM paper_signals WHERE namespace=? AND status='pending'",(NS,));pending=set()
  for s in pending_rows:
-  if not snapshot_only and s['side']=='BUY' and s['eligible_date']<=str(target):stm.append(("UPDATE paper_signals SET status='expired' WHERE namespace=? AND id=?",(NS,s['id'])))
+  if not snapshot_only and s['side']=='BUY' and s['eligible_date']<=str(target):_stm_append(db,stm,("UPDATE paper_signals SET status='expired' WHERE namespace=? AND id=?",(NS,s['id'])))
   else:pending.add((s['strategy'],s['symbol'],s['side']))
- strategy_audit={};qual=[];created=0;funnel={str(i):{'current_symbols':0,'individual_pass_counts':{},'sequential_pass_counts':{},'qualified':0} for i in range(1,8)};skipped=[sym for sym in syms if sym not in set(raw.symbol)]
- for sym,g in raw.groupby('symbol'):
-  g=g.sort_values('trade_date').reset_index(drop=True)
-  if str(g.iloc[-1].trade_date)!=str(target):skipped.append(sym);continue
-  for strategy in range(1,8):
-   key=(strategy,sym);p=pos.get(key);gate=gates[sym];gatepass=gate['status']=='PASS'
-   if gatepass or p:f=indicator(strategy,g)
-   else:f=g.assign(entry_condition=False,exit_condition=False)
-   x=f.iloc[-1];bar=str(x.trade_date)
-   if p:audit_events.append(al.event(sys.modules[__name__],'held_exit_evaluation',strategy=strategy,symbol=sym,bar_date=bar,trigger=bool(x.exit_condition),reason='completed_daily_exit',target_defined=False))
-   stage2=au.checklist(sys.modules[__name__],strategy,f) if gatepass else {'all_filters_satisfied':None,'checks':{},'reason':'NOT_EVALUATED_PREFILTER'}
-   checklist={**stage2,'prefilter':gate,'entry_evaluated':gatepass,'input_policy':input_details[sym]}
-   strategy_audit.setdefault(sym,[]).append({'strategy':strategy,'outcome':'qualified' if gatepass and bool(x.entry_condition) else 'rejected' if gatepass else 'not_evaluated','checks':stage2.get('checks',{}),'reason':'ok' if gatepass else 'NOT_EVALUATED_PREFILTER'})
-   stm.append(('INSERT INTO paper_qualifier_states(namespace,bar_date,strategy,symbol,qualified,checklist_json,plan_json,scanned_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,strategy,symbol) DO UPDATE SET qualified=excluded.qualified,checklist_json=excluded.checklist_json,plan_json=excluded.plan_json,scanned_at=excluded.scanned_at',(NS,bar,strategy,sym,int(gatepass and bool(x.entry_condition)),js(checklist),js(au.plan(sys.modules[__name__],strategy,x)),t.isoformat())))
-   checks=stage2.get('checks',{});counts=funnel[str(strategy)];counts['current_symbols']+=int(gatepass);sofar=True
-   for name,passed in checks.items():
-    counts['individual_pass_counts'][name]=counts['individual_pass_counts'].get(name,0)+int(passed);sofar=sofar and passed;counts['sequential_pass_counts'][name]=counts['sequential_pass_counts'].get(name,0)+int(sofar)
-   counts['qualified']+=int(gatepass and bool(x.entry_condition))
-   if gatepass and x.entry_condition:qual.append({'strategy':strategy,'symbol':sym,'bar_date':bar,'held':bool(p),'close':float(x.close),'indicator_values_json':json.dumps(x.to_dict(),default=str)})
-   if snapshot_only:continue
-   previous=wm.get(key)
-   if bootstrap or previous is None:
-    stm.append(('INSERT INTO paper_watermarks(namespace,strategy,symbol,bar_date) VALUES(?,?,?,?) ON CONFLICT(namespace,strategy,symbol) DO UPDATE SET bar_date=excluded.bar_date',(NS,strategy,sym,bar)));continue
-   if previous>=bar:continue
-   newbars=f[(f.trade_date>previous)&(f.trade_date>=datetime.fromisoformat(p['entry_at']).date().isoformat())] if p else f.iloc[0:0]
-   miss=missed_trail_touch(p,g,previous) if (p and strategy==7 and len(newbars)) else None
-   if miss:
-    audit_events.append(al.event(sys.modules[__name__],'missed_stop_touch',outcome='failed',severity='ERROR',**miss))
-    try:log('missed_stop_touch',**miss)
-    except Exception:pass
-   missed_exit=bool(newbars.exit_condition.any()) if len(newbars) else False
-   side='SELL' if p and missed_exit else ('BUY' if gatepass and not p and bool(x.entry_condition) else None)
-   if side and (strategy,sym,side) not in pending:
-    sid=stable_id(strategy,sym,bar,side);eligible=str(next_session(target));stm.append(('INSERT OR IGNORE INTO paper_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(NS,sid,strategy,sym,bar,side,'pending','daily_exit:'+p['entry_at'] if side=='SELL' else 'daily_entry:'+pf.POLICY['version'],t.isoformat(),eligible)));created+=1
-    audit_events.append(al.event(sys.modules[__name__],'paper_order_queued',strategy=strategy,symbol=sym,signal_id=sid,bar_date=bar,side=side,reason='completed_daily_exit' if side=='SELL' else 'qualified'))
-    if side=='BUY':
-     stm.append(('INSERT OR IGNORE INTO paper_entry_gate_proofs VALUES(?,?,?,?,?)',(NS,sid,bar,sym,pf.POLICY['version'])))
-     stm.append(('INSERT OR IGNORE INTO paper_entry_input_proofs VALUES(?,?,?,?,?)',(NS,sid,si.POLICY['version'],bar,t.isoformat())))
-   if p and strategy==7:
-    # Only completed closes on/after the actual paper entry can raise the stop.
-    since=g[(g.trade_date>=datetime.fromisoformat(p['entry_at']).date().isoformat())&(g.trade_date<=bar)]
-    H=max(p['high_water'],float(since.close.max())) if len(since) else p['high_water'];stm.append(('UPDATE paper_positions SET high_water=MAX(high_water,?),updated_at=? WHERE namespace=? AND strategy=7 AND symbol=? AND qty>0',(H,t.isoformat(),NS,sym)))
-   stm.append(('UPDATE paper_watermarks SET bar_date=? WHERE namespace=? AND strategy=? AND symbol=?',(bar,NS,strategy,sym)))
+ _flush_stm(db,stm)
+ strategy_audit={};qual=[];created=0;funnel={str(i):{'current_symbols':0,'individual_pass_counts':{},'sequential_pass_counts':{},'qualified':0} for i in range(1,8)}
+ for i in range(0,len(syms),chunk):
+  chunk_syms=syms[i:i+chunk]
+  raw_c=read_history(db,chunk_syms,target)
+  raw_c,details_c,_audit_c=si.filter_history(raw_c,benchmark)
+  valid_c=_valid_history_mask(raw_c)
+  raw_c=raw_c[valid_c].copy()
+  for sym,g in raw_c.groupby('symbol'):
+   g=g.sort_values('trade_date').reset_index(drop=True)
+   if str(g.iloc[-1].trade_date)!=str(target):skipped.append(sym);continue
+   for strategy in range(1,8):
+    key=(strategy,sym);p=pos.get(key);gate=gates[sym];gatepass=gate['status']=='PASS'
+    if gatepass or p:f=indicator(strategy,g)
+    else:f=g.assign(entry_condition=False,exit_condition=False)
+    x=f.iloc[-1];bar=str(x.trade_date)
+    if p:audit_events.append(al.event(sys.modules[__name__],'held_exit_evaluation',strategy=strategy,symbol=sym,bar_date=bar,trigger=bool(x.exit_condition),reason='completed_daily_exit',target_defined=False))
+    stage2=au.checklist(sys.modules[__name__],strategy,f) if gatepass else {'all_filters_satisfied':None,'checks':{},'reason':'NOT_EVALUATED_PREFILTER'}
+    checklist={**stage2,'prefilter':gate,'entry_evaluated':gatepass,'input_policy':details_c[sym]}
+    strategy_audit.setdefault(sym,[]).append({'strategy':strategy,'outcome':'qualified' if gatepass and bool(x.entry_condition) else 'rejected' if gatepass else 'not_evaluated','checks':stage2.get('checks',{}),'reason':'ok' if gatepass else 'NOT_EVALUATED_PREFILTER'})
+    _stm_append(db,stm,('INSERT INTO paper_qualifier_states(namespace,bar_date,strategy,symbol,qualified,checklist_json,plan_json,scanned_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,strategy,symbol) DO UPDATE SET qualified=excluded.qualified,checklist_json=excluded.checklist_json,plan_json=excluded.plan_json,scanned_at=excluded.scanned_at',(NS,bar,strategy,sym,int(gatepass and bool(x.entry_condition)),js(checklist),js(au.plan(sys.modules[__name__],strategy,x)),t.isoformat())))
+    checks=stage2.get('checks',{});counts=funnel[str(strategy)];counts['current_symbols']+=int(gatepass);sofar=True
+    for name,passed in checks.items():
+     counts['individual_pass_counts'][name]=counts['individual_pass_counts'].get(name,0)+int(passed);sofar=sofar and passed;counts['sequential_pass_counts'][name]=counts['sequential_pass_counts'].get(name,0)+int(sofar)
+    counts['qualified']+=int(gatepass and bool(x.entry_condition))
+    if gatepass and x.entry_condition:qual.append({'strategy':strategy,'symbol':sym,'bar_date':bar,'held':bool(p),'close':float(x.close),'indicator_values_json':json.dumps(x.to_dict(),default=str)})
+    if snapshot_only:continue
+    previous=wm.get(key)
+    if bootstrap or previous is None:
+     _stm_append(db,stm,('INSERT INTO paper_watermarks(namespace,strategy,symbol,bar_date) VALUES(?,?,?,?) ON CONFLICT(namespace,strategy,symbol) DO UPDATE SET bar_date=excluded.bar_date',(NS,strategy,sym,bar)));continue
+    if previous>=bar:continue
+    newbars=f[(f.trade_date>previous)&(f.trade_date>=datetime.fromisoformat(p['entry_at']).date().isoformat())] if p else f.iloc[0:0]
+    miss=missed_trail_touch(p,g,previous) if (p and strategy==7 and len(newbars)) else None
+    if miss:
+     audit_events.append(al.event(sys.modules[__name__],'missed_stop_touch',outcome='failed',severity='ERROR',**miss))
+     try:log('missed_stop_touch',**miss)
+     except Exception:pass
+    missed_exit=bool(newbars.exit_condition.any()) if len(newbars) else False
+    side='SELL' if p and missed_exit else ('BUY' if gatepass and not p and bool(x.entry_condition) else None)
+    if side and (strategy,sym,side) not in pending:
+     sid=stable_id(strategy,sym,bar,side);eligible=str(next_session(target));_stm_append(db,stm,('INSERT OR IGNORE INTO paper_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(NS,sid,strategy,sym,bar,side,'pending','daily_exit:'+p['entry_at'] if side=='SELL' else 'daily_entry:'+pf.POLICY['version'],t.isoformat(),eligible)));created+=1
+     audit_events.append(al.event(sys.modules[__name__],'paper_order_queued',strategy=strategy,symbol=sym,signal_id=sid,bar_date=bar,side=side,reason='completed_daily_exit' if side=='SELL' else 'qualified'))
+     if side=='BUY':
+      _stm_append(db,stm,('INSERT OR IGNORE INTO paper_entry_gate_proofs VALUES(?,?,?,?,?)',(NS,sid,bar,sym,pf.POLICY['version'])))
+      _stm_append(db,stm,('INSERT OR IGNORE INTO paper_entry_input_proofs VALUES(?,?,?,?,?)',(NS,sid,si.POLICY['version'],bar,t.isoformat())))
+    if p and strategy==7:
+     # Only completed closes on/after the actual paper entry can raise the stop.
+     since=g[(g.trade_date>=datetime.fromisoformat(p['entry_at']).date().isoformat())&(g.trade_date<=bar)]
+     H=max(p['high_water'],float(since.close.max())) if len(since) else p['high_water'];_stm_append(db,stm,('UPDATE paper_positions SET high_water=MAX(high_water,?),updated_at=? WHERE namespace=? AND strategy=7 AND symbol=? AND qty>0',(H,t.isoformat(),NS,sym)))
+    _stm_append(db,stm,('UPDATE paper_watermarks SET bar_date=? WHERE namespace=? AND strategy=? AND symbol=?',(bar,NS,strategy,sym)))
+  del raw_c,details_c,_audit_c,valid_c
+ _flush_stm(db,stm)
  for sym in sorted(set(skipped)):
   if not snapshot_only:
-   for strategy in range(1,8):stm.append(('INSERT INTO paper_watermarks VALUES(?,?,?,?) ON CONFLICT(namespace,strategy,symbol) DO UPDATE SET bar_date=excluded.bar_date',(NS,strategy,sym,str(target))))
-  for strategy in range(1,8):stm.append(('INSERT INTO paper_qualifier_states(namespace,bar_date,strategy,symbol,qualified,checklist_json,plan_json,scanned_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,strategy,symbol) DO UPDATE SET qualified=0,checklist_json=excluded.checklist_json,scanned_at=excluded.scanned_at',(NS,str(target),strategy,sym,0,js({'data_current':False,'reason':'NOT_EVALUATED_PREFILTER','prefilter':gates[sym],'entry_evaluated':False,'all_filters_satisfied':None}),'{}',t.isoformat())))
+   for strategy in range(1,8):_stm_append(db,stm,('INSERT INTO paper_watermarks VALUES(?,?,?,?) ON CONFLICT(namespace,strategy,symbol) DO UPDATE SET bar_date=excluded.bar_date',(NS,strategy,sym,str(target))))
+  for strategy in range(1,8):_stm_append(db,stm,('INSERT INTO paper_qualifier_states(namespace,bar_date,strategy,symbol,qualified,checklist_json,plan_json,scanned_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,strategy,symbol) DO UPDATE SET qualified=0,checklist_json=excluded.checklist_json,scanned_at=excluded.scanned_at',(NS,str(target),strategy,sym,0,js({'data_current':False,'reason':'NOT_EVALUATED_PREFILTER','prefilter':gates[sym],'entry_evaluated':False,'all_filters_satisfied':None}),'{}',t.isoformat())))
+ _flush_stm(db,stm)
  for sym,decisions in strategy_audit.items():audit_events.append(al.event(sys.modules[__name__],'strategy_decisions',symbol=sym,bar_date=str(target),decisions=decisions))
  for sym in sorted(set(skipped)):audit_events.append(al.event(sys.modules[__name__],'strategy_decisions',outcome='not_evaluated',symbol=sym,bar_date=str(target),decisions=[{'strategy':i,'outcome':'not_evaluated','reason':'stale_stock_or_benchmark'} for i in range(1,8)]))
- stm+=al.statements(audit_events)
+ _flush_stm(db,al.statements(audit_events))
  if not NS.startswith('test_'):pd.DataFrame(qual).to_csv(rm.state_path(ROOT,'out/latest_qualifiers.csv'),index=False)
- report={'input_validation':input_audit,'target_completed_bar':str(target),'bootstrap':bootstrap,'funnel':funnel,'universe_symbols':len(syms),'frozen_universe_symbols':len(universe()),'excluded_audit_symbols':len(exclusions),'original_audit_universe':len(universe())+len(exclusions),'signals_queued':created,'latest_qualifiers':len(qual),'unavailable_current_symbols':skipped,'invalid_rows_excluded':int((~valid).sum()),'sync':sync_report,'no_backlog_fills':True,'screen_only':snapshot_only,'prefilter_policy':pf.POLICY,'prefilter_counts':{k:sum(r['status']==k for r in gates.values()) for k in ['PASS','FAIL','UNAVAILABLE']},'benchmark_sync_error':benchmark_error,'history_repair':repair_report,'reference_feeds':reference_report,'data_refresh_status':repair_report.get('status') if repair_report else 'not_requested'};stm.append(('INSERT INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace,bar_date) DO UPDATE SET scanned_at=excluded.scanned_at,status=excluded.status,report_json=excluded.report_json',(NS,str(target),t.isoformat(),'partial' if skipped else 'ok',js(report))));db.batch(stm);db.run('scan','partial' if skipped else 'ok',**report);return report
+ report={'input_validation':input_audit,'target_completed_bar':str(target),'bootstrap':bootstrap,'funnel':funnel,'universe_symbols':len(syms),'frozen_universe_symbols':len(universe()),'excluded_audit_symbols':len(exclusions),'original_audit_universe':len(universe())+len(exclusions),'signals_queued':created,'latest_qualifiers':len(qual),'unavailable_current_symbols':skipped,'invalid_rows_excluded':invalid_count,'sync':sync_report,'no_backlog_fills':True,'screen_only':snapshot_only,'prefilter_policy':pf.POLICY,'prefilter_counts':{k:sum(r['status']==k for r in gates.values()) for k in ['PASS','FAIL','UNAVAILABLE']},'benchmark_sync_error':benchmark_error,'history_repair':repair_report,'reference_feeds':reference_report,'data_refresh_status':repair_report.get('status') if repair_report else 'not_requested'};_stm_append(db,stm,('INSERT INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace,bar_date) DO UPDATE SET scanned_at=excluded.scanned_at,status=excluded.status,report_json=excluded.report_json',(NS,str(target),t.isoformat(),'partial' if skipped else 'ok',js(report))));_flush_stm(db,stm);db.run('scan','partial' if skipped else 'ok',**report);return report
 
 def missed_trail_touch(p,g,previous):
  """Alert only (never a fill, never backdated): a completed bar after `previous` touched the Strategy 07 trail level while the
@@ -796,13 +888,19 @@ def missed_trail_touch(p,g,previous):
  return {'strategy':7,'symbol':p['symbol'],'bar_date':str(touched.iloc[-1].trade_date),'threshold':lvl,'high_water':p['high_water'],'price':float(touched.low.min()),'reason':'completed_bar_low_at_or_below_trail_with_position_open'}
 def scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  e=sys.modules[__name__];start=time.monotonic()
- with al.scope(e,db,'scan'):
-  al.emit(e,db,'scan_started',screen_only=snapshot_only)
-  try:r=_scan(db,api,do_sync,bootstrap,snapshot_only)
-  except Exception as ex:
-   al.emit(e,db,'scan_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__);raise
-  al.emit(e,db,'scan_completed',duration_ms=round((time.monotonic()-start)*1000),**r)
-  return r
+ try:
+  with al.scope(e,db,'scan'):
+   al.emit(e,db,'scan_started',screen_only=snapshot_only)
+   try:r=_scan(db,api,do_sync,bootstrap,snapshot_only)
+   except Exception as ex:
+    al.emit(e,db,'scan_failed',outcome='failed',severity='ERROR',error_code=type(ex).__name__);raise
+   al.emit(e,db,'scan_completed',duration_ms=round((time.monotonic()-start)*1000),**r)
+   return r
+ finally:
+  # The scan never enables the persistent helper (one node child at a
+  # time); close it if a caller did, so no helper is left open after
+  # the scan (render-deploy-03 Task 1).
+  db.close_helper()
 
 def entry_priority(day,s):
  if s.get('side')=='SELL':
