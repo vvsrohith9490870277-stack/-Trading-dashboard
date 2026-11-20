@@ -1,10 +1,11 @@
 # Exit slippage fallback when ADV is unavailable — proposal (Part B)
 
-Status: **PROPOSAL ONLY — not implemented.** Part A (visibility) is done on branch
+Status: **IMPLEMENTED on branch `feat/adaptive-tuning` (adaptive-support-tuning-01, B1): option (a).** Part A (visibility) is done on branch
 `fix/paper-exit-slippage`: when an exit gets no slippage, the fill decision payload and the
 returned fill JSON (what the log records) now say `exit_slippage_unavailable` with the reason
-`adv_below_floor` or `lagged_adv_history_short`. No price changed. This document asks the senior
-to pick one option below; implementation happens only after that reply.
+`adv_below_floor` or `lagged_adv_history_short`. No price changed. Option (a) was picked by the user;
+implementation is in `fees.mjs` (`baseOnlySlippage`), `db.mjs` (SELL branch) and `adaptive_engine.py`
+(`base_only_slippage_paise`, both exit paths).
 
 ## Problem, with evidence
 

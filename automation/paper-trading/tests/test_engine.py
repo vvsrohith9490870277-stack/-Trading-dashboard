@@ -186,31 +186,35 @@ class PaperTests(unittest.TestCase):
   self.assertEqual(payload['slippage_rule'],'tiered_adv_slippage');self.assertTrue(payload['slippage_applied'])
   direct=self.db.call({'action':'slippage','adv_paise':20000000000,'order_paise':5500000,'reference_paise':11000,'side':'SELL','stress':False})
   self.assertEqual(direct['base_bps'],8);self.assertEqual(direct['price'],109.91)
- def test_exit_slippage_unavailable_below_floor_names_the_reason(self):
-  # Pinned behaviour: a SELL below the ADV floor fills at the raw reference price with no slippage.
-  # Visibility (Part A step 2): the fill decision payload and the returned JSON (what the log records)
-  # must say exit_slippage_unavailable with the reason adv_below_floor.
+ def test_exit_slippage_below_floor_uses_base_only_fallback(self):
+  # B1 (option (a), user-decided, branch feat/adaptive-tuning): a SELL below the ADV floor
+  # NO LONGER fills at the raw reference price with no slippage. It now applies the base-only
+  # fallback (8 bps from capital_policy.json, no participation term, no stress): 110 -> 109.91.
+  # The reason is still recorded (adv_below_floor) so a fallback fill stays distinguishable
+  # from a tiered one. (Was test_exit_slippage_unavailable_below_floor_names_the_reason.)
   bought=self.signal();self.assertTrue(e.fill(self.db,bought,self.quote(),T)['filled'])
   sell=self.signal('SELL')
   self.seed_adv('RELIANCE-EQ',90000000)
   r=e.fill(self.db,sell,self.quote(110),T)
-  self.assertTrue(r['filled']);self.assertEqual(r['price'],110)
+  self.assertTrue(r['filled']);self.assertEqual(r['price'],109.91)
   payload=json.loads(self.db.query('SELECT payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,sell['id']))[0]['payload_json'])
-  self.assertEqual(payload['slippage_rule'],'exit_slippage_unavailable');self.assertFalse(payload['slippage_applied'])
+  self.assertEqual(payload['slippage_rule'],'base_only_fallback');self.assertTrue(payload['slippage_applied'])
   self.assertEqual(payload['slippage_reason'],'adv_below_floor')
-  self.assertEqual(r['slippage_rule'],'exit_slippage_unavailable');self.assertEqual(r['slippage_reason'],'adv_below_floor')
- def test_exit_slippage_unavailable_short_history_names_the_reason(self):
-  # Pinned behaviour: a SELL with no usable ADV history fills at the raw reference price with no slippage.
-  # Visibility (Part A step 2): the reason here is lagged_adv_history_short.
+  self.assertEqual(r['slippage_rule'],'base_only_fallback');self.assertEqual(r['slippage_reason'],'adv_below_floor')
+ def test_exit_slippage_short_history_uses_base_only_fallback(self):
+  # B1 (option (a), user-decided, branch feat/adaptive-tuning): a SELL with no usable ADV history
+  # NO LONGER fills at the raw reference price with no slippage. It now applies the base-only
+  # fallback: 110 -> 109.91, with the reason lagged_adv_history_short still recorded.
+  # (Was test_exit_slippage_unavailable_short_history_names_the_reason.)
   bought=self.signal();self.assertTrue(e.fill(self.db,bought,self.quote(),T)['filled'])
   sell=self.signal('SELL')
   self.db.batch([('DELETE FROM daily_ohlcv WHERE symbol=?',('RELIANCE-EQ',))])
   r=e.fill(self.db,sell,self.quote(110),T)
-  self.assertTrue(r['filled']);self.assertEqual(r['price'],110)
+  self.assertTrue(r['filled']);self.assertEqual(r['price'],109.91)
   payload=json.loads(self.db.query('SELECT payload_json FROM paper_decisions WHERE namespace=? AND correlation_id=?',(e.NS,sell['id']))[0]['payload_json'])
-  self.assertEqual(payload['slippage_rule'],'exit_slippage_unavailable');self.assertFalse(payload['slippage_applied'])
+  self.assertEqual(payload['slippage_rule'],'base_only_fallback');self.assertTrue(payload['slippage_applied'])
   self.assertEqual(payload['slippage_reason'],'lagged_adv_history_short')
-  self.assertEqual(r['slippage_rule'],'exit_slippage_unavailable');self.assertEqual(r['slippage_reason'],'lagged_adv_history_short')
+  self.assertEqual(r['slippage_rule'],'base_only_fallback');self.assertEqual(r['slippage_reason'],'lagged_adv_history_short')
  def test_exit_slippage_be_series_uses_stress(self):
   # Pinned behaviour: a BE/BZ exit uses the stress multiplier on the same tiered model.
   sbin=self.signal(symbol='SBIN-EQ');self.assertTrue(e.fill(self.db,sbin,self.quote(),T)['filled'])

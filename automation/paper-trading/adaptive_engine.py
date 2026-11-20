@@ -416,6 +416,25 @@ def slippage_fill_paise(reference_paise, order_paise, adv_paise, side, stress=Fa
     return {'price_paise': int(out), 'base_bps': base, 'bps': float(bps), 'stress': bool(stress)}
 
 
+def base_only_slippage_paise(reference_paise, side):
+    """B1 fallback (option (a), user-decided): base bps only, mirroring fees.mjs baseOnlySlippage().
+
+    Base is slippage_base_bps_through_20cr from the frozen capital_policy.json, read from
+    the file, never typed in code. No participation term (it needs ADV, which is exactly
+    what is missing) and no 1.5x stress (also for BE/BZ without ADV).
+    Example: SELL at 110.00 -> 109.91.
+    """
+    ref = int(reference_paise)
+    if ref <= 0 or side not in ('BUY', 'SELL'):
+        raise ValueError('slippage_inputs')
+    base = int(CAPITAL_POLICY['slippage_base_bps_through_20cr'])
+    factor = Fraction(10_000 + base, 10_000) if side == 'BUY' else Fraction(10_000 - base, 10_000)
+    out = math.floor(ref * factor + Fraction(1, 2))
+    if out <= 0:
+        raise ValueError('slippage_bounds')
+    return {'price_paise': int(out), 'base_bps': base}
+
+
 def lagged_adv_paise(sym_hist, day):
     """Lagged median traded value (paise) exactly as Track A db.mjs laggedAdv(): sessions strictly before day,
     special sessions excluded, turnover else close*volume, last adv_lookback_sessions rows. None if history is short."""
@@ -452,8 +471,9 @@ def estimate_exit_haircut_paise(qty, mark_price, series='EQ', locked_lower_days=
     """Exit haircut in paise for an open position: frozen sell charges (incl. overnight DP) + tiered exit slippage
     (stress multiplier on BE/BZ or explicit stress) + lower-circuit carry-forward haircut.
 
-    When lagged ADV is unknown, Track A applies no exit slippage ('exit_slippage_unavailable'); the same is done here
-    and reported as slippage_applied=False so callers can see it.
+    B1 (option (a)): when lagged ADV is unknown or below the floor, Track A applies the base-only
+    fallback (base bps from capital_policy.json, no participation term, no stress) instead of
+    no slippage; the same is done here.
     """
     qty = int(qty)
     if qty <= 0:
@@ -461,10 +481,13 @@ def estimate_exit_haircut_paise(qty, mark_price, series='EQ', locked_lower_days=
     mark_paise = cap.price_paise(mark_price)
     gross_paise = qty * mark_paise
     circuit_loss_paise = circuit_haircut_paise(gross_paise, locked_lower_days)
-    slippage_paise = 0
-    if adv_paise:
+    adv_floor_paise = int(CAPITAL_POLICY['adv_floor_inr']) * 100
+    if adv_paise and int(adv_paise) >= adv_floor_paise:
         stressed = bool(stress or CAPITAL_POLICY.get('slippage_stress') is True or str(series).upper() in ('BE', 'BZ'))
         fill = slippage_fill_paise(mark_paise, gross_paise, adv_paise, 'SELL', stress=stressed)['price_paise']
+        slippage_paise = gross_paise - qty * fill
+    else:
+        fill = base_only_slippage_paise(mark_paise, 'SELL')['price_paise']
         slippage_paise = gross_paise - qty * fill
     fees_paise = fill_charges_paise(gross_paise, 'SELL', overnight_dp=True)['total']
     return circuit_loss_paise + slippage_paise + fees_paise
@@ -909,6 +932,7 @@ def simulate_track_window(
     corp_actions=None,
     bands_by_date_symbol=None,
     stress_slippage=False,
+    signal_evaluator=None,
 ):
     """Run point-in-time warm-start + evaluation window simulation for a single track with all microstructure locks.
 
@@ -919,12 +943,27 @@ def simulate_track_window(
     - Upper-circuit buy block, lower-circuit carry-forward exit with 1%/day haircut, gap-aware Strategy 07 stops
     - EQ-only new entries, 1.5x exit slippage on BE/BZ
     - Starting equity E_0 at eval_dates[0] valued net of exit haircut
+
+    signal_evaluator (B3, optional): a callable (strategy, df) -> df with
+    entry_condition / exit_condition columns, used INSTEAD of
+    evaluate_parameterized_strategy. It lets shadow challengers (ids 101+,
+    which are not in BASELINE_PARAMS) reuse this simulator with the same
+    frozen sizing and costs. When it is given, baseline parameter validation
+    and warm-start-day validation are skipped (the registry owns the
+    candidate's params and warm-start); everything else — fills, locks,
+    charges, slippage — is identical, so strategies 1-7 are unaffected.
     """
     s = int(strategy)
-    validated_params = validate_parameter_only_mutation(s, params)
+    if signal_evaluator is None:
+        validated_params = validate_parameter_only_mutation(s, params)
+    else:
+        # Candidate challenger: params are the registry params, not baseline
+        # mutations; the evaluator owns the signals.
+        validated_params = dict(params or {})
     ws_dates = [str(d) for d in warm_start_dates]
     ev_dates = [str(d) for d in eval_dates]
-    validate_warm_start_days(s, len(ws_dates))
+    if signal_evaluator is None:
+        validate_warm_start_days(s, len(ws_dates))
     all_dates = ws_dates + ev_dates
     ws_end = ws_dates[-1]
     corp_actions = corp_actions or []
@@ -1001,9 +1040,15 @@ def simulate_track_window(
             ref_paise = cap.price_paise(raw_fill)
             adv = lagged_adv_paise(hist_by_symbol.get(sym), day)
             fill_paise = ref_paise
-            if adv:
+            exit_slippage_rule = 'tiered_adv_slippage'
+            if adv and adv >= adv_floor_paise:
                 stressed = bool(stress_slippage or CAPITAL_POLICY.get('slippage_stress') is True or pit_ser in ('BE', 'BZ'))
                 fill_paise = slippage_fill_paise(ref_paise, pos['qty'] * ref_paise, adv, 'SELL', stress=stressed)['price_paise']
+            else:
+                # B1 (option (a)): ADV unknown or below the floor -> base-only fallback
+                # (base bps from capital_policy.json, no participation term, no stress).
+                fill_paise = base_only_slippage_paise(ref_paise, 'SELL')['price_paise']
+                exit_slippage_rule = 'base_only_fallback'
             gross_proceeds = pos['qty'] * fill_paise
             sell_fees = fill_charges_paise(gross_proceeds, 'SELL', overnight_dp=True)['total']
             net_proceeds = gross_proceeds - sell_fees
@@ -1018,7 +1063,8 @@ def simulate_track_window(
                 'exit_price': fill_paise / 100.0,
                 'reference_exit_price': raw_fill,
                 'side': pos.get('side'),
-                'exit_slippage_applied': bool(adv),
+                'exit_slippage_applied': True,
+                'exit_slippage_rule': exit_slippage_rule,
                 'net_pnl_paise': net_proceeds - entry_cost,
                 'reason': sig.get('reason', 'daily_exit'),
             })
@@ -1144,7 +1190,10 @@ def simulate_track_window(
             if sym_hist.empty or str(sym_hist.iloc[-1]['trade_date']) != day:
                 continue
             adj_hist = back_adjust_ohlc_pit(sym_hist, corp_actions, as_of_date=day)
-            ind_df = evaluate_parameterized_strategy(s, adj_hist, validated_params)
+            if signal_evaluator is not None:
+                ind_df = signal_evaluator(s, adj_hist)
+            else:
+                ind_df = evaluate_parameterized_strategy(s, adj_hist, validated_params)
             last_row = ind_df.iloc[-1]
             if sym in positions and bool(last_row.get('exit_condition', False)):
                 pending_signals.append({'symbol': sym, 'side': 'SELL', 'signal_date': day, 'reason': 'daily_exit'})

@@ -322,7 +322,7 @@ full text: https://floridapsc.com/library/FILINGS/2013/07457-2013/Support/Gulf's
 
 No "R" exists in the codebase. Proposed definition for the B4 compare report:
 
-- **1R per trade = qty × ATR(14) at entry, in paise.** ATR(14) is the
+- **1R per trade = qty × 2 × ATR(14) at entry, in paise.** ATR(14) is the
   Wilder-smoothed True Range over 14 sessions at the entry close.
 - **R-multiple per trade = net P&L (paise) ÷ 1R.**
 - **Portfolio R = Σ net P&L ÷ Σ 1R** over the compared window; expectancy

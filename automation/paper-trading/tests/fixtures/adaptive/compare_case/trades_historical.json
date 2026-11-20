@@ -1,0 +1,28 @@
+{
+  "window_days": 20,
+  "starting_capital_paise": 50000000,
+  "strategies": {
+    "1": [
+      {"symbol": "AAA-EQ", "entry_date": "2026-01-02", "exit_date": "2026-01-10", "qty": 10, "entry_price": 100.0, "exit_price": 105.0, "net_pnl_paise": 5000, "atr14_at_entry_paise": 200},
+      {"symbol": "BBB-EQ", "entry_date": "2026-01-03", "exit_date": "2026-01-06", "qty": 5, "entry_price": 50.0, "exit_price": 48.0, "net_pnl_paise": -1200, "atr14_at_entry_paise": 100}
+    ],
+    "2": [
+      {"symbol": "AAA-EQ", "entry_date": "2026-01-02", "exit_date": "2026-01-09", "qty": 8, "entry_price": 100.0, "exit_price": 102.0, "net_pnl_paise": 1500, "atr14_at_entry_paise": 200},
+      {"symbol": "CCC-EQ", "entry_date": "2026-01-05", "exit_date": "2026-01-07", "qty": 20, "entry_price": 25.0, "exit_price": 24.0, "net_pnl_paise": -2200, "atr14_at_entry_paise": 50}
+    ],
+    "3": [
+      {"symbol": "DDD-EQ", "entry_date": "2026-01-04", "exit_date": "2026-01-12", "qty": 10, "entry_price": 200.0, "exit_price": 210.0, "net_pnl_paise": 9000, "atr14_at_entry_paise": 400}
+    ],
+    "4": [],
+    "5": [],
+    "6": [],
+    "7": [],
+    "101": [
+      {"symbol": "AAA-EQ", "entry_date": "2026-01-02", "exit_date": "2026-01-11", "qty": 10, "entry_price": 100.0, "exit_price": 108.0, "net_pnl_paise": 7500, "atr14_at_entry_paise": 200},
+      {"symbol": "EEE-EQ", "entry_date": "2026-01-06", "exit_date": "2026-01-08", "qty": 4, "entry_price": 75.0, "exit_price": 74.0, "net_pnl_paise": -500, "atr14_at_entry_paise": 150}
+    ],
+    "102": [
+      {"symbol": "FFF-EQ", "entry_date": "2026-01-05", "exit_date": "2026-01-06", "qty": 10, "entry_price": 10.0, "exit_price": 10.5, "net_pnl_paise": 400, "atr14_at_entry_paise": 20}
+    ]
+  }
+}

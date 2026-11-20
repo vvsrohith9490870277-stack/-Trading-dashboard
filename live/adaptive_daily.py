@@ -375,12 +375,28 @@ def main():
             replica_day = [r for r in base['daily_records'] if r['trade_date'] == day]
             live_sleeve = sleeves.get(str(s)) or sleeves.get(s) or {}
             live_eq = live_sleeve.get('equity_paise')
+            # B2 (P2+E1 condition 5): equity is change-based, so pass the
+            # previous day's equities too. Replica prev comes from the
+            # previous daily record; live prev from the sidecar's copied
+            # Track A equity rows (latest trade_date before today). Either
+            # may be None (first evaluated day) — then the equity part of
+            # the parity row is not_evaluable, never a level comparison.
+            recs = base['daily_records']
+            today_i = next((i for i, r in enumerate(recs) if r['trade_date'] == day), None)
+            replica_prev = recs[today_i - 1]['equity_paise'] if today_i else None
+            live_prev = None
+            try:
+                prev_rows = db.query('SELECT equity_paise FROM adaptive_live_track_a_equity WHERE namespace=? AND strategy=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1', (NS, s, day))
+                live_prev = int(prev_rows[0]['equity_paise']) if prev_rows else None
+            except Exception:
+                live_prev = None
             report['parity'][s] = pr.record_for_session(
                 db, NS, s, day, reconciled=rec, simulated=True, live_fills=live_fills,
                 replica_closed_trades=base['closed_trades'], replica_open_positions=base['open_positions'],
                 replica_entry_skips=base['entry_skips'], warm_start_end=info['warm_start'][1],
                 replica_equity_paise=(replica_day[-1]['equity_paise'] if replica_day else None),
-                live_equity_paise=(int(live_eq) if live_eq is not None else None))
+                live_equity_paise=(int(live_eq) if live_eq is not None else None),
+                replica_equity_prev_paise=replica_prev, live_equity_prev_paise=live_prev)
         report['simulation_status'] = 'SIMULATED'
     for s in sorted(ae.BASELINE_PARAMS):
         if s not in report['parity']:

@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 import inputPolicy from './session_input_policy.json' with {type:'json'};
 import prefilterPolicy from './prefilter_policy.json' with {type:'json'};
 import fs from 'fs';import {createRequire} from 'module';const require=createRequire(import.meta.url);const{createClient}=require('@libsql/client');
-import path from 'node:path';import {fileURLToPath} from 'node:url';import {policy,rates,paise,estimate,allocateOvernightDp,executionSlippage,fraction,DP_TOTAL_PAISE} from './fees.mjs';
+import path from 'node:path';import {fileURLToPath} from 'node:url';import {policy,rates,paise,estimate,allocateOvernightDp,executionSlippage,baseOnlySlippage,fraction,DP_TOTAL_PAISE} from './fees.mjs';
 import capitalPolicy from './capital_policy.json' with {type:'json'};
 import engineConfig from './config.json' with {type:'json'};
 import freezeLock from './freeze_lock.json' with {type:'json'};
@@ -128,7 +128,7 @@ else if(a.action==='decision'){
  let fillPrice=Number(a.price);let slip={applied:false,rule:side==='SELL'?'exit_slippage_unavailable':'not_applied',reference_price:Number(a.price)};
  const slipOf=advRow=>{const out=executionSlippage({advPaise:Math.round(advRow.median_paise),orderPaise:paise(a.price)*BigInt(q),referencePaise:paise(a.price),side,stress:capitalPolicy.slippage_stress===true||(side==='SELL'&&(a.series==='BE'||a.series==='BZ'))});fillPrice=out.price;slip={applied:true,rule:'tiered_adv_slippage',reference_price:Number(a.price),...out};};
  if(side==='BUY'&&advPass)slipOf(advPass);
- else if(side==='SELL'){const sellAdv=await laggedAdv(tx,s.symbol,day);if(sellAdv.ok)slipOf(sellAdv);else slip.reason=sellAdv.rule==='lagged_adv_history_short'?'lagged_adv_history_short':'adv_below_floor';}
+ else if(side==='SELL'){const sellAdv=await laggedAdv(tx,s.symbol,day);if(sellAdv.ok)slipOf(sellAdv);else{const fb=baseOnlySlippage({referencePaise:paise(a.price),side:'SELL'});fillPrice=fb.price;slip={applied:true,rule:'base_only_fallback',reference_price:Number(a.price),...fb,reason:sellAdv.rule==='lagged_adv_history_short'?'lagged_adv_history_short':'adv_below_floor'};}}
  const turnover=paise(fillPrice)*BigInt(q);if(turnover>BigInt(Number.MAX_SAFE_INTEGER))throw Error('turnover_bounds');
  const prior=rows(await tx.execute({sql:'SELECT side,turnover_paise,policy_version FROM paper_fill_costs WHERE namespace=? AND day=?',args:[n,day]}));
  if(prior.some(x=>x.policy_version!==policy.version))throw Error('mixed_daily_policy');
