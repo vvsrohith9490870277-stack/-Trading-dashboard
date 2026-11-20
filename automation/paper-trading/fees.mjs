@@ -52,3 +52,17 @@ export function executionSlippage({advPaise,orderPaise,referencePaise,side,stres
  return {price_paise:Number(out),price:inrFromPaise(out),base_bps:Number(base),bps_numerator:Number(num),bps_denominator:Number(den),stress:!!stress};
 }
 export const DP_TOTAL_PAISE=rates.dp.charge_paise+rates.dp.gst_paise;
+// B1 (option (a), user-decided): base-only exit-slippage fallback when lagged ADV is
+// unavailable. Price = reference x (1 -/+ base/10000), half-up to paise, where base is
+// slippage_base_bps_through_20cr read from capital_policy.json (never typed in code).
+// No participation term (it needs ADV, which is exactly what is missing) and no 1.5x
+// stress (also for BE/BZ without ADV). Example: SELL 500 at 110.00 gives 109.91.
+export function baseOnlySlippage({referencePaise,side}){
+ const ref=BigInt(referencePaise);
+ if(ref<=0n||!['BUY','SELL'].includes(side))throw Error('slippage_inputs');
+ const base=BigInt(capitalPolicy.slippage_base_bps_through_20cr);
+ const scale=10000n;const bumped=side==='BUY'?scale+base:scale-base;
+ if(bumped<=0n)throw Error('slippage_bounds');
+ const out=div(ref*bumped,scale);if(out<=0n||out>9007199254740991n)throw Error('slippage_bounds');
+ return {price_paise:Number(out),price:inrFromPaise(out),base_bps:Number(base)};
+}
