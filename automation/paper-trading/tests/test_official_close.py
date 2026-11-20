@@ -172,6 +172,8 @@ class TaxonomyTests(unittest.TestCase):
         self.assertEqual(al.classified_error(RuntimeError('position_mark_stale')), 'position_mark_stale')
         self.assertEqual(al.classified_error(RuntimeError('database_operation_failed')), 'database_operation_failed')
         self.assertEqual(al.classified_error(RuntimeError('market_data_error_SERVER_ERROR')), 'market_data_error_SERVER_ERROR')
+        self.assertEqual(al.classified_error(RuntimeError('market_data_error_-16')), 'market_data_error_-16')
+        self.assertEqual(al.classified_error(RuntimeError('market_data_error_-300')), 'market_data_error_-300')
         self.assertEqual(al.classified_error(RuntimeError('weird_token_not_allowlisted')), 'RuntimeError')
         self.assertEqual(al.clean('Turso_operation_failed', 'error_code'), 'Turso_operation_failed')
         self.assertEqual(al.clean('SERVER_ERROR', 'error_code'), 'SERVER_ERROR')
