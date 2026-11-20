@@ -74,13 +74,14 @@ class HealthFieldsTests(unittest.TestCase):
     Task 6.3 field, with exactly those names."""
 
     # Top-level keys a live snapshot must have (trial adds two more).
+    # 'breakers' is the Task 2 (render-deploy-03) crash-loop breaker map.
     LIVE_KEYS = {
         'ok', 'mode', 'login_allowed', 'state', 'namespace', 'role',
         'runner_id', 'epoch', 'uptime_s', 'now_ist', 'session_open',
         'calendar_valid_through', 'calendar_days_left', 'worker',
         'last_tick_ist', 'last_lease_renew_age_s', 'jobs_today',
         'last_job', 'rss_mb', 'children_rss_mb', 'fyers_budget', 'auth',
-        'git_sha', 'version',
+        'git_sha', 'version', 'breakers',
         # kept from the original snapshot:
         'status', 'active_runner', 'lease', 'jobs', 'uptime_seconds',
         'memory_mb',
@@ -366,6 +367,219 @@ class SupervisorTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class JobGuardTests(unittest.TestCase):
+    """Task 2 (render-deploy-03): per-job memory guard + crash-loop
+    breaker. The guard kills the job's process group over the cap and
+    records failed/memory_cap; the breaker counts starts from
+    paper_job_runs, stops scheduling for the rest of the IST day, and
+    /health stays 200 with state degraded."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / 'jobs.sqlite'
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _store(self):
+        store = rs.SqliteStore(self.path)
+        rs.migrate(store)
+        return store
+
+    def _alloc_child(self, mb=80):
+        # Allocates ~mb of RAM, then sleeps: over a small cap, under a
+        # large one. The RSS includes the interpreter (~15 MB).
+        return [sys.executable, '-c',
+                'import time; b = bytearray(%d * 1024 * 1024);'
+                ' time.sleep(30)' % mb]
+
+    def test_job_rss_cap_kills_child(self):
+        import render_app as ra
+        res = ra.run_job_streaming(self._alloc_child(80), None,
+                                   timeout=30, rss_cap_mb=50)
+        self.assertEqual(res.get('killed_reason'), 'memory_cap')
+        self.assertEqual(res.get('rss_cap_mb'), 50)
+        self.assertNotEqual(res['exit_code'], 0)
+
+    def test_job_rss_cap_records_failed(self):
+        import render_app as ra
+        import render_jobs as rj
+        store = self._store()
+        try:
+            out = rj.run_job(
+                store, 'paper_v2', 'scan', '2026-11-20',
+                owner_id='render:h:1:1',
+                runner=lambda name: ra.run_job_streaming(
+                    self._alloc_child(80), None, timeout=30,
+                    rss_cap_mb=50))
+            self.assertEqual(out.get('killed_reason'), 'memory_cap')
+            rows = store.execute(
+                "SELECT status, exit_code, result_json FROM paper_job_runs"
+                " WHERE namespace='paper_v2' AND job='scan'")
+            self.assertEqual(rows[0]['status'], 'failed')
+            self.assertIn('memory_cap', rows[0]['result_json'])
+        finally:
+            store.close()
+
+    def _sup_with_breaker(self, store, breaker_open=True):
+        import render_app as ra
+        import render_jobs as rj
+        if breaker_open:
+            # Seed the breaker with 3 killed starts (the incident: the
+            # scan child is killed, it does not succeed). A failed run
+            # does not count in last_run_times, so the job is still due
+            # — and the breaker must stop it from starting again.
+            for _ in range(3):
+                rj.run_job(store, 'paper_v2', 'scan', '2026-11-20',
+                           owner_id='render:h:1:1',
+                           runner=lambda name: {
+                               'exit_code': -9, 'stdout_tail': '',
+                               'stderr_tail': '',
+                               'killed_reason': 'memory_cap',
+                               'rss_cap_mb': 350})
+        sup = ra.Supervisor.__new__(ra.Supervisor)
+        sup.store = store
+        sup.namespace = 'paper_v2'
+        sup.mode = 'live'
+        sup.breakers = {}
+        sup._job_thread = None
+        return sup
+
+    def _due_scan_schedule(self):
+        # A schedule whose scan slot was 5 minutes ago (inside the
+        # 30-min catch-up window), so the scan is due right now.
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        now = _dt.now(_ZI('Asia/Kolkata')) - __import__(
+            'datetime').timedelta(minutes=5)
+        return {'timezone': 'Asia/Kolkata', 'catch_up_minutes': 30,
+                'jobs': [{'name': 'scan', 'time': now.strftime('%H:%M'),
+                          'enabled': True}]}
+
+    def test_breaker_stops_scheduling(self):
+        import render_app as ra
+        import render_jobs as rj
+        import render_schedule as rsch
+        store = self._store()
+        try:
+            sup = self._sup_with_breaker(store, breaker_open=True)
+            self.assertIn('scan', rj.open_breakers(
+                store, 'paper_v2', '2026-11-20',
+                max_starts=3, window_min=30))
+            orig = rsch.load_schedule
+            rsch.load_schedule = lambda mode='live': \
+                self._due_scan_schedule()
+            try:
+                sup._manage_jobs()
+            finally:
+                rsch.load_schedule = orig
+            self.assertIsNone(sup._job_thread,
+                              'breaker-open job must not start')
+            self.assertIn('scan', sup.breakers)
+        finally:
+            store.close()
+
+    def test_health_degraded_with_breakers(self):
+        snap = rh.build_snapshot(
+            mode='live', namespace='paper_v2', active_runner='render',
+            lease_held=True,
+            lease={'owner_id': 'render:h:1:1', 'epoch': 1},
+            worker={'state': 'running', 'pid': 123, 'rss_mb': 200},
+            jobs={'scan': '2026-11-20T08:45:00'},
+            uptime_seconds=60, memory_mb=150,
+            breakers={'scan': {'starts': 3, 'window_min': 30,
+                               'max_starts': 3}})
+        code, payload = rh.health_response(snap)
+        self.assertEqual(code, 200, payload)
+        self.assertIs(payload['ok'], True)
+        self.assertEqual(payload['status'], 'degraded')
+        self.assertIn('scan', payload['breakers'])
+        # The same inputs without a breaker are ok, not degraded.
+        snap2 = rh.build_snapshot(
+            mode='live', namespace='paper_v2', active_runner='render',
+            lease_held=True,
+            lease={'owner_id': 'render:h:1:1', 'epoch': 1},
+            worker={'state': 'running', 'pid': 123, 'rss_mb': 200},
+            jobs={'scan': '2026-11-20T08:45:00'},
+            uptime_seconds=60, memory_mb=150)
+        self.assertEqual(snap2['status'], 'ok')
+
+    def test_incident_replay_breaker(self):
+        # Incident replay: the scan child is killed 3x in 10 minutes
+        # (memory_cap), with an instance restart between starts. After
+        # the 3rd kill the breaker is open, the 4th start never happens,
+        # the worker keeps running, and /health is degraded at HTTP 200.
+        import render_app as ra
+        import render_jobs as rj
+        import render_schedule as rsch
+
+        def kill_run(store):
+            return rj.run_job(
+                store, 'paper_v2', 'scan', '2026-11-20',
+                owner_id='render:h:1:1',
+                runner=lambda name: {'exit_code': -9,
+                                     'stdout_tail': '',
+                                     'stderr_tail': '',
+                                     'killed_reason': 'memory_cap',
+                                     'rss_cap_mb': 350})
+
+        store = self._store()
+        try:
+            for _ in range(3):
+                kill_run(store)
+                # instance restart: close and reopen the store
+                store.close()
+                store = self._store()
+            self.assertTrue(rj.breaker_open(
+                store, 'paper_v2', 'scan', '2026-11-20',
+                max_starts=3, window_min=30))
+            sup = ra.Supervisor.__new__(ra.Supervisor)
+            sup.store = store
+            sup.namespace = 'paper_v2'
+            sup.mode = 'live'
+            sup.owner_id = 'render:h:1:1'
+            sup.config = {'calendar_valid_from': '2026-01-01',
+                          'calendar_valid_through': '2026-12-31',
+                          'regular_session': ['09:15', '15:30'],
+                          'holidays': [], 'special_sessions': {}}
+            sup.lease_held = True
+            sup.stopping = False
+            sup.store_error = None
+            sup.started_at = time.time() - 60
+            sup.last_tick_at = time.time()
+            sup.last_lease_renew_at = time.time()
+            sup.last_flag = 'render'
+            sup.breakers = {}
+            sup._job_thread = None
+
+            class FakeWorker:
+                def describe(self):
+                    return {'state': 'running', 'pid': 123, 'rss_mb': 95,
+                            'restarts': 0, 'restarts_10m': 0,
+                            'last_heartbeat_age_s': 5}
+            sup.worker = FakeWorker()
+            # No 4th start: the due scan is skipped while the breaker
+            # is open.
+            orig = rsch.load_schedule
+            rsch.load_schedule = lambda mode='live': \
+                self._due_scan_schedule()
+            try:
+                sup._manage_jobs()
+            finally:
+                rsch.load_schedule = orig
+            self.assertIsNone(sup._job_thread)
+            # /health: worker running, state degraded, HTTP 200.
+            snap = sup.snapshot('render')
+            self.assertEqual(snap['worker']['state'], 'running')
+            self.assertEqual(snap['status'], 'degraded')
+            self.assertIs(snap['ok'], True)
+            code, _payload = rh.health_response(snap)
+            self.assertEqual(code, 200)
+            self.assertIn('scan', snap['breakers'])
+        finally:
+            store.close()
 
 
 class WorkerWindowTests(unittest.TestCase):

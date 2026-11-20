@@ -502,6 +502,34 @@ def cmd_handoff(args):
     return 0
 
 
+def cmd_breaker_clear(args):
+    """Clear a job's crash-loop breaker after the cause is fixed
+    (render-deploy-03 Task 2). The breaker is the stored start list in
+    paper_job_runs; clearing it lets the supervisor schedule the job
+    again today. Needs --yes: it changes live scheduling state."""
+    if not getattr(args, 'yes', False):
+        print('breaker-clear needs --yes (refusing to change scheduling'
+              ' state without it)', file=sys.stderr)
+        return 2
+    import render_app as ra
+    import render_jobs as rj
+    ok, namespace = ra.check_namespace()
+    if not ok:
+        print('namespace refused; breaker-clear not applied',
+              file=sys.stderr)
+        return 3
+    if getattr(args, 'namespace', None):
+        namespace = args.namespace
+    day = getattr(args, 'day', None) or datetime.now(IST).date().isoformat()
+    store = _store()
+    cleared = rj.clear_breaker(store, namespace, args.job, day)
+    _print({'ok': True, 'namespace': namespace, 'job': args.job,
+            'day': day, 'cleared': cleared,
+            'breaker_open': rj.breaker_open(store, namespace, args.job,
+                                            day)})
+    return 0
+
+
 def cmd_gen_key(args):
     import token_store as ts
     _print({'TOKEN_ENC_KEY': ts.generate_key()})
@@ -1356,6 +1384,12 @@ def build_parser():
     p.add_argument('--to', required=True)
     p.add_argument('--yes', action='store_true')
     p.set_defaults(fn=cmd_handoff)
+    p = sub.add_parser('breaker-clear')
+    p.add_argument('--job', required=True)
+    p.add_argument('--namespace', default=None)
+    p.add_argument('--day', default=None)
+    p.add_argument('--yes', action='store_true')
+    p.set_defaults(fn=cmd_breaker_clear)
     p = sub.add_parser('gen-key')
     p.set_defaults(fn=cmd_gen_key)
     p = sub.add_parser('seed-budget')

@@ -74,6 +74,46 @@ def children_rss_mb():
     return total
 
 
+def tree_rss_mb(pid):
+    """RSS in MB of a process and all its descendants (Linux /proc).
+    0 when unreadable. Used by the per-job memory guard."""
+    try:
+        ppid = {}
+        rss = {}
+        for name in os.listdir('/proc'):
+            if not name.isdigit():
+                continue
+            try:
+                with open('/proc/%s/stat' % name) as f:
+                    parts = f.read().rsplit(')', 1)[1].split()
+                ppid[int(name)] = int(parts[1])
+                with open('/proc/%s/status' % name) as f:
+                    for line in f:
+                        if line.startswith('VmRSS:'):
+                            rss[int(name)] = int(line.split()[1]) // 1024
+                            break
+            except Exception:
+                continue
+        children = {}
+        for p, parent in ppid.items():
+            children.setdefault(parent, []).append(p)
+        total = rss.get(pid, 0)
+        frontier = [pid]
+        seen = {pid}
+        while frontier:
+            nxt = []
+            for p in frontier:
+                for c in children.get(p, []):
+                    if c not in seen:
+                        seen.add(c)
+                        total += rss.get(c, 0)
+                        nxt.append(c)
+            frontier = nxt
+        return total
+    except Exception:
+        return 0
+
+
 def memory_over_limit(rss_mb, limit=MEMORY_LIMIT_MB):
     return rss_mb > limit
 
@@ -87,7 +127,8 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
                    jobs_today=None, last_job=None, rss_mb=None,
                    children_rss_mb=None, fyers_budget=None, auth=None,
                    git_sha=None, version=None, trial_budget=None,
-                   box_conflict_check=None, login_allowed=None):
+                   box_conflict_check=None, login_allowed=None,
+                   breakers=None):
     """Build the /health payload (brief 01 Task 6.3).
 
     The first nine arguments are the original snapshot inputs and keep
@@ -96,6 +137,10 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
     from the inputs where possible (state/role/epoch/ok) and left null
     where they would need a store read (see the module docstring).
     `trial_budget` and `box_conflict_check` appear only in trial mode.
+    `breakers` is {job: info} for open crash-loop breakers (Task 2):
+    an open breaker makes the state 'degraded' but leaves ok true
+    (HTTP 200) — the supervisor is up and the worker runs, it just
+    will not start that job again today.
     """
     if active_runner != 'render':
         status = 'idle_not_active_runner'
@@ -103,13 +148,20 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
         status = 'lease_lost'
     elif worker.get('state') == 'crashed':
         status = 'degraded'
+    elif breakers:
+        status = 'degraded'
     else:
         status = 'ok'
     ok = status in ('ok', 'idle_not_active_runner')
+    if status == 'degraded' and breakers and lease_held and \
+            worker.get('state') != 'crashed':
+        ok = True
     if state is None:
         if active_runner != 'render':
             state = 'idle_not_active_runner'
         elif worker.get('state') == 'crashed':
+            state = 'degraded'
+        elif breakers:
             state = 'degraded'
         elif not lease_held:
             state = 'standby'
@@ -163,6 +215,7 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
         'jobs': jobs,
         'jobs_today': jobs_today if jobs_today is not None else {},
         'last_job': last_job,
+        'breakers': breakers if breakers is not None else {},
         'rss_mb': rss_mb if rss_mb is not None else memory_mb,
         'memory_mb': memory_mb,
         'children_rss_mb': (children_rss_mb if children_rss_mb is not None

@@ -181,5 +181,96 @@ class JobRunTests(unittest.TestCase):
                                                       last_run=last)])
 
 
+class BreakerTests(unittest.TestCase):
+    """Task 2 (render-deploy-03): the crash-loop breaker counts job
+    starts from paper_job_runs, so it survives a supervisor restart.
+    Starts are recorded in the row's result_json 'starts' list (one
+    row per (namespace, job, session_day), so no new table)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / 'jobs.sqlite'
+        self.store = rs.SqliteStore(self.path)
+        rs.migrate(self.store)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+
+    def _run_starts(self, n, job='scan'):
+        for _ in range(n):
+            rj.run_job(self.store, 'paper_v2', job, '2026-11-20',
+                       owner_id='render:h:1:1',
+                       runner=lambda name: {'status': 'ok'})
+
+    def test_breaker_opens_after_max_starts(self):
+        self._run_starts(3)
+        self.assertTrue(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', '2026-11-20',
+            max_starts=3, window_min=30))
+        open_b = rj.open_breakers(
+            self.store, 'paper_v2', '2026-11-20',
+            max_starts=3, window_min=30)
+        self.assertIn('scan', open_b)
+        self.assertEqual(open_b['scan']['starts'], 3)
+
+    def test_breaker_closed_below_max_starts(self):
+        self._run_starts(2)
+        self.assertFalse(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', '2026-11-20',
+            max_starts=3, window_min=30))
+        self.assertEqual(rj.open_breakers(
+            self.store, 'paper_v2', '2026-11-20',
+            max_starts=3, window_min=30), {})
+
+    def test_breaker_window_expiry(self):
+        import json as _json
+        import time as _time
+        now = int(_time.time())
+        old = [now - 3600, now - 3500, now - 3400]  # all > 30 min ago
+        self.store.execute(
+            'INSERT INTO paper_job_runs(namespace, job, session_day,'
+            ' attempt, status, owner_id, claimed_unix, lease_until_unix,'
+            ' started_at, result_json) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('paper_v2', 'scan', '2026-11-20', 3, 'ok', 'render:h:1:1',
+             now - 3600, now - 3510, '2026-11-20T03:15:00',
+             _json.dumps({'starts': old})))
+        self.assertFalse(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', '2026-11-20',
+            max_starts=3, window_min=30, now_unix=now))
+        recent = [now - 600, now - 300, now - 60]
+        self.store.execute(
+            'UPDATE paper_job_runs SET result_json=?'
+            ' WHERE namespace=? AND job=? AND session_day=?',
+            (_json.dumps({'starts': recent}),
+             'paper_v2', 'scan', '2026-11-20'))
+        self.assertTrue(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', '2026-11-20',
+            max_starts=3, window_min=30, now_unix=now))
+
+    def test_breaker_clear(self):
+        self._run_starts(3)
+        self.assertTrue(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', '2026-11-20',
+            max_starts=3, window_min=30))
+        self.assertTrue(rj.clear_breaker(
+            self.store, 'paper_v2', 'scan', '2026-11-20'))
+        self.assertFalse(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', '2026-11-20',
+            max_starts=3, window_min=30))
+        self.assertEqual(rj.open_breakers(
+            self.store, 'paper_v2', '2026-11-20',
+            max_starts=3, window_min=30), {})
+        # A cleared breaker lets the job run again (attempt keeps counting).
+        rj.run_job(self.store, 'paper_v2', 'scan', '2026-11-20',
+                   owner_id='render:h:1:1',
+                   runner=lambda name: {'status': 'ok'})
+        rows = self.store.execute(
+            "SELECT attempt, status FROM paper_job_runs"
+            " WHERE namespace='paper_v2' AND job='scan'")
+        self.assertEqual(rows[0]['attempt'], 4)
+        self.assertEqual(rows[0]['status'], 'ok')
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -82,7 +82,15 @@ def check_namespace():
         return False, None
 
 
-def run_job_streaming(cmd, env, timeout=1800):
+def job_rss_cap_mb():
+    """Per-job RSS cap in MB (env RENDER_JOB_RSS_CAP_MB, default 350)."""
+    try:
+        return max(1, int(os.environ.get('RENDER_JOB_RSS_CAP_MB', '350')))
+    except ValueError:
+        return 350
+
+
+def run_job_streaming(cmd, env, timeout=1800, rss_cap_mb=None):
     """Run a job child streaming stdout/stderr (render-deploy-03 Task 1).
 
     The child's output is read as it arrives in fixed 64 KiB chunks
@@ -92,11 +100,20 @@ def run_job_streaming(cmd, env, timeout=1800):
     capture_output=True and buffered the whole output. Returns
     {'exit_code', 'stdout_tail', 'stderr_tail'}. Raises
     subprocess.TimeoutExpired on timeout, like subprocess.run.
+
+    Memory guard (Task 2): the child's whole process tree is watched
+    every 0.5 s; over RENDER_JOB_RSS_CAP_MB (default 350) the process
+    group is killed and the result carries killed_reason 'memory_cap'
+    plus the cap in force, so the job is recorded failed/memory_cap.
     """
     import threading
+    if rss_cap_mb is None:
+        rss_cap_mb = job_rss_cap_mb()
     tails = {'out': '', 'err': ''}
+    killed = {'reason': None}
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, env=env)
+                            stderr=subprocess.PIPE, text=True, env=env,
+                            start_new_session=True)
 
     def _drain(stream, key):
         try:
@@ -113,10 +130,25 @@ def run_job_streaming(cmd, env, timeout=1800):
             except Exception:
                 pass
 
+    def _watch():
+        while proc.poll() is None:
+            try:
+                if rh.tree_rss_mb(proc.pid) > rss_cap_mb:
+                    try:
+                        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    except Exception:
+                        break
+                    killed['reason'] = 'memory_cap'
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+
     threads = [threading.Thread(target=_drain, args=(proc.stdout, 'out'),
                                 daemon=True),
                threading.Thread(target=_drain, args=(proc.stderr, 'err'),
-                                daemon=True)]
+                                daemon=True),
+               threading.Thread(target=_watch, daemon=True)]
     for th in threads:
         th.start()
     try:
@@ -130,8 +162,12 @@ def run_job_streaming(cmd, env, timeout=1800):
         raise subprocess.TimeoutExpired(cmd, timeout)
     for th in threads:
         th.join(timeout=10)
-    return {'exit_code': rc, 'stdout_tail': tails['out'],
-            'stderr_tail': tails['err']}
+    out = {'exit_code': rc, 'stdout_tail': tails['out'],
+           'stderr_tail': tails['err']}
+    if killed['reason']:
+        out['killed_reason'] = killed['reason']
+        out['rss_cap_mb'] = rss_cap_mb
+    return out
 
 
 class Worker:
@@ -229,6 +265,9 @@ class Supervisor:
         self.last_snapshot = None
         self.last_tick_at = None
         self.last_lease_renew_at = None
+        # Open crash-loop breakers {job: info}, refreshed from
+        # paper_job_runs (authoritative; survives a restart).
+        self.breakers = {}
 
     # -- worker ---------------------------------------------------------
     def _worker_cmd(self):
@@ -299,6 +338,19 @@ class Supervisor:
         except Exception:
             pass  # recorded in paper_job_runs; the next tick retries in-window
 
+    def _refresh_breakers(self):
+        """Re-read the open crash-loop breakers from the store into
+        self.breakers. The store is authoritative; on a read failure
+        the last known breakers stand (a breaker is never silently
+        cleared by a transient store error)."""
+        try:
+            day = datetime.now(IST).date().isoformat()
+            self.breakers = rj.open_breakers(self.store, self.namespace,
+                                             day)
+        except Exception:
+            pass
+        return self.breakers
+
     def _manage_jobs(self):
         if self._job_thread is not None and self._job_thread.is_alive():
             return
@@ -308,6 +360,11 @@ class Supervisor:
             due = rsch.due_jobs(sched, last_run=last)
         except Exception:
             return
+        if not due:
+            return
+        # A job whose breaker is open is not started again today.
+        self._refresh_breakers()
+        due = [j for j in due if j['name'] not in self.breakers]
         if not due:
             return
         job = due[0]
@@ -373,9 +430,16 @@ class Supervisor:
                         'last_heartbeat_age_s': None})
         if self.store_error is not None:
             worker = dict(worker, state='crashed')
+        self._refresh_breakers()
         if self.stopping:
             state = 'stopping'
         elif self.store_error is not None or worker['state'] == 'crashed':
+            state = 'degraded'
+        elif self.breakers:
+            # A breaker is protective, not a failure: the supervisor is
+            # up and the worker runs, it just will not start that job
+            # again today. State degraded, /health stays 200 (see
+            # build_snapshot's ok rule).
             state = 'degraded'
         elif flag != 'render':
             state = 'idle_not_active_runner'
@@ -422,6 +486,7 @@ class Supervisor:
                 if self.last_lease_renew_at is not None else None),
             jobs_today={}, last_job=None,
             children_rss_mb=rh.children_rss_mb(),
+            breakers=self.breakers,
             fyers_budget={
                 'day_used': None,
                 'per_day_limit': int(
