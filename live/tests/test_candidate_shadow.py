@@ -11,10 +11,24 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / 'automation' / 'paper-trading'))
-sys.path.insert(0, str(HERE.parent / 'automation' / 'paper-trading' / 'tests'))
 
 import candidate_shadow as cs
+# adaptive_fixtures lives in automation/paper-trading/tests, but that
+# directory must NOT go on sys.path: it also holds test_namespace_cutover,
+# and live/tests holds a module of the same name, so inserting it breaks
+# unittest discovery of live/tests (ImportError: module incorrectly
+# imported from the automation copy). Load the fixtures by file path.
+import importlib.util as _ilu
+_FIXTURES_PATH = HERE.parent / 'automation' / 'paper-trading' / 'tests' / 'adaptive_fixtures.py'
+_spec = _ilu.spec_from_file_location('adaptive_fixtures', _FIXTURES_PATH)
+adaptive_fixtures = _ilu.module_from_spec(_spec)
+sys.modules['adaptive_fixtures'] = adaptive_fixtures
+_spec.loader.exec_module(adaptive_fixtures)
 from adaptive_fixtures import fresh_db, make_market, seed_pit
+
+# Snapshot sys.path right after this module's own imports: the regression
+# test below asserts this module did not add the automation tests dir.
+_SYS_PATH_AFTER_IMPORT = list(sys.path)
 
 
 class SpyDB:
@@ -41,6 +55,18 @@ class CandidateShadowTests(unittest.TestCase):
         cls.spy = SpyDB(db)
         cls.out = cs.run_shadow(cls.spy, 'adaptive_v1', df, idx, days[:260], days[260:])
         cls.db = db
+
+    def test_import_does_not_pollute_sys_path(self):
+        # Regression test for the G3 discovery failure: this module used to
+        # insert automation/paper-trading/tests into sys.path at import time,
+        # so unittest discovery of live/tests then resolved the duplicate
+        # module name test_namespace_cutover to the automation copy and died
+        # with ImportError ('incorrectly imported from ...'). The snapshot
+        # is taken at this module's import time, so later imports by other
+        # test modules cannot affect it.
+        import sys
+        tests_dir = str(HERE.parent / 'automation' / 'paper-trading' / 'tests')
+        self.assertNotIn(tests_dir, _SYS_PATH_AFTER_IMPORT)
 
     def test_shadow_runs_all_five_offline(self):
         self.assertEqual(set(self.out), {101, 102, 103, 104, 105})
