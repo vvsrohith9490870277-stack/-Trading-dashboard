@@ -21,7 +21,7 @@ sys.path.insert(0, str(LIVE))
 import candidate_compare as cc
 
 ROW_FIELDS = {'trades', 'win_rate', 'avg_net_return_pct', 'avg_r',
-              'max_drawdown_pct', 'net_pnl_inr', 'avg_hold_days', 'exposure',
+              'max_drawdown_pct', 'net_pnl_inr', 'net_pnl_paise', 'avg_hold_days', 'exposure',
               'overlap_with_seven', 'sample_size'}
 
 
@@ -37,35 +37,58 @@ class CompareMetricsTests(unittest.TestCase):
         cls.report = cc.build_report(hist, fwd, '2026-01-15')
 
     def test_metrics_exact_on_hand_built_trades(self):
-        # Strategy 1 historical: +5000 (R 2.5, ret 5.0%) and -1200 (R -2.4, ret -4.8%).
+        # 1R = qty x 2 x ATR(14) at entry (Grok Q3 answer, plan §9): every
+        # R-multiple below is half the 1x-ATR value, e.g. S1 +5000/(10x200)
+        # = 2.5 -> 1.25 and -1200/(5x100) = -2.4 -> -1.2, avg 0.025.
+        # Strategy 1 historical: +5000 (R 1.25, ret 5.0%) and -1200 (R -1.2, ret -4.8%).
         s1 = self.report['historical_replay']['strategies']['1']
         self.assertEqual(s1['trades'], 2)
         self.assertEqual(s1['win_rate'], 0.5)
         self.assertAlmostEqual(s1['avg_net_return_pct'], 0.1, places=4)
-        self.assertAlmostEqual(s1['avg_r'], 0.05, places=4)
+        self.assertAlmostEqual(s1['avg_r'], 0.025, places=4)
         self.assertAlmostEqual(s1['max_drawdown_pct'], 0.0024, places=4)
         self.assertEqual(s1['net_pnl_inr'], 38.0)
+        self.assertEqual(s1['net_pnl_paise'], 3800)
         self.assertEqual(s1['avg_hold_days'], 5.5)
         self.assertEqual(s1['exposure'], 0.55)
-        # Strategy 2 historical: +1500 (R 0.9375) and -2200 (R -2.2).
+        # Strategy 2 historical: +1500 (R 0.4688) and -2200 (R -1.1).
         s2 = self.report['historical_replay']['strategies']['2']
         self.assertEqual(s2['trades'], 2)
         self.assertAlmostEqual(s2['avg_net_return_pct'], -1.2625, places=4)
-        self.assertAlmostEqual(s2['avg_r'], -0.6313, places=4)
+        self.assertAlmostEqual(s2['avg_r'], -0.3156, places=4)
         self.assertAlmostEqual(s2['max_drawdown_pct'], 0.0044, places=4)
         self.assertEqual(s2['net_pnl_inr'], -7.0)
-        # Strategy 3 historical: single +9000 trade, R 2.25, ret 4.5%.
+        self.assertEqual(s2['net_pnl_paise'], -700)
+        # Strategy 3 historical: single +9000 trade, R 1.125, ret 4.5%.
         s3 = self.report['historical_replay']['strategies']['3']
         self.assertEqual((s3['trades'], s3['win_rate'], s3['avg_net_return_pct'],
-                          s3['avg_r'], s3['max_drawdown_pct'], s3['net_pnl_inr']),
-                         (1, 1.0, 4.5, 2.25, 0.0, 90.0))
-        # Candidate 101 historical: +7500 (R 3.75) and -500 (R -0.8333).
+                          s3['avg_r'], s3['max_drawdown_pct'], s3['net_pnl_inr'],
+                          s3['net_pnl_paise']),
+                         (1, 1.0, 4.5, 1.125, 0.0, 90.0, 9000))
+        # Candidate 101 historical: +7500 (R 1.875) and -500 (R -0.4167).
         c101 = self.report['historical_replay']['strategies']['101']
         self.assertEqual(c101['trades'], 2)
         self.assertAlmostEqual(c101['avg_net_return_pct'], 2.9167, places=4)
-        self.assertAlmostEqual(c101['avg_r'], 1.4583, places=4)
+        self.assertAlmostEqual(c101['avg_r'], 0.7292, places=4)
         self.assertAlmostEqual(c101['max_drawdown_pct'], 0.001, places=4)
         self.assertEqual(c101['net_pnl_inr'], 70.0)
+        self.assertEqual(c101['net_pnl_paise'], 7000)
+        # Candidate 102 historical: single +400 trade, R 1.0
+        # (400/(10 x 2 x 20)).
+        c102 = self.report['historical_replay']['strategies']['102']
+        self.assertEqual((c102['trades'], c102['avg_r'], c102['net_pnl_inr'],
+                          c102['net_pnl_paise']), (1, 1.0, 4.0, 400))
+        # Forward shadow panel: S1 +900 (R 0.225), C101 -1100 (R -0.275).
+        fwd = self.report['forward_shadow']['strategies']
+        self.assertAlmostEqual(fwd['1']['avg_r'], 0.225, places=4)
+        self.assertAlmostEqual(fwd['101']['avg_r'], -0.275, places=4)
+        # Merged (both panels): S1 avg R (1.25 - 1.2 + 0.225)/3 = 0.0917,
+        # net 4700 paise; C101 (1.875 - 0.4167 - 0.275)/3 = 0.3944, net 5900.
+        merged = self.report['strategies']
+        self.assertAlmostEqual(merged['1']['avg_r'], 0.0917, places=4)
+        self.assertEqual(merged['1']['net_pnl_paise'], 4700)
+        self.assertAlmostEqual(merged['101']['avg_r'], 0.3944, places=4)
+        self.assertEqual(merged['101']['net_pnl_paise'], 5900)
 
     def test_insufficient_sample_label(self):
         # Every fixture row has <30 trades.
@@ -93,6 +116,9 @@ class CompareMetricsTests(unittest.TestCase):
         md = cc.render_markdown(self.report)
         for k in ('1', '7', '101', '102'):
             self.assertIn(f'| {k} |', md)
+        # Raw paise P&L is shown alongside the INR figure.
+        self.assertIn('net P&L (paise)', md)
+        self.assertIn('4700', md)  # merged S1 net_pnl_paise
 
     def test_overlap_calculation(self):
         hist = self.report['historical_replay']['strategies']

@@ -7,11 +7,12 @@ average net return per trade (%), average R, max drawdown, total net P&L
 after modeled charges and slippage, average holding days, exposure, trade
 overlap with the seven (by (symbol, entry date)), sample size.
 
-R definition (plan §4.4, brief §6 Q3 fallback): 1R per trade = qty x ATR(14)
-at entry, in paise; R-multiple per trade = net P&L (paise) / 1R. No pass/fail
-on R. The frozen seven have no fixed stops (indicator-based exits), so
-entry-minus-stop is not computable for them and one definition must cover
-baseline and challengers alike.
+R definition (plan §4.4, brief §6 Q3 answered by Grok, plan §9): 1R per
+trade = qty x 2 x ATR(14) at entry, in paise; R-multiple per trade = net
+P&L (paise) / 1R. No pass/fail on R. The frozen seven have no fixed stops
+(indicator-based exits), so entry-minus-stop is not computable for them
+and one definition must cover baseline and challengers alike. Raw net
+P&L in paise is shown alongside the INR figure in every row.
 
 Honesty rules (brief §4 B4):
 - Two clearly separated panels: historical replay (simulated) and forward
@@ -58,10 +59,12 @@ def _hold_days(t):
 
 
 def _r_multiple(t):
+    """R-multiple = net P&L / 1R, with 1R = qty x 2 x ATR(14) at entry
+    (Grok Q3 answer, plan §9)."""
     atr = t.get('atr14_at_entry_paise')
     if atr is None or float(atr) <= 0:
         return None
-    return float(t['net_pnl_paise']) / (int(t['qty']) * float(atr))
+    return float(t['net_pnl_paise']) / (int(t['qty']) * 2.0 * float(atr))
 
 
 def _max_drawdown_pct(trades, capital_paise):
@@ -127,6 +130,7 @@ def strategy_metrics(strategies_trades, seven_keys, window_days, capital_paise):
             'avg_r_note': None if rs else ('atr14_at_entry_not_stored' if trades else 'no_trades'),
             'max_drawdown_pct': _max_drawdown_pct(trades, capital_paise),
             'net_pnl_inr': round(net / 100, 2),
+            'net_pnl_paise': net,
             'avg_hold_days': round(sum(holds) / len(holds), 2) if holds else None,
             'exposure': round(sum(holds) / float(window_days), 4) if window_days else None,
             'overlap_with_seven': {'count': overlap,
@@ -154,7 +158,7 @@ def build_report(historical, forward, session_day):
         'generated_at_ist': datetime.now(IST).isoformat(),
         'session_day': session_day,
         'statement': 'shadow, simulated, observation only, no promotion',
-        'r_definition': '1R per trade = qty x ATR(14) at entry (paise); R-multiple = net P&L / 1R. No pass/fail on R.',
+        'r_definition': '1R per trade = qty x 2 x ATR(14) at entry (paise); R-multiple = net P&L / 1R. No pass/fail on R.',
         'min_trades_for_sample': MIN_TRADES_FOR_SAMPLE,
         'historical_replay': {'days': historical.get('window_days'),
                               'trades': sum(len(v) for v in historical['strategies'].values()),
@@ -188,18 +192,19 @@ def render_markdown(report):
         '',
         '## Per-strategy table (both panels combined)',
         '',
-        'R definition: 1R per trade = qty x ATR(14) at entry (paise); '
+        'R definition: 1R per trade = qty x 2 x ATR(14) at entry (paise); '
         'R-multiple = net P&L / 1R. No pass/fail on R.',
         'Rows with fewer than 30 trades are labelled insufficient_sample.',
         '',
-        '| strategy | trades | win rate | avg net return % | avg R | max DD % | net P&L (INR) | avg hold days | exposure | overlap with seven | sample |',
-        '|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|',
+        '| strategy | trades | win rate | avg net return % | avg R | max DD % | net P&L (INR) | net P&L (paise) | avg hold days | exposure | overlap with seven | sample |',
+        '|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|',
     ]
     for key, r in sorted(report['strategies'].items(), key=lambda kv: int(kv[0])):
         ov = r['overlap_with_seven']
         lines.append(
             f"| {key} | {r['trades']} | {_fmt(r['win_rate'])} | {_fmt(r['avg_net_return_pct'])} | "
             f"{_fmt(r['avg_r'])} | {_fmt(r['max_drawdown_pct'], 4)} | {r['net_pnl_inr']:.2f} | "
+            f"{r['net_pnl_paise']} | "
             f"{_fmt(r['avg_hold_days'], 1)} | {_fmt(r['exposure'])} | {ov['count']} ({_fmt(ov['pct'])}) | {r['sample_label']} |")
     lines += [
         '',

@@ -42,7 +42,8 @@ Per-candidate notes / fallbacks (brief §6):
   actual entry only (state-aware walk, no ghost expiries).
 - No candidate has a fixed stop (exits are indicator-based, like the frozen
   seven). initial_stop is therefore None with a note; the B4 compare report
-  uses the ATR(14)-based 1R reporting convention (plan §4.4).
+  uses the 2x ATR(14)-based 1R reporting convention (plan §4.4, Grok Q3:
+  1R = qty x 2 x ATR(14)).
 """
 import numpy as np
 import pandas as pd
@@ -136,7 +137,7 @@ def _dmi_adx(high, low, close, period=14):
 
 def atr14_at_entry(df, entry_idx):
     """ATR(14) at the entry bar (paise are applied by the caller). Used for
-    the B4 reporting 1R: 1R = qty x ATR(14) at entry."""
+    the B4 reporting 1R: 1R = qty x 2 x ATR(14) at entry."""
     atr = _atr_wilder(df['high'], df['low'], df['close'], 14)
     return float(atr.iloc[entry_idx]) if entry_idx < len(atr) else float('nan')
 
@@ -392,7 +393,7 @@ def _c105_exits(df, universe=None, entry_dates=None):
 
 _NO_STOP = {'type': 'none_indicator_exit',
             'definition': 'No fixed stop; exits are indicator-based (see exits). '
-                          'Reporting R uses the ATR(14)-based 1R convention (plan §4.4).'}
+                          'Reporting R uses the 2x ATR(14)-based 1R convention (plan §4.4, Grok Q3).'}
 
 CANDIDATE_STRATEGIES = {
     101: {
