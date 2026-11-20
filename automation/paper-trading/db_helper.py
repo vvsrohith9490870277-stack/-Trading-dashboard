@@ -45,6 +45,12 @@ class Helper:
   self.restarts.append(now)
   try:
    self.per_call({'action':'query','sql':'SELECT 1 AS ok','args':[]})  # db.mjs freeze-lock gate
+   # logs/ is excluded by .dockerignore and the Dockerfile never
+   # creates it, so in the Render image this open raised
+   # FileNotFoundError and the helper failed to start every cycle
+   # (db_helper_start_failed). Create the directory first; it is
+   # harmless when it already exists (box, tests).
+   (self.root/'logs').mkdir(parents=True,exist_ok=True)
    err=(self.root/'logs'/'db-helper.log').open('a')
    try:
     args=['node',str(self.root/'db_helper.mjs')]+([str(self.test_database)] if self.test_database else [])
