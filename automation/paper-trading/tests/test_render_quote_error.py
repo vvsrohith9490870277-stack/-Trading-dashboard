@@ -11,13 +11,18 @@ error_detail() carries the real (redacted) message alongside the
 unchanged error_code, in quote_batch_failed events and in the worker
 backoff heartbeat.
 """
+import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import audit as al
 import engine as e
+import test_engine as fixtures
 
 
 class ErrorDetailTests(unittest.TestCase):
@@ -145,6 +150,48 @@ class QuoteErrorDetailTests(unittest.TestCase):
         self.assertIn('connection reset by peer',
                       failed[0]['error_detail'])
         self.assertIn('/data/quotes', failed[0]['error_detail'])
+
+
+class WorkerBackoffErrorDetailTests(unittest.TestCase):
+    """The worker loop's backoff heartbeat (the record Grok cited:
+    status=backoff, failures=153) must carry the real error, not just
+    error_code 'RuntimeError'."""
+
+    @classmethod
+    def setUpClass(cls):
+        fixtures.PaperTests.setUpClass.__func__(cls)
+
+    @classmethod
+    def tearDownClass(cls):
+        fixtures.PaperTests.tearDownClass.__func__(cls)
+
+    setUp = fixtures.PaperTests.setUp
+
+    def test_backoff_heartbeat_carries_error_detail(self):
+        # The worker loop's failure record (the backoff heartbeat Grok
+        # cited: status=backoff, failures=153) must carry the real
+        # error, not just error_code 'RuntimeError'. The heartbeat row
+        # is overwritten by 'stopped' when the worker exits, so the
+        # durable proof is the worker_failure audit event, which the
+        # loop emits with the same error_detail.
+        import automation as a
+        err = RuntimeError('market_data_transport_failed')
+        err.detail = 'connection reset by peer while reading /data/quotes'
+        with patch.object(e, 'monitor', side_effect=err):
+            a.worker(e, self.db, sleep=lambda _: None, max_polls=1,
+                     api_factory=lambda: object())
+        rows = self.db.query(
+            "SELECT data_json FROM paper_events WHERE namespace=?"
+            " AND event_type='worker_failure' ORDER BY recorded_at DESC",
+            (e.NS,))
+        self.assertTrue(rows, 'no worker_failure event recorded')
+        data = json.loads(rows[0]['data_json'])
+        self.assertEqual(data['error_code'],
+                         'market_data_transport_failed')
+        self.assertEqual(
+            data['error_detail'],
+            'connection reset by peer while reading /data/quotes')
+        self.assertEqual(data['failures'], 1)
 
 
 if __name__ == '__main__':
