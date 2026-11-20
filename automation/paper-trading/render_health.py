@@ -329,20 +329,15 @@ def refresh_store_fields(store, namespace, mode, now=None):
                 fields['last_job_peak_rss_mb'] = p
             else:
                 reasons['last_job_peak_rss_mb'] = 'no_peak_recorded'
-            # Breakers, from the same rows (job_starts reads the stored
-            # starts list; no second query).
-            breakers = {}
-            for r in rows:
-                try:
-                    n = rj.job_starts(r)
-                except Exception:
-                    continue
-                if n >= rj.job_max_starts():
-                    breakers[r['job']] = {
-                        'starts': n,
-                        'window_min': rj.job_window_min(),
-                        'max_starts': rj.job_max_starts()}
-            fields['breakers'] = breakers
+            # Breakers, via the same public helper the scheduler uses
+            # (open_breakers), so /health and the scheduler always
+            # agree on which breakers are open. A failure here leaves
+            # only the breakers empty; the job rows above are read.
+            try:
+                fields['breakers'] = rj.open_breakers(
+                    store, namespace, today)
+            except Exception as ex:
+                reasons['breakers'] = _read_reason(ex)
         else:
             reasons['last_job'] = 'no_jobs_today'
             reasons['peak_job_rss_mb'] = 'no_jobs_today'

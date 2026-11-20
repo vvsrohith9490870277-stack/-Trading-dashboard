@@ -483,6 +483,38 @@ class HealthStoreTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_health_refresher_reports_open_breaker(self):
+        # The refresher must report the same open breakers the
+        # scheduler sees (3 starts in the window): a breaker is
+        # protective, so /health is degraded but ok:true, HTTP 200.
+        # (Regression: the first version called job_starts() with a
+        # row dict instead of (store, namespace, job, day), which
+        # raised TypeError and silently left breakers empty.)
+        import render_jobs as rj
+        store = self._store()
+        try:
+            today = self._today()
+            for _ in range(3):
+                rj.run_job(store, 'paper_render_trial_v1', 'scan', today,
+                           owner_id='render:h:1:1',
+                           runner=lambda name: {
+                               'exit_code': -9, 'stdout_tail': '',
+                               'stderr_tail': '',
+                               'killed_reason': 'memory_cap',
+                               'rss_cap_mb': 350, 'peak_rss_mb': 340})
+            sup = self._sup(store)
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertIn('scan', snap['breakers'])
+            self.assertEqual(snap['breakers']['scan']['starts'], 3)
+            self.assertEqual(snap['state'], 'degraded')
+            self.assertEqual(snap['status'], 'degraded')
+            self.assertIs(snap['ok'], True)
+            code, _payload = rh.health_response(snap)
+            self.assertEqual(code, 200)
+        finally:
+            store.close()
+
     def test_health_missing_monitor_table_leaves_only_heartbeat_null(self):
         # paper_monitor_health is a box table, not in the render
         # schema: a fresh render store has no such table. The refresher
