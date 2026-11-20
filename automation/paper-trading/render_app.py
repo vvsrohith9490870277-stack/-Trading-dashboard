@@ -268,6 +268,9 @@ class Supervisor:
         self.stopping = False
         self.store_error = None
         self._job_thread = None
+        # One-shot boot action (Task 1: quote probe) runs once per
+        # supervisor boot, on the first tick where the lease is held.
+        self._boot_actions_done = False
         self._lock = threading.Lock()
         self.last_flag = None
         self.last_snapshot = None
@@ -432,6 +435,74 @@ class Supervisor:
             target=self._run_job_sync, args=(job,), daemon=True)
         self._job_thread.start()
 
+    # -- boot-time one-shot actions (Tasks 1-2) ----------------------
+    def _run_probe_child(self):
+        """Spawn the quote-probe child and return its run_job_streaming
+        result (or raise subprocess.TimeoutExpired). Tests replace this
+        with a canned result; the default runs the real child, which
+        imports the engine in its own process and exits with it, so
+        the supervisor never pays the numpy/pandas import."""
+        cmd = [sys.executable, 'render_quote_probe.py']
+        return run_job_streaming(cmd, self._child_env(), timeout=120)
+
+    def _maybe_run_quote_probe(self):
+        """Run the one-shot quote probe (Task 1) when enabled.
+
+        Returns the recorded result, a refusal record, or None when
+        the env is unset. The result is written to paper_runtime_kv
+        (key 'quote_probe') and to the audit event
+        'render_quote_probe'; /health serves it from the refresher's
+        cache. A refusal never writes to the store. Never raises into
+        the tick."""
+        import render_boot as rb
+        if not rb.probe_enabled():
+            return None
+        ok, reason = rb.guard_ok(self.mode, self.namespace)
+        if not ok:
+            print('quote probe refused: %s' % reason, flush=True)
+            return {'status': 'refused', 'reason': reason,
+                    'symbols': list(rb.PROBE_SYMBOLS),
+                    'at': datetime.now(IST).isoformat()}
+        try:
+            res = self._run_probe_child()
+        except subprocess.TimeoutExpired:
+            result = rb.probe_failed_result(
+                'probe_timeout', 'quote probe child timed out')
+        except Exception as ex:
+            result = rb.probe_failed_result(
+                'probe_child_failed', type(ex).__name__)
+        else:
+            result = rb.probe_result_from_child(res)
+        try:
+            result['audit_ok'] = rb.emit_probe_audit(
+                self.store, self.namespace, result)
+        except Exception:
+            result['audit_ok'] = False
+        try:
+            rb.kv_put(self.store, self.namespace, rb.QUOTE_PROBE_KEY,
+                      result)
+        except Exception as ex:
+            print('quote probe kv write failed: %s' % type(ex).__name__,
+                  flush=True)
+        return result
+
+    def _run_boot_actions(self):
+        """One-shot boot action (Task 1: quote probe), once per
+        supervisor boot.
+
+        Runs on the first tick where the lease is held (so this
+        supervisor is the active runner), before the worker starts.
+        Never raises into the tick; a failure is printed (type only,
+        never a secret).
+        """
+        if getattr(self, '_boot_actions_done', False):
+            return
+        self._boot_actions_done = True
+        try:
+            self._maybe_run_quote_probe()
+        except Exception as ex:
+            print('quote probe error: %s' % type(ex).__name__, flush=True)
+
     # -- main tick ------------------------------------------------------
     def tick(self):
         self.last_tick_at = time.time()
@@ -472,6 +543,9 @@ class Supervisor:
             if not self.lease_held:
                 self.last_snapshot = self.snapshot(flag)
                 return self.last_snapshot
+        # One-shot boot action (quote probe) on the first tick where
+        # this supervisor holds the lease.
+        self._run_boot_actions()
         # worker first (the primary process), then due jobs
         self._manage_worker()
         self._manage_jobs()
@@ -587,6 +661,7 @@ class Supervisor:
             peak_job_rss_mb=fields.get('peak_job_rss_mb'),
             last_job_peak_rss_mb=fields.get('last_job_peak_rss_mb'),
             job_rss_cap_mb=job_rss_cap_mb(),
+            quote_probe=fields.get('quote_probe'),
             fyers_budget={
                 'day_used': fields.get('fyers_budget_day_used'),
                 'per_day_limit': int(

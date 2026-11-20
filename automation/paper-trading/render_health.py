@@ -217,7 +217,7 @@ _HEALTH_FIELDS = (
     'last_job', 'fyers_budget_day_used', 'trial_budget_day_used',
     'box_conflict_check', 'peak_job_rss_mb', 'last_job_peak_rss_mb',
     'breakers', 'worker_status', 'worker_consecutive_failures',
-    'worker_last_quote_ok_at')
+    'worker_last_quote_ok_at', 'quote_probe')
 
 
 def new_health_cache():
@@ -235,7 +235,7 @@ def new_health_cache():
             'peak_job_rss_mb': None, 'last_job_peak_rss_mb': None,
             'breakers': {}, 'worker_status': None,
             'worker_consecutive_failures': None,
-            'worker_last_quote_ok_at': None,
+            'worker_last_quote_ok_at': None, 'quote_probe': None,
         },
         'reasons': {k: 'not_refreshed_yet' for k in _HEALTH_FIELDS},
     }
@@ -513,6 +513,31 @@ def refresh_store_fields(store, namespace, mode, now=None):
         except Exception as ex:
             reasons['box_conflict_check'] = _read_reason(ex)
 
+    # --- one-shot quote probe (Task 1, trial only): the last probe
+    # result the supervisor recorded in paper_runtime_kv (key
+    # 'quote_probe'). Absent (never probed) is null with
+    # 'no_probe_run', never a made-up result; an unparseable row is
+    # null with 'probe_unparseable'.
+    if mode == 'trial':
+        try:
+            rows = store.execute(
+                'SELECT value FROM paper_runtime_kv'
+                ' WHERE scope=? AND key=?', (namespace, 'quote_probe'))
+            if rows:
+                try:
+                    probe = json.loads(rows[0]['value'])
+                except Exception:
+                    probe = None
+                if isinstance(probe, dict):
+                    fields['quote_probe'] = probe
+                else:
+                    reasons['quote_probe'] = 'probe_unparseable'
+            else:
+                reasons['quote_probe'] = 'no_probe_run'
+            ok_groups += 1
+        except Exception as ex:
+            reasons['quote_probe'] = _read_reason(ex)
+
     return {'ok': ok_groups > 0, 'fields': fields, 'reasons': reasons}
 
 
@@ -528,7 +553,8 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
                    box_conflict_check=None, login_allowed=None,
                    breakers=None, store_ok=None, store_age_s=None,
                    reasons=None, peak_job_rss_mb=None,
-                   last_job_peak_rss_mb=None, job_rss_cap_mb=None):
+                   last_job_peak_rss_mb=None, job_rss_cap_mb=None,
+                   quote_probe=None):
     """Build the /health payload (brief 01 Task 6.3).
 
     The first nine arguments are the original snapshot inputs and keep
@@ -660,6 +686,10 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
             else {'paper_v2_heartbeat_present': None,
                   'paper_v2_heartbeat_age_s': None,
                   'paper_v2_active_runner': None})
+        # Task 1 (one-shot quote probe): the last probe result (or
+        # None when it never ran). Trial only — the probe refuses
+        # outside trial mode, so live snapshots have no such key.
+        snap['quote_probe'] = quote_probe
     return snap
 
 

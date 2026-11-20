@@ -108,7 +108,8 @@ class HealthFieldsTests(unittest.TestCase):
         trial = self._snap(mode='trial')
         self.assertEqual(set(trial),
                          self.LIVE_KEYS | {'trial_budget',
-                                           'box_conflict_check'})
+                                           'box_conflict_check',
+                                           'quote_probe'})
         # worker subkeys (brief 6.3): state, pid, restarts_10m,
         # last_heartbeat_age_s (plus the kept rss_mb/restarts), and
         # Fix 2 (Grok box test): status, consecutive_failures,
@@ -367,6 +368,15 @@ class HealthStoreTests(unittest.TestCase):
             sup = self._sup(store)
             sup._refresh_health_store(force=True)
             snap = sup.snapshot('render')
+            # A probe ran today, so quote_probe is filled (Task 1).
+            import render_boot as rb
+            rb.kv_put(store, 'paper_render_trial_v1', 'quote_probe',
+                      {'status': 'ok', 'ltp_count': 2, 'http_status': 200,
+                       'requests': 1})
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertEqual(snap['quote_probe']['status'], 'ok')
+            self.assertEqual(snap['quote_probe']['ltp_count'], 2)
             # Worker heartbeat: seeded 12 s ago (allow drift).
             hb = snap['worker']['last_heartbeat_age_s']
             self.assertIsInstance(hb, int)
@@ -497,14 +507,55 @@ class HealthStoreTests(unittest.TestCase):
             snap = sup.snapshot('render')
             self.assertNotIn('trial_budget', snap)
             self.assertNotIn('box_conflict_check', snap)
+            self.assertNotIn('quote_probe', snap)
             self.assertEqual(snap['fyers_budget']['day_used'], 1234)
-            # Trial mode carries both.
+            # Trial mode carries all three.
             sup_t = self._sup(store, mode='trial')
             sup_t._refresh_health_store(force=True)
             snap_t = sup_t.snapshot('render')
             self.assertIn('trial_budget', snap_t)
             self.assertIn('box_conflict_check', snap_t)
+            self.assertIn('quote_probe', snap_t)
+            self.assertIsNone(snap_t['quote_probe'])
             self.assertEqual(snap_t['trial_budget']['day_used'], 57)
+        finally:
+            store.close()
+
+    def test_health_quote_probe_from_store(self):
+        # Task 1 (one-shot quote probe): the refresher reads the probe
+        # result the supervisor recorded in paper_runtime_kv and serves
+        # it as /health.quote_probe (trial only). Absent is null with a
+        # reason, never a made-up result.
+        import render_boot as rb
+        store = self._store()
+        try:
+            self._seed(store)
+            sup = self._sup(store)
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertIsNone(snap['quote_probe'])
+            self.assertEqual(snap['reasons'].get('quote_probe'),
+                             'no_probe_run')
+            probe = {'status': 'failed', 'ltp_count': 0,
+                     'http_status': 401, 'fyers_code': None,
+                     'error_code': 'token_unavailable_no_login',
+                     'error_detail': 'no login in trial mode',
+                     'duration_ms': 1200, 'requests': 1}
+            rb.kv_put(store, 'paper_render_trial_v1', 'quote_probe', probe)
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertEqual(snap['quote_probe'], probe)
+            self.assertNotIn('quote_probe', snap['reasons'])
+            # An unparseable row is null with a reason, not a crash.
+            store.execute(
+                'UPDATE paper_runtime_kv SET value=?'
+                ' WHERE scope=? AND key=?',
+                ('not json{', 'paper_render_trial_v1', 'quote_probe'))
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertIsNone(snap['quote_probe'])
+            self.assertEqual(snap['reasons'].get('quote_probe'),
+                             'probe_unparseable')
         finally:
             store.close()
 
