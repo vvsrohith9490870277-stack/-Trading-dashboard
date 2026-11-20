@@ -18,6 +18,7 @@ sys.path.insert(0, str(LIB)); sys.path.insert(0, str(HERE))
 import support_agent as sa   # noqa: E402  (library copy, not the installed runtime)
 import snapshot              # noqa: E402
 import support_finding_verify as sfv  # noqa: E402
+import support_render as srender  # noqa: E402  (read-only Render checks, A3)
 
 IST = ZoneInfo('Asia/Kolkata')
 LIVE_ROOT = Path(os.environ.get('TRACK_A_ROOT', '/workspace/paper-trading'))
@@ -114,7 +115,63 @@ def build_parser():
     ap = argparse.ArgumentParser()
     ap.add_argument('--session', required=True)
     ap.add_argument('--now', default=None, help='virtual clock end (ISO, IST); default = full session tick set ending at policy EOD')
+    ap.add_argument('--render-health-url', default=None,
+                    help='Render /health URL (default: $SUPPORT_RENDER_HEALTH_URL or https://signal-atlas-paper.onrender.com/health)')
+    ap.add_argument('--no-render', action='store_true', help='skip the read-only Render checks (A3)')
     return ap
+
+
+def run_render_check(namespace, session_day, now_ist, health_url=None, no_render=False):
+    """Read-only Render check (A3). Returns {findings, not_evaluable, info, scan_completed, eod_completed}.
+
+    Never raises: any failure to reach Render or Turso becomes a
+    not_evaluable entry so the support run itself is never blocked.
+    ``health_url`` defaults to $SUPPORT_RENDER_HEALTH_URL, then the
+    signal-atlas-paper /health URL. ``now_ist`` is a datetime.
+    """
+    info = {'expected': None, 'health_ok': None, 'mode': None}
+    empty = {'findings': [], 'not_evaluable': [], 'info': info,
+             'scan_completed': False, 'eod_completed': False}
+    if no_render:
+        return {**empty, 'not_evaluable': [{'detector': 'render_check', 'reason': 'render_check_skipped'}]}
+    url = health_url or os.environ.get('SUPPORT_RENDER_HEALTH_URL') or srender.DEFAULT_HEALTH_URL
+    try:
+        _status, health = srender.fetch_health(url)
+        try:
+            from ro_client import TursoRO
+            ro = TursoRO(timeout=30, retries=1)
+            state = srender.query_render_state(ro.query, namespace, session_day)
+        except Exception:
+            state = {'kv': None, 'lease': None, 'jobs': None,
+                     'tables_absent': True, 'schema_mismatch': False}
+        if state.get('schema_mismatch'):
+            result = {**empty, 'not_evaluable': [
+                {'detector': 'render_lease', 'reason': 'lease_schema_mismatch'}]}
+            if isinstance(health, dict):
+                result['info'] = {'expected': None, 'health_ok': health.get('ok'),
+                                  'mode': health.get('mode')}
+            return result
+        expected_session = sa.is_trading_day(session_day) and (
+            sa.parse_ist(f'{session_day}T08:45:00+05:30')
+            <= now_ist <=
+            sa.parse_ist(f'{session_day}T16:35:00+05:30'))
+        evaluated = srender.evaluate(health, state['kv'], state['lease'], state['jobs'],
+                                     now_ist, namespace, expected_session)
+        findings = [f for f in evaluated if f['severity'] != 'NOT_EVALUABLE']
+        not_evaluable = [{'detector': f['detector'], 'reason': f['details'].get('reason')}
+                         for f in evaluated if f['severity'] == 'NOT_EVALUABLE']
+        if isinstance(health, dict):
+            info = {'expected': (state['kv'] or {}).get('active_runner'),
+                    'health_ok': health.get('ok'), 'mode': health.get('mode')}
+        jobs = state['jobs'] or []
+        scan_ok = any('scan' in str(j.get('job') or '').lower()
+                      and j.get('status') == 'ok' for j in jobs)
+        eod_ok = any('eod' in str(j.get('job') or '').lower()
+                     and j.get('status') == 'ok' for j in jobs)
+        return {'findings': findings, 'not_evaluable': not_evaluable, 'info': info,
+                'scan_completed': scan_ok, 'eod_completed': eod_ok}
+    except Exception:
+        return {**empty, 'not_evaluable': [{'detector': 'render_check', 'reason': 'render_check_failed'}]}
 
 
 def main(argv=None):
@@ -141,6 +198,19 @@ def main(argv=None):
     findings_path = Path(os.environ.get('SUPPORT_FINDINGS_DB') or (STATE / 'support' / 'findings.sqlite'))
     store = sa.SupportStore(findings_path)
 
+    # A3: read-only Render check (never blocks the run on failure). Findings
+    # land in the store before the replay so they appear in the report; the
+    # scan/EOD flags let a successful Render job satisfy those expectations.
+    now_dt = sa.parse_ist(a.now) if a.now else datetime.now(IST)
+    render = run_render_check(ns, day, now_dt, health_url=a.render_health_url, no_render=a.no_render)
+    render_info = render['info']
+    render_not_evaluable = render['not_evaluable']
+    for f in render['findings']:
+        sa.append_finding(store, ns, f['detector'], f"{f['detector']}:{day}",
+                          now_dt.isoformat(), day, severity=f['severity'],
+                          status='OPEN', details=f['details'],
+                          observation_only=True, recorded_at=now_dt.isoformat())
+
     # Durable sanitized exit-selftest evidence (survives Turso --cleanup-only and log rotation).
     import support_exit_evidence as evd
     ev_rows = list(engine_events)
@@ -162,7 +232,9 @@ def main(argv=None):
     ticks = None
     if a.now:
         ticks = [a.now]
-    replay = sa.run_virtual_clock_replay(store, trading, namespace=ns, session_day=day, ticks=ticks, observation_only=True)
+    replay = sa.run_virtual_clock_replay(store, trading, namespace=ns, session_day=day, ticks=ticks, observation_only=True,
+                                         render_scan_completed=render['scan_completed'],
+                                         render_eod_completed=render['eod_completed'])
     rep = sa.session_report(store, ns, day, out_dir=out_dir, write_markdown=True)
 
     # Audit spool parity (file read only).

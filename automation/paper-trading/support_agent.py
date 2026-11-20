@@ -1169,8 +1169,14 @@ def collapse_duplicate_findings(db, namespace, session_day, recorded_at=None):
     return closed
 
 
-def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading_db=None, observation_only=True, check_policy_hygiene=False, box_metrics=None, dashboard_probe=None, recorded_at=None):
-    """Run the full Production Action Plan v3 detector suite (SEV1-SEV4 + expectation ledger + episodes)."""
+def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading_db=None, observation_only=True, check_policy_hygiene=False, box_metrics=None, dashboard_probe=None, recorded_at=None, render_scan_completed=False, render_eod_completed=False):
+    """Run the full Production Action Plan v3 detector suite (SEV1-SEV4 + expectation ledger + episodes).
+
+    ``render_scan_completed`` / ``render_eod_completed`` (A3): when Render is
+    the expected runner, the scan / EOD expectation accepts a successful
+    Render paper_job_runs row for the session day instead of a box
+    paper_events row.
+    """
     assert_support_policy_lock()
     reader = trading_db if trading_db is not None else db
     session_day = ist_session_day(session_day)
@@ -1283,7 +1289,7 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         ev for ev in events
         if ev['event_type'] == 'scan_failed' and parse_ist(ev['source_at']) <= scan_deadline
     ]
-    scan_ok = bool(premarket_scans) or bool(started_and_finished)
+    scan_ok = bool(premarket_scans) or bool(started_and_finished) or render_scan_completed
     if now_ist >= scan_deadline and (not scan_ok or (premarket_failed and not scan_ok)):
         first_at = premarket_failed[0]['source_at'] if premarket_failed else f"{session_day}T{scan_exp['expected_at']}:00+05:30"
         ep = record_episode(
@@ -1854,7 +1860,7 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         eh, em, tzinfo=IST,
     ) + timedelta(minutes=int(eod_exp['grace_minutes']))
     eod_events = [ev for ev in events if ev['event_type'] in ('eod_completed', 'eod_reconciled')]
-    if now_ist >= eod_deadline and not eod_events:
+    if now_ist >= eod_deadline and not eod_events and not render_eod_completed:
         ep = record_episode(
             db, namespace, session_day, 'eod_1615', 'eod_missed',
             eod_deadline.isoformat(), blind_seconds=float(eod_exp['grace_minutes']) * 60,
@@ -1989,7 +1995,7 @@ def build_nov9_replay_fixture(db, namespace=None):
     db.batch(stmts)
 
 
-def run_virtual_clock_replay(support_db, trading_db, namespace=None, session_day='2026-11-09', ticks=None, observation_only=True):
+def run_virtual_clock_replay(support_db, trading_db, namespace=None, session_day='2026-11-09', ticks=None, observation_only=True, render_scan_completed=False, render_eod_completed=False):
     """Run virtual-clock replay across a session day and verify zero duplicate findings on repeat ticks."""
     namespace = CFG['namespace'] if namespace is None else namespace
     session_day = ist_session_day(session_day)
@@ -2009,6 +2015,8 @@ def run_virtual_clock_replay(support_db, trading_db, namespace=None, session_day
             observation_only=observation_only,
             check_policy_hygiene=False,
             recorded_at=tick,
+            render_scan_completed=render_scan_completed,
+            render_eod_completed=render_eod_completed,
         )
     findings = current_findings(support_db, namespace, session_day)
     by_sev = {'SEV1': [], 'SEV2': [], 'SEV3': [], 'SEV4': []}
