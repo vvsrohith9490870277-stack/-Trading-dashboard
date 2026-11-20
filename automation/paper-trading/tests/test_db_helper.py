@@ -81,7 +81,26 @@ class HelperTests(unittest.TestCase):
  def test_crashed_helper_is_restarted_on_next_call(self):
   h=self.real();self.assertEqual(h.call({'action':'query','sql':'SELECT 1 AS x','args':[]}),[{'x':1}])
   first=h.proc;first.kill();first.wait()
-  self.assertEqual(h.call({'action':'query','sql':'SELECT 2 AS x','args':[]}),[{'x':2}]);self.assertEqual(h.stats['starts'],2);self.assertEqual(h.stats['restarts'],1);self.no_zombie(first)
+  self.assertEqual(h.call({'action':'query','sql':'SELECT 2 AS x','args':[]}),[{'x':2}]);self.assertEqual(h.stats['starts'],2);self.assertEqual(h.stats['restarts'],1);self.assertEqual(h.stats['planned_restarts'],0);self.no_zombie(first)
+ def test_wake_reset_is_a_planned_restart_not_a_restart(self):
+  """Box behaviour (20 Nov): WakeWatch calls reset('host_resume') after
+  every host freeze, so the helper is recycled every 15-50 min by design.
+  That must count as a planned restart, never as a restart."""
+  h=self.real();self.assertEqual(h.call({'action':'query','sql':'SELECT 1 AS x','args':[]}),[{'x':1}])
+  self.assertEqual((h.stats['starts'],h.stats['restarts'],h.stats['planned_restarts'],h.stats['resets']),(1,0,0,0))
+  h.reset('host_resume')
+  self.assertEqual(h.call({'action':'query','sql':'SELECT 2 AS x','args':[]}),[{'x':2}])
+  self.assertEqual(h.stats['starts'],2);self.assertEqual(h.stats['restarts'],0);self.assertEqual(h.stats['planned_restarts'],1);self.assertEqual(h.stats['resets'],1)
+  h.reset('host_resume')
+  self.assertEqual(h.call({'action':'query','sql':'SELECT 3 AS x','args':[]}),[{'x':3}])
+  self.assertEqual(h.stats['starts'],3);self.assertEqual(h.stats['restarts'],0);self.assertEqual(h.stats['planned_restarts'],2);self.assertEqual(h.stats['resets'],2)
+ def test_timeout_kill_is_an_unplanned_restart(self):
+  """A kill after a timeout is a real failure, not a planned recycle:
+  the next start counts as a restart."""
+  h=self.real();self.assertEqual(h.call({'action':'query','sql':'SELECT 1 AS x','args':[]}),[{'x':1}])
+  h._kill('timeout')
+  self.assertEqual(h.call({'action':'query','sql':'SELECT 2 AS x','args':[]}),[{'x':2}])
+  self.assertEqual(h.stats['starts'],2);self.assertEqual(h.stats['restarts'],1);self.assertEqual(h.stats['planned_restarts'],0)
  def test_unstartable_helper_falls_back_and_restart_budget_disables(self):
   self.calls=[]
   def per_call(a):self.calls.append(a);return [{'via':'per_call'}]

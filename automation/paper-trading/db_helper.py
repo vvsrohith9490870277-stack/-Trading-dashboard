@@ -11,6 +11,15 @@ Safety rules:
   exactly like a failed per-call write, so the caller's existing spool/backoff handling applies.
 - Every (re)start first runs one per-call query, so db.mjs's freeze-lock check still gates the session.
 - Restarts are bounded per window; past the bound the helper stays off and the per-call path serves all.
+- Restarts: a restart that follows an explicit reset() is a planned
+  recycle, not a failure. The worker's WakeWatch calls reset() after
+  every host freeze (the box VM pauses when no agent task runs), so on
+  the box the helper is recycled roughly every 15-50 min by design.
+  stats['restarts'] counts only UNPLANNED restarts (the child exited
+  on its own, or was killed after a query/batch timeout);
+  stats['planned_restarts'] counts restarts after a reset(), and
+  stats['resets'] counts reset() calls. A day with 8 resets, 8
+  planned_restarts and 0 restarts is healthy, not a crash loop.
 """
 import atexit,collections,itertools,json,subprocess,threading,time
 
@@ -28,8 +37,8 @@ class Helper:
  def __init__(self,root,test_database,cfg,per_call,log=None,popen=subprocess.Popen,sleep=time.sleep,clock=time.monotonic):
   self.root,self.test_database,self.cfg,self.per_call=root,test_database,cfg,per_call
   self.log_fn,self.popen,self.sleep,self.clock=log,popen,sleep,clock
-  self.proc=None;self.lock=threading.RLock();self.pending={};self.ids=itertools.count(1);self.restarts=collections.deque();self.disabled_until=0.0;self.closed=False
-  self.stats={'helper_requests':0,'helper_ok':0,'fallbacks':0,'starts':0,'restarts':0,'retries':0,'timeouts':0,'errors':0,'write_unconfirmed':0}
+  self.proc=None;self.lock=threading.RLock();self.pending={};self.ids=itertools.count(1);self.restarts=collections.deque();self.disabled_until=0.0;self.closed=False;self._planned_restart_pending=False
+  self.stats={'helper_requests':0,'helper_ok':0,'fallbacks':0,'starts':0,'restarts':0,'planned_restarts':0,'resets':0,'retries':0,'timeouts':0,'errors':0,'write_unconfirmed':0}
   atexit.register(self.close)
  def log(self,event,**data):
   if self.log_fn:
@@ -60,7 +69,11 @@ class Helper:
    self._roundtrip({'action':'ping'},self.cfg['start_timeout_seconds'])
   except Exception as ex:
    self.log('db_helper_start_failed',error=type(ex).__name__,code=getattr(ex,'code',None));self._kill('start_failed');return False
-  self.stats['starts']+=1;self.stats['restarts']=self.stats['starts']-1
+  self.stats['starts']+=1
+  if self.stats['starts']>1:
+   if self._planned_restart_pending:self.stats['planned_restarts']+=1
+   else:self.stats['restarts']+=1
+  self._planned_restart_pending=False
   self.log('db_helper_started',pid=self.proc.pid,starts=self.stats['starts']);return True
  def _ensure(self):
   with self.lock:
@@ -142,9 +155,10 @@ class Helper:
     if attempt==self.cfg['per_call_read_retries']:raise
     self.stats['retries']+=1;self.sleep(self.cfg['retry_backoff_seconds']*(attempt+1))
  def reset(self,reason='reset'):
-  """Kill the current child so in-flight requests fail now (reads retry, writes report unconfirmed); the next call restarts it."""
+  """Kill the current child so in-flight requests fail now (reads retry, writes report unconfirmed); the next call restarts it.
+  An explicit reset is a planned recycle (e.g. after a host freeze): the next start counts as a planned_restart, not a restart."""
   if self.alive() or self.proc is not None:
-   self.stats['resets']=self.stats.get('resets',0)+1;self.log('db_helper_reset',reason=reason);self._kill(reason)
+   self.stats['resets']+=1;self._planned_restart_pending=True;self.log('db_helper_reset',reason=reason);self._kill(reason)
  def close(self):
   with self.lock:
    self.closed=True;proc=self.proc
