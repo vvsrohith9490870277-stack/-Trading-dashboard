@@ -613,6 +613,11 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
    checklist={**stage2,'prefilter':gate,'entry_evaluated':gatepass,'input_policy':input_details[sym]}
    strategy_audit.setdefault(sym,[]).append({'strategy':strategy,'outcome':'qualified' if gatepass and bool(x.entry_condition) else 'rejected' if gatepass else 'not_evaluated','checks':stage2.get('checks',{}),'reason':'ok' if gatepass else 'NOT_EVALUATED_PREFILTER'})
    stm.append(('INSERT INTO paper_qualifier_states(namespace,bar_date,strategy,symbol,qualified,checklist_json,plan_json,scanned_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(namespace,bar_date,strategy,symbol) DO UPDATE SET qualified=excluded.qualified,checklist_json=excluded.checklist_json,plan_json=excluded.plan_json,scanned_at=excluded.scanned_at',(NS,bar,strategy,sym,int(gatepass and bool(x.entry_condition)),js(checklist),js(au.plan(sys.modules[__name__],strategy,x)),t.isoformat())))
+   # A re-run of the same bar refreshes the qualifier (above) but never reaches the signal block
+   # (watermark guard below), so a still-pending BUY's input proof would keep the first run's
+   # observed_at and the db.mjs gate would block the fill. Refresh the proof here, only while
+   # the signal is still pending and this scan re-confirmed it as qualified.
+   if gatepass and bool(x.entry_condition) and (strategy,sym,'BUY') in pending:stm.append(("INSERT INTO paper_entry_input_proofs VALUES(?,?,?,?,?) ON CONFLICT(namespace,signal_id) DO UPDATE SET observed_at=excluded.observed_at,policy_version=excluded.policy_version,bar_date=excluded.bar_date WHERE (SELECT status FROM paper_signals WHERE namespace=paper_entry_input_proofs.namespace AND id=paper_entry_input_proofs.signal_id)='pending'",(NS,stable_id(strategy,sym,bar,'BUY'),si.POLICY['version'],bar,t.isoformat())))
    checks=stage2.get('checks',{});counts=funnel[str(strategy)];counts['current_symbols']+=int(gatepass);sofar=True
    for name,passed in checks.items():
     counts['individual_pass_counts'][name]=counts['individual_pass_counts'].get(name,0)+int(passed);sofar=sofar and passed;counts['sequential_pass_counts'][name]=counts['sequential_pass_counts'].get(name,0)+int(sofar)
@@ -636,7 +641,7 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
     audit_events.append(al.event(sys.modules[__name__],'paper_order_queued',strategy=strategy,symbol=sym,signal_id=sid,bar_date=bar,side=side,reason='completed_daily_exit' if side=='SELL' else 'qualified'))
     if side=='BUY':
      stm.append(('INSERT OR IGNORE INTO paper_entry_gate_proofs VALUES(?,?,?,?,?)',(NS,sid,bar,sym,pf.POLICY['version'])))
-     stm.append(('INSERT OR IGNORE INTO paper_entry_input_proofs VALUES(?,?,?,?,?)',(NS,sid,si.POLICY['version'],bar,t.isoformat())))
+     stm.append(("INSERT INTO paper_entry_input_proofs VALUES(?,?,?,?,?) ON CONFLICT(namespace,signal_id) DO UPDATE SET observed_at=excluded.observed_at,policy_version=excluded.policy_version,bar_date=excluded.bar_date WHERE (SELECT status FROM paper_signals WHERE namespace=paper_entry_input_proofs.namespace AND id=paper_entry_input_proofs.signal_id)='pending'",(NS,sid,si.POLICY['version'],bar,t.isoformat())))
    if p and strategy==7:
     # Only completed closes on/after the actual paper entry can raise the stop.
     since=g[(g.trade_date>=datetime.fromisoformat(p['entry_at']).date().isoformat())&(g.trade_date<=bar)]

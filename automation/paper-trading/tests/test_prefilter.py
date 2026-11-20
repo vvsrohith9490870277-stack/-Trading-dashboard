@@ -1,4 +1,5 @@
 import unittest,sys,uuid
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
 import numpy as np,pandas as pd
@@ -113,3 +114,42 @@ class EntryGuardTests(unittest.TestCase):
   with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=s),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}),patch.object(e,'indicator',side_effect=indicator):
    report=e.scan(self.db,None,snapshot_only=True)
   self.assertEqual(seen,list(range(1,8)));self.assertEqual(report['signals_queued'],0);self.assertFalse(report['input_validation']['raw_rows_mutated'])
+ def _rerun_scan_frames(self):
+  # Bar D is 2026-11-06 (Friday); the signal is eligible 2026-11-09 (Monday), so a fill at
+  # fixtures.T (2026-11-09 10:00) is eligible. The two scans run at 16:00 and 17:00 on 2026-11-06.
+  s,b=frames();s['symbol']='RELIANCE-EQ'
+  return s,b
+ def _scan_at(self,s,b,when):
+  def indicator(i,g):return g.assign(entry_condition=True,exit_condition=False)
+  with patch.object(e,'now',return_value=when),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}),patch.object(e,'indicator',side_effect=indicator):
+   return e.scan(self.db,None)
+ def test_scan_rerun_same_bar_keeps_pending_buy_fillable(self):
+  s,b=self._rerun_scan_frames()
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-05'))])
+  t1=(fixtures.T-timedelta(days=3)).replace(hour=16);t2=(fixtures.T-timedelta(days=3)).replace(hour=17)
+  r1=self._scan_at(s,b,t1);self.assertEqual(r1['signals_queued'],1)
+  rows=self.db.query("SELECT * FROM paper_signals WHERE namespace=? AND status='pending'",(e.NS,));self.assertEqual(len(rows),1);sid=rows[0]['id']
+  self.assertEqual(self.db.query("SELECT observed_at FROM paper_entry_input_proofs WHERE namespace=? AND signal_id=?",(e.NS,sid))[0]['observed_at'],t1.isoformat())
+  r2=self._scan_at(s,b,t2);self.assertEqual(r2['signals_queued'],0)
+  self.seed_adv('RELIANCE-EQ',200000000)
+  signal=self.db.query("SELECT * FROM paper_signals WHERE namespace=? AND id=?",(e.NS,sid))[0]
+  # The signal is eligible on 2026-11-08 (the Muhurat special session 14:20-15:15, the next
+  # session after bar 2026-11-06), so the fill runs then, with a fresh quote inside that session.
+  tf=(fixtures.T-timedelta(days=1)).replace(hour=14,minute=30)
+  r=e.fill(self.db,signal,{'symbol':'RELIANCE-EQ','price':100,'quote_at':tf.isoformat()},tf);self.assertTrue(r['filled'],r)
+  self.assertEqual(self.db.query("SELECT observed_at FROM paper_entry_input_proofs WHERE namespace=? AND signal_id=?",(e.NS,sid))[0]['observed_at'],t2.isoformat())
+  self.assertEqual(self.db.query("SELECT scanned_at FROM paper_qualifier_states WHERE namespace=? AND symbol=? AND strategy=1 AND bar_date='2026-11-06'",(e.NS,'RELIANCE-EQ'))[0]['scanned_at'],t2.isoformat())
+  self.assertEqual(self.db.query("SELECT observed_at FROM paper_prefilter_states WHERE namespace=? AND symbol=? AND bar_date='2026-11-06'",(e.NS,'RELIANCE-EQ'))[0]['observed_at'],t2.isoformat())
+ def test_scan_rerun_does_not_rewrite_proof_of_non_pending_signal(self):
+  s,b=self._rerun_scan_frames()
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-05'))])
+  t1=(fixtures.T-timedelta(days=3)).replace(hour=16);t2=(fixtures.T-timedelta(days=3)).replace(hour=17)
+  r1=self._scan_at(s,b,t1);self.assertEqual(r1['signals_queued'],1)
+  rows=self.db.query("SELECT * FROM paper_signals WHERE namespace=? AND status='pending'",(e.NS,));self.assertEqual(len(rows),1);sid=rows[0]['id']
+  self.db.batch([("UPDATE paper_signals SET status='blocked_prefilter' WHERE namespace=? AND id=?",(e.NS,sid))])
+  r2=self._scan_at(s,b,t2);self.assertEqual(r2['signals_queued'],0)
+  self.assertEqual(self.db.query("SELECT observed_at FROM paper_entry_input_proofs WHERE namespace=? AND signal_id=?",(e.NS,sid))[0]['observed_at'],t1.isoformat())
+  # the re-run itself happened: qualifier and prefilter advanced to T2, only the proof was held back
+  self.assertEqual(self.db.query("SELECT scanned_at FROM paper_qualifier_states WHERE namespace=? AND symbol=? AND strategy=1 AND bar_date='2026-11-06'",(e.NS,'RELIANCE-EQ'))[0]['scanned_at'],t2.isoformat())
+  self.assertEqual(self.db.query("SELECT observed_at FROM paper_prefilter_states WHERE namespace=? AND symbol=? AND bar_date='2026-11-06'",(e.NS,'RELIANCE-EQ'))[0]['observed_at'],t2.isoformat())
+  self.assertEqual(self.db.query("SELECT status FROM paper_signals WHERE namespace=? AND id=?",(e.NS,sid))[0]['status'],'blocked_prefilter')
