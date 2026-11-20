@@ -714,6 +714,21 @@ def read_history(db,symbols,target):
  for i in range(0,len(symbols),25):
   sy=symbols[i:i+25];rows+=db.query('SELECT symbol,trade_date,open,high,low,close,volume FROM daily_ohlcv WHERE symbol IN ('+','.join('?'*len(sy))+') AND trade_date<=? ORDER BY symbol,trade_date',sy+[str(target)],tuples=True)['rows']
  return pd.DataFrame(rows,columns=_HISTORY_COLS)
+def _chunk_frame(raw, chunk_syms):
+ """A chunk's history restricted to the chunk's symbols (Task 1).
+
+ The DB-backed read_history already returns only the requested
+ symbols, so this is a no-op on the real path (byte-identical). It
+ makes the scan correct when the reader returns extra rows (a mock,
+ or a future reader change): without it, pass B would process every
+ symbol in the frame for every chunk and strategy_audit[sym] would
+ accumulate past the audit list bound (test_full751)."""
+ if not len(raw):
+  return raw
+ keep = set(chunk_syms)
+ return raw[raw['symbol'].isin(keep)]
+
+
 def _scan_chunk_symbols():
  """Symbols per scan chunk (env RENDER_SCAN_CHUNK_SYMBOLS, default 10:
  the largest size measured to keep the scan tree under 300 MiB)."""
@@ -782,6 +797,7 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  for i in range(0,len(syms),chunk):
   chunk_syms=syms[i:i+chunk]
   raw_c=read_history(db,chunk_syms,target)
+  raw_c=_chunk_frame(raw_c,chunk_syms)
   saw_rows=saw_rows or len(raw_c)>0
   raw_c,details_c,audit_c=si.filter_history(raw_c,benchmark)
   input_audit=_merge_input_audit(input_audit,audit_c)
@@ -826,6 +842,7 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  for i in range(0,len(syms),chunk):
   chunk_syms=syms[i:i+chunk]
   raw_c=read_history(db,chunk_syms,target)
+  raw_c=_chunk_frame(raw_c,chunk_syms)
   raw_c,details_c,_audit_c=si.filter_history(raw_c,benchmark)
   valid_c=_valid_history_mask(raw_c)
   raw_c=raw_c[valid_c].copy()

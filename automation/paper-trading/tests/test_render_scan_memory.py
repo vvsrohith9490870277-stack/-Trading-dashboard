@@ -257,6 +257,36 @@ def run_scan_golden(db):
     return report, tables, audit_seq, multi
 
 
+class ChunkFrameTests(unittest.TestCase):
+    """_chunk_frame (Task 1 fix): a chunk's history restricted to the
+    chunk's symbols. The DB reader already filters, so this is a
+    no-op on the real path (byte-identical); it makes the scan
+    correct when the reader returns extra rows (a mock, or a future
+    reader change) — without it, pass B processes every symbol in
+    the frame for every chunk and strategy_audit[sym] accumulates
+    past the audit list bound (test_full751)."""
+
+    def test_keeps_only_chunk_symbols(self):
+        import pandas as pd
+        raw = pd.DataFrame([
+            {'symbol': 'A-EQ', 'trade_date': '2026-11-09', 'open': 100.,
+             'high': 102., 'low': 99., 'close': 101., 'volume': 1000.},
+            {'symbol': 'B-EQ', 'trade_date': '2026-11-09', 'open': 100.,
+             'high': 102., 'low': 99., 'close': 101., 'volume': 1000.},
+            {'symbol': 'C-EQ', 'trade_date': '2026-11-09', 'open': 100.,
+             'high': 102., 'low': 99., 'close': 101., 'volume': 1000.}])
+        out = e._chunk_frame(raw, ['A-EQ', 'C-EQ'])
+        self.assertEqual(sorted(out['symbol'].unique()), ['A-EQ', 'C-EQ'])
+        self.assertEqual(len(out), 2)
+
+    def test_empty_frame_passes_through(self):
+        import pandas as pd
+        raw = pd.DataFrame(columns=['symbol', 'trade_date', 'open',
+                                    'high', 'low', 'close', 'volume'])
+        out = e._chunk_frame(raw, ['A-EQ'])
+        self.assertEqual(len(out), 0)
+
+
 class ScanGolden(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
