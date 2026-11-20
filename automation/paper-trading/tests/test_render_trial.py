@@ -17,6 +17,13 @@ import render_state as rs
 import render_trial as t
 
 BAR = '2026-11-18'
+# In-process init_trial calls below pass latest_completed_day=BAR: the
+# full suite freezes engine.now at 2026-11-09 (test_engine.py), so the
+# default completed-day computation would return 2026-11-08 and refuse
+# BAR. The baselined DB's own latest completed day IS BAR (the paper_v2
+# baseline and the trial bootstrap are both at BAR). The bar validation
+# still runs — a bar later than BAR is refused — and the CLI tests
+# cover refusal with the real clock.
 TRIAL_NS = 'paper_render_trial_v1'
 LIVE_NS = 'paper_v2'
 
@@ -173,7 +180,8 @@ class TrialLifecycleTests(unittest.TestCase):
         # DB, then the marker row and the watermark match are both present.
         store, db, path = self._baselined_db()
         try:
-            out = t.init_trial(store, db, TRIAL_NS, BAR)
+            out = t.init_trial(store, db, TRIAL_NS, BAR,
+                               latest_completed_day=BAR)
             self.assertEqual(out['namespace'], TRIAL_NS)
             self.assertTrue(out['bootstrapped'])
             self.assertTrue(out['watermarks_match_paper_v2'])
@@ -296,7 +304,8 @@ class TrialLifecycleTests(unittest.TestCase):
         import token_store as ts
         store, db, path = self._baselined_db()
         try:
-            t.init_trial(store, db, TRIAL_NS, BAR)
+            t.init_trial(store, db, TRIAL_NS, BAR,
+                         latest_completed_day=BAR)
             enc = ts.generate_key()
             tstore = ts.TokenStore(store, enc, {})
             tstore.put_budget({'day': '2026-11-19', 'requests': 1,
@@ -534,7 +543,8 @@ class TrialInitRealPathTests(unittest.TestCase):
     def test_trial_init_real_path_runs_bootstrap_and_matches(self):
         store, db, path = self._baselined_db()
         try:
-            out = t.init_trial(store, db, TRIAL_NS, BAR)
+            out = t.init_trial(store, db, TRIAL_NS, BAR,
+                               latest_completed_day=BAR)
             self.assertEqual(out['namespace'], TRIAL_NS)
             self.assertEqual(out['bar'], BAR)
             self.assertTrue(out['bootstrapped'])
@@ -565,7 +575,8 @@ class TrialInitRealPathTests(unittest.TestCase):
         requests.request = _record('request')
         store, db, path = self._baselined_db()
         try:
-            out = t.init_trial(store, db, TRIAL_NS, BAR)
+            out = t.init_trial(store, db, TRIAL_NS, BAR,
+                               latest_completed_day=BAR)
         finally:
             requests.get, requests.post, requests.request = (
                 orig_get, orig_post, orig_request)
@@ -596,7 +607,8 @@ class TrialInitRealPathTests(unittest.TestCase):
             before_history = conn.execute(
                 'SELECT COUNT(*) FROM daily_ohlcv').fetchone()[0]
             conn.close()
-            out = t.init_trial(store, db, TRIAL_NS, BAR)
+            out = t.init_trial(store, db, TRIAL_NS, BAR,
+                               latest_completed_day=BAR)
             self.assertTrue(out['watermarks_match_paper_v2'])
             for sql, args in seen:
                 if sql.strip().upper().startswith(
@@ -623,13 +635,28 @@ class TrialInitRealPathTests(unittest.TestCase):
         finally:
             ctl.close_baselined_db(store, path)
 
+    def test_validate_bar_refuses_bar_after_latest_completed_day(self):
+        # The fix for the frozen-clock G2 failure passes
+        # latest_completed_day explicitly; the refusal itself must
+        # still work: a bar later than the latest completed day is
+        # refused, the bar itself is accepted.
+        with self.assertRaises(t.BarRefused):
+            t.validate_bar('2026-11-19', '2026-11-18')
+        with self.assertRaises(t.BarRefused):
+            t.validate_bar('2026-12-31', '2026-11-18')
+        self.assertEqual(
+            t.validate_bar('2026-11-18', '2026-11-18').isoformat(),
+            '2026-11-18')
+
     def test_trial_init_idempotent_real_path(self):
         store, db, path = self._baselined_db()
         try:
-            first = t.init_trial(store, db, TRIAL_NS, BAR)
+            first = t.init_trial(store, db, TRIAL_NS, BAR,
+                                 latest_completed_day=BAR)
             self.assertTrue(first['bootstrapped'])
             self.assertFalse(first['already_bootstrapped'])
-            second = t.init_trial(store, db, TRIAL_NS, BAR)
+            second = t.init_trial(store, db, TRIAL_NS, BAR,
+                                  latest_completed_day=BAR)
             self.assertFalse(second['bootstrapped'])
             self.assertTrue(second['already_bootstrapped'])
             # the second run still runs the watermark comparison
