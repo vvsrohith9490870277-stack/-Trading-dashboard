@@ -24,9 +24,12 @@ computed from bars up to and including the current close, exactly like the
 frozen strategies.
 
 Per-candidate notes / fallbacks (brief §6):
-- C101 criterion 8 (RS rank >= 70) has no feed: the challenger implements
-  criteria 1-7 and records criterion 8 as not_evaluable
-  (rs_rank_unavailable); it is flagged "partial template (7/8)".
+- C101 criterion 8 (RS rank >= 70) is derived_rs_rank (in-universe),
+  NOT IBD's rating (Grok Q2 answer, plan §9): percentile (0-100) of each
+  stock's 252-session return within the eligible universe on the same bar,
+  computed from the bars already held. Missing history -> criterion 8 is
+  not_evaluable (rs_rank_unavailable) for that stock only. Full 8-criterion
+  template; no partial_template flag.
 - C104 entry is +DI crossing above -DI AND ADX(14) > 25 (plan exact text).
   Wilder's extreme-point rule (enter only when price passes the crossover
   bar's high) is NOT applied — the daily-close harness enters at the close.
@@ -137,11 +140,30 @@ def atr14_at_entry(df, entry_idx):
     return float(atr.iloc[entry_idx]) if entry_idx < len(atr) else float('nan')
 
 
+def _derived_rs_rank(universe):
+    """derived_rs_rank (in-universe): percentile (0-100) of each stock's
+    252-session return within the universe on the same bar (Grok Q2 answer,
+    plan §9). NOT IBD's rating: it is computed from the bars already held
+    (close / close.shift(252) - 1, ranked across the universe that day).
+    Returns a frame indexed by trade_date with one column per symbol, or
+    None when the universe is missing or shorter than 253 sessions. A stock
+    with missing history gets NaN (criterion 8 not_evaluable,
+    rs_rank_unavailable, for that stock only). Point-in-time safe: the rank
+    at a date uses only closes up to that date."""
+    if universe is None:
+        return None
+    closes = _universe_closes(universe)
+    if closes is None or len(closes) < 253:
+        return None
+    ret252 = closes / closes.shift(252) - 1.0
+    return ret252.rank(axis=1, ascending=True, pct=True, method='min') * 100.0
+
+
 # ---------------------------------------------------------------------------
 # C101 — Minervini Trend Template + breakout (Minervini 2013)
 # ---------------------------------------------------------------------------
 
-def _c101_entries(df):
+def _c101_entries(df, universe=None):
     g = df.copy()
     c = g['close'].astype(float)
     h = g['high'].astype(float)
@@ -151,7 +173,18 @@ def _c101_entries(df):
     g['sma200'] = _sma(c, 200)
     g['high252'] = h.rolling(252).max()
     g['low252'] = l.rolling(252).min()
-    # Criteria 1-7 (criterion 8, RS rank >= 70, is not_evaluable: no feed).
+    # Criterion 8: derived_rs_rank (in-universe), NOT IBD's rating.
+    # NaN when the stock's history is missing -> criterion 8 not_evaluable
+    # (rs_rank_unavailable) for that stock only; the comparison below is
+    # False for NaN, so no entry fires without a computable rank.
+    rank_frame = _derived_rs_rank(universe)
+    sym = str(df['symbol'].iloc[0]) if 'symbol' in df.columns and len(df) else None
+    if rank_frame is not None and sym in rank_frame.columns:
+        g['derived_rs_rank'] = rank_frame[sym].reindex(
+            g['trade_date'].astype(str)).to_numpy()
+    else:
+        g['derived_rs_rank'] = np.nan
+    # Criteria 1-8 (all must hold at the close).
     g['entry_condition'] = (
         (c > g['sma150']) & (c > g['sma200'])                      # 1
         & (g['sma150'] > g['sma200'])                              # 2
@@ -160,6 +193,7 @@ def _c101_entries(df):
         & (c > g['sma50'])                                         # 5
         & (c >= 1.30 * g['low252'])                                # 6
         & (c >= 0.75 * g['high252'])                               # 7
+        & (g['derived_rs_rank'] >= 70)                             # 8
     ).fillna(False)
     return g
 
@@ -346,11 +380,15 @@ CANDIDATE_STRATEGIES = {
         'source': 'Minervini, Trade Like a Stock Market Wizard (McGraw-Hill, 2013), Trend Template (8 criteria)',
         'tier': 'trend', 'warm_start_days': 252,
         'params': {'sma_fast': 50, 'sma_mid': 150, 'sma_slow': 200, 'sma200_trend_lookback': 20,
-                   'above_52w_low_pct': 30, 'within_52w_high_pct': 25, 'breakout_lookback': 20},
+                   'above_52w_low_pct': 30, 'within_52w_high_pct': 25, 'breakout_lookback': 20,
+                   'rs_rank_min': 70},
         'entries': _c101_entries, 'exits': _c101_exits, 'initial_stop': _NO_STOP,
-        'partial_template': True,
-        'not_evaluable': {'criterion_8_rs_rank_ge_70': 'rs_rank_unavailable'},
-        'notes': 'Partial template (7/8): criterion 8 (RS rank >= 70) has no feed.',
+        'rs_rank_label': 'derived_rs_rank (in-universe)',
+        'notes': 'Full 8-criterion template. Criterion 8 uses derived_rs_rank '
+                 '(in-universe), NOT IBD\'s rating: percentile (0-100) of the '
+                 '252-session return within the eligible universe on the same '
+                 'bar; missing history -> criterion 8 not_evaluable '
+                 '(rs_rank_unavailable) for that stock only.',
     },
     102: {
         'id': 102, 'name': 'Connors RSI(2) in uptrend',
@@ -398,8 +436,9 @@ def candidate_signals(strategy, df, universe=None, entry_dates=None):
 
     Returns df with entry_condition / exit_condition (same convention as
     evaluate_parameterized_strategy). universe (multi-symbol bars frame) is
-    required for 105; entry_dates (entry fill dates for this symbol) enables
-    the 105 hold-expiry exit. Signals use only completed bars (no lookahead).
+    required for 101 (derived_rs_rank) and 105 (cross-sectional rank);
+    entry_dates (entry fill dates for this symbol) enables the 105
+    hold-expiry exit. Signals use only completed bars (no lookahead).
     """
     s = int(strategy)
     if s not in CANDIDATE_STRATEGIES:
@@ -408,12 +447,17 @@ def candidate_signals(strategy, df, universe=None, entry_dates=None):
     if s == 105:
         en = c['entries'](df, universe)
         ex = c['exits'](df, universe, entry_dates)
+    elif s == 101:
+        en = c['entries'](df, universe)
+        ex = c['exits'](df)
     else:
         en = c['entries'](df)
         ex = c['exits'](df)
     out = df.copy()
     out['entry_condition'] = en['entry_condition'].fillna(False).astype(bool)
     out['exit_condition'] = ex['exit_condition'].fillna(False).astype(bool)
+    if 'derived_rs_rank' in en.columns:
+        out['derived_rs_rank'] = en['derived_rs_rank']
     return out
 
 

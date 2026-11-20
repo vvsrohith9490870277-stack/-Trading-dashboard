@@ -64,17 +64,18 @@ def _check_namespace(namespace):
 
 def make_evaluator(strategy, stock_df):
     """signal_evaluator for simulate_track_window: registry signals for one
-    candidate. For 105 the full universe panel is captured so ranks are
-    computed point-in-time (bars up to each signal date only)."""
+    candidate. For 101 (derived_rs_rank) and 105 (cross-sectional rank) the
+    full universe panel is captured so ranks are computed point-in-time
+    (bars up to each signal date only)."""
     s = int(strategy)
-    if s == 105:
-        # Precompute 105 signals once on the full panel (the registry's rank
-        # at each date uses only closes up to that date, so this is PIT-safe).
+    if s in (101, 105):
+        # Precompute 101/105 signals once on the full panel (each rank at a
+        # date uses only closes up to that date, so this is PIT-safe).
         # Corp-action back-adjustment is not applied to the rank panel; the
         # simulator's adj_hist is used only for the fill prices.
         precomputed = {}
         for sym, sdf in stock_df.groupby('symbol'):
-            precomputed[str(sym)] = ac.candidate_signals(105, sdf.reset_index(drop=True), universe=stock_df)
+            precomputed[str(sym)] = ac.candidate_signals(s, sdf.reset_index(drop=True), universe=stock_df)
 
         def evaluator(_s, adj_hist):
             sym = str(adj_hist['symbol'].iloc[0])

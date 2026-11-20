@@ -176,25 +176,92 @@ def _c105_universe(n_days=400):
     return pd.DataFrame(rows)
 
 
+def _c101_universe():
+    """5-symbol universe for C101: SYN-EQ (the _c101_closes series) has the
+    best 252-session return, so its derived_rs_rank is 100 at idx 252; the
+    four siblings grow slower, giving ranks 80/60/40/20 at idx 252."""
+    import pandas as pd
+    series = {'SYN-EQ': _c101_closes()}
+    for k, r in enumerate((0.002, 0.001, 0.0005, 0.0)):
+        px, cl = 1000.0, []
+        for i in range(300):
+            px *= (1 + r)
+            cl.append(round(px, 2))
+        series[f'SIB{k + 1}-EQ'] = cl
+    frames = [_bars(cl, symbol=sym) for sym, cl in series.items()]
+    return frames[0], pd.concat(frames, ignore_index=True)
+
+
 class CandidateSignalTests(unittest.TestCase):
     def test_c101_trend_template_entry_exit(self):
-        df = _bars(_c101_closes())
-        out = ac.candidate_signals(101, df)
-        self.assertEqual(_edge_dates(out, 'entry_condition'), ['2024-12-17'])
+        df, uni = _c101_universe()
+        out = ac.candidate_signals(101, df, universe=uni)
+        # Rank first computable at idx 252 (2024-12-18): criteria 1-7 hold
+        # from idx 251, but criterion 8 (rs_rank >= 70) needs the 252-session
+        # return, so the first entry edge is one session later than the 7/8
+        # template's 2024-12-17.
+        self.assertEqual(_edge_dates(out, 'entry_condition'), ['2024-12-18'])
         self.assertEqual(_edge_dates(out, 'exit_condition'), ['2025-01-02'])
-        # Independent check of the 7 computable criteria on the entry day.
-        en = ac.CANDIDATE_STRATEGIES[101]['entries'](df)
-        row = en.iloc[251]
+        # Independent check of the 8 criteria on the entry day.
+        en = ac.CANDIDATE_STRATEGIES[101]['entries'](df, universe=uni)
+        row = en.iloc[252]
         self.assertGreater(row['close'], row['sma50'])
         self.assertGreater(row['sma50'], row['sma150'])
         self.assertGreater(row['sma150'], row['sma200'])
-        self.assertGreater(row['sma200'], en.iloc[231]['sma200'])
+        self.assertGreater(row['sma200'], en.iloc[232]['sma200'])
         self.assertGreaterEqual(row['close'], 1.30 * row['low252'])
         self.assertGreaterEqual(row['close'], 0.75 * row['high252'])
-        # Criterion 8 (RS rank >= 70) is not_evaluable — partial template (7/8).
-        self.assertTrue(ac.CANDIDATE_STRATEGIES[101]['partial_template'])
-        self.assertEqual(ac.CANDIDATE_STRATEGIES[101]['not_evaluable'],
-                         {'criterion_8_rs_rank_ge_70': 'rs_rank_unavailable'})
+        # Criterion 8: derived_rs_rank (in-universe) is 100 on the entry day.
+        self.assertEqual(row['derived_rs_rank'], 100.0)
+        self.assertGreaterEqual(row['derived_rs_rank'],
+                                ac.CANDIDATE_STRATEGIES[101]['params']['rs_rank_min'])
+        # Full 8-criterion template: no partial_template / not_evaluable keys.
+        self.assertNotIn('partial_template', ac.CANDIDATE_STRATEGIES[101])
+        self.assertNotIn('not_evaluable', ac.CANDIDATE_STRATEGIES[101])
+
+    def test_c101_rs_rank_percentiles_at_idx_252(self):
+        # Percentile (0-100) of each stock's 252-session return within the
+        # universe on the same bar: best -> 100, then 80/60/40/20.
+        _, uni = _c101_universe()
+        expected = {'SYN-EQ': 100.0, 'SIB1-EQ': 80.0, 'SIB2-EQ': 60.0,
+                    'SIB3-EQ': 40.0, 'SIB4-EQ': 20.0}
+        for sym, rank in expected.items():
+            sdf = uni[uni['symbol'] == sym].reset_index(drop=True)
+            en = ac.CANDIDATE_STRATEGIES[101]['entries'](sdf, universe=uni)
+            self.assertEqual(en.iloc[252]['derived_rs_rank'], rank, sym)
+            # Rank is NaN before idx 252 (no 252-session return yet).
+            self.assertTrue(en['derived_rs_rank'].iloc[:252].isna().all(), sym)
+
+    def test_c101_rs_rank_short_history_all_nan(self):
+        # A stock with only 100 bars has no 252-session return: its rank is
+        # all-NaN (criterion 8 not_evaluable, rs_rank_unavailable, for that
+        # stock only) and it never enters; its siblings are unaffected.
+        df, uni = _c101_universe()
+        short = _bars(_c101_closes()[:100], symbol='SHORT-EQ')
+        import pandas as pd
+        uni2 = pd.concat([uni, short], ignore_index=True)
+        out_short = ac.candidate_signals(101, short, universe=uni2)
+        self.assertTrue(out_short['derived_rs_rank'].isna().all())
+        self.assertEqual(int(out_short['entry_condition'].sum()), 0)
+        # Siblings keep their idx-252 ranks with the short symbol present.
+        sdf = uni[uni['symbol'] == 'SYN-EQ'].reset_index(drop=True)
+        en = ac.CANDIDATE_STRATEGIES[101]['entries'](sdf, universe=uni2)
+        self.assertEqual(en.iloc[252]['derived_rs_rank'], 100.0)
+
+    def test_c101_rs_rank_label_not_ibd(self):
+        # The rank is labelled "derived_rs_rank (in-universe)", NOT IBD's
+        # rating: it is computed from the bars already held.
+        c101 = ac.CANDIDATE_STRATEGIES[101]
+        self.assertEqual(c101['rs_rank_label'], 'derived_rs_rank (in-universe)')
+        self.assertIn('derived_rs_rank (in-universe)', c101['notes'])
+        self.assertIn('NOT IBD', c101['notes'])
+        self.assertEqual(c101['params']['rs_rank_min'], 70)
+        # Without a universe there is no rank at all: criterion 8 is
+        # not_evaluable for that stock, so no entry fires.
+        df = _bars(_c101_closes())
+        out = ac.candidate_signals(101, df)
+        self.assertTrue(out['derived_rs_rank'].isna().all())
+        self.assertEqual(int(out['entry_condition'].sum()), 0)
 
     def test_c102_connors_rsi2_entry_exit(self):
         df = _bars(_c102_closes())
@@ -247,8 +314,7 @@ class CandidateSignalTests(unittest.TestCase):
 
     def test_no_lookahead(self):
         # Truncating future bars must not change past signals.
-        cases = [(101, _bars(_c101_closes()), 280, None),
-                 (102, _bars(_c102_closes()), 210, None),
+        cases = [(102, _bars(_c102_closes()), 210, None),
                  (103, _bars(_c103_closes()), 140, None),
                  (104, _bars(_c104_closes()), 100, None)]
         for s, df, cut, _ in cases:
@@ -257,6 +323,21 @@ class CandidateSignalTests(unittest.TestCase):
             for col in ('entry_condition', 'exit_condition'):
                 self.assertTrue((full[col].iloc[:cut].to_numpy() == trunc[col].to_numpy()).all(),
                                 f'candidate {s}: {col} changes when future bars are removed')
+        # C101 needs its universe for the rank; truncating both the symbol
+        # bars and the universe must not change past signals.
+        df101, uni101 = _c101_universe()
+        cut = 280
+        cut_date = df101['trade_date'].iloc[cut - 1]
+        uni_trunc = uni101[uni101['trade_date'] <= cut_date]
+        full = ac.candidate_signals(101, df101, universe=uni101)
+        trunc = ac.candidate_signals(101, df101.iloc[:cut], universe=uni_trunc)
+        for col in ('entry_condition', 'exit_condition'):
+            self.assertTrue((full[col].iloc[:cut].to_numpy() == trunc[col].to_numpy()).all(),
+                            f'candidate 101: {col} changes when future bars are removed')
+        import numpy as np
+        self.assertTrue(np.array_equal(full['derived_rs_rank'].iloc[:cut].to_numpy(),
+                                       trunc['derived_rs_rank'].to_numpy(), equal_nan=True),
+                        'candidate 101: derived_rs_rank changes when future bars are removed')
         uni = _c105_universe()
         win = uni[uni['symbol'] == 'WIN-EQ'].reset_index(drop=True)
         full = ac.candidate_signals(105, win, universe=uni)
