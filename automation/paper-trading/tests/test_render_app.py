@@ -366,3 +366,34 @@ class SupervisorTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class WorkerWindowTests(unittest.TestCase):
+    """Senior fix 20 Nov: the worker starts only in the session window."""
+
+    def _sup(self):
+        import render_app as ra
+        sup = ra.Supervisor.__new__(ra.Supervisor)
+        sup.config = {'calendar_valid_from': '2026-01-01',
+                      'calendar_valid_through': '2026-12-31',
+                      'regular_session': ['09:15', '15:30'],
+                      'holidays': [], 'special_sessions': {}}
+        return sup
+
+    def test_worker_window(self):
+        import os
+        from datetime import datetime
+        import render_app as ra
+        old = os.environ.pop('PAPER_FAKE_WORKER', None)
+        try:
+            sup = self._sup()
+            d = lambda h, m: datetime(2026, 11, 20, h, m, tzinfo=ra.IST)
+            self.assertFalse(sup._worker_window_open(d(7, 40)))
+            self.assertTrue(sup._worker_window_open(d(9, 13)))
+            self.assertTrue(sup._worker_window_open(d(12, 0)))
+            self.assertFalse(sup._worker_window_open(d(15, 30)))
+            self.assertFalse(sup._worker_window_open(
+                datetime(2026, 11, 21, 10, 0, tzinfo=ra.IST)))  # Saturday
+        finally:
+            if old is not None:
+                os.environ['PAPER_FAKE_WORKER'] = old

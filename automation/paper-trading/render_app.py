@@ -18,7 +18,7 @@ import subprocess
 import sys
 import threading
 import time
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -97,8 +97,7 @@ class Worker:
 
     def start(self):
         self.proc = subprocess.Popen(
-            self.cmd, env=self.env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self.cmd, env=self.env)  # inherit stdout/stderr: Render captures them
         self.state = 'running'
         self.next_start = 0.0
 
@@ -192,7 +191,28 @@ class Supervisor:
         env['RENDER_OWNER_ID'] = self.owner_id
         return env
 
+    def _worker_window_open(self, now=None):
+        """True from 2 minutes before the session open to the close.
+        Outside it the worker is not started (and is stopped if running);
+        engine.worker exits outside the session, so starting it there only
+        burns the crash-restart budget."""
+        if os.environ.get('PAPER_FAKE_WORKER') == '1':
+            return True
+        now = now or datetime.now(IST)
+        window = session_window(self.config, now.date())
+        if not window:
+            return False
+        moment = now.time()
+        start = (datetime.combine(now.date(), window[0])
+                 - timedelta(minutes=2)).time()
+        return start <= moment < window[1]
+
     def _manage_worker(self):
+        if not self._worker_window_open():
+            if self.worker is not None:
+                self.worker.stop()
+                self.worker = None
+            return
         if self.worker is None:
             self.worker = Worker(self._worker_cmd(), self._child_env())
             self.worker.start()
