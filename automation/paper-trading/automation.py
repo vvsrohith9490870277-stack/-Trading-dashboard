@@ -627,10 +627,10 @@ def worker(e,db,sleep=time.sleep,max_polls=None,api_factory=None):
       reason=al.classified_error(ex);failures+=1;polls+=1
       try:e.log('monitor_check',status='failed',error_code=reason,failures=failures)
       except Exception:pass
-      al.emit(e,db,'worker_failure',outcome='failed',severity='ERROR',error_code=reason,failures=failures)
-      try:al.emit(e,db,'monitor_check',outcome='failed',severity='WARN',error_code=reason,failures=failures,poll_seconds=delay)
+      al.emit(e,db,'worker_failure',outcome='failed',severity='ERROR',error_code=reason,error_detail=al.error_detail(ex),failures=failures)
+      try:al.emit(e,db,'monitor_check',outcome='failed',severity='WARN',error_code=reason,error_detail=al.error_detail(ex),failures=failures,poll_seconds=delay)
       except Exception:pass
-      heartbeat(e,db,'backoff',error=reason,failures=failures)
+      heartbeat(e,db,'backoff',error=reason,error_detail=al.error_detail(ex),failures=failures)
       if 'auth' in reason.lower() or 'token_refresh' in reason.lower():paused=True;heartbeat(e,db,'paused_auth',error=reason);return {'status':'paused_auth','polls':polls}
       backoff_max=int(e.CFG.get('worker_backoff_max_seconds',30))
       if 'rate_limit' in reason:

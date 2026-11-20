@@ -332,16 +332,16 @@ class MarketData:
     import token_store as ts
     result=fa.refresh_token(self.env)
     ts.open_token_store().put_token(result)
-   except Exception:
-    _circuit_set(True);raise RuntimeError('token_refresh_failed') from None
+   except Exception as ex:
+    _circuit_set(True);err=RuntimeError('token_refresh_failed');err.detail=al.error_detail(ex);raise err from None
    self.env=load_env();_circuit_set(False);log('auth_refresh',success=True);return
   circuit=auth_circuit_path()
   src=(LEGACY/'fyers_auth.py').read_text().replace('for url, payload in otp_urls:','for url, payload in otp_urls[:1]:').replace('for label, ident in (("b64", pin_b64), ("sha256", pin_sha), ("raw", pin)):', 'for label, ident in (("b64", pin_b64),):')
   ns={'__file__':str(LEGACY/'fyers_auth.py'),'__name__':'paper_authorized_refresh'};exec(compile(src,str(LEGACY/'fyers_auth.py'),'exec'),ns)
   try:
    with contextlib.redirect_stdout(io.StringIO()),contextlib.redirect_stderr(io.StringIO()):code=ns['main']()
-  except Exception:
-   circuit.write_text(js({'open':True,'at':now().isoformat()}));raise RuntimeError('token_refresh_failed') from None
+  except Exception as ex:
+   circuit.write_text(js({'open':True,'at':now().isoformat()}));err=RuntimeError('token_refresh_failed');err.detail=al.error_detail(ex);raise err from None
   if code:
    circuit.write_text(js({'open':True,'at':now().isoformat()}));raise RuntimeError('token_refresh_failed')
   self.env=load_env();circuit.write_text(js({'open':False,'at':now().isoformat()}));log('auth_refresh',success=True)
@@ -356,8 +356,14 @@ class MarketData:
    if wait>0:time.sleep(wait)
    self.last=time.monotonic()
    try:r=requests.get(AUTH_ROUTES[route],params=params,headers={'Authorization':self.env['FYERS_APP_ID']+':'+self.env['FYERS_ACCESS_TOKEN']},timeout=MD['request_timeout_seconds']);d=r.json()
-   except Exception:
-    self.budget.record(route);raise RuntimeError('market_data_transport_failed') from None
+   except Exception as ex:
+    # The transport error is the diagnosis (connection refused,
+    # timeout, DNS, proxy 502...). Keep the allowlisted error_code
+    # ('market_data_transport_failed') but attach the real, redacted
+    # message so quote_batch_failed can record it — previously the
+    # `from None` re-raise discarded it and classified_error could
+    # only report the bare type name 'RuntimeError'.
+    self.budget.record(route);err=RuntimeError('market_data_transport_failed');err.detail=al.error_detail(ex);raise err from None
    self.budget.record(route)
    if r.status_code in (401,403) or d.get('code') in (-8,-15,-16,-17):
     self.refresh();continue
@@ -390,9 +396,9 @@ class MarketData:
       sym=q.get('symbol')
       if sym:out[sym]=q
    except RuntimeError as ex:
-    al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
+    al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),error_detail=al.error_detail(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
    except Exception as ex:
-    al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
+    al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),error_detail=al.error_detail(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
    al.note('quote_batch_response',batch_id=batch_id,request_started_at=batch_at,response_received_at=observed,duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(symbols),fyers_budget=(self.budget.snapshot() if hasattr(self,'budget') else None))
   depth_when=set(MD.get('depth_when') or [])
   need_depth=[]
@@ -410,9 +416,9 @@ class MarketData:
     except RuntimeError as ex:
      if str(ex).startswith('market_data_error_'):
       al.note('quote_symbol_failed',outcome='failed',severity='WARN',symbol=sym,error_code=str(ex));out[sym]={'symbol':sym,'price':None,'quote_at':None,'provider_status':'error','source':'FYERS_DEPTH_LTT'};continue
-     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
+     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),error_detail=al.error_detail(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
     except Exception as ex:
-     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
+     al.note('quote_batch_failed',outcome='failed',severity='ERROR',error_code=al.classified_error(ex),error_detail=al.error_detail(ex),duration_ms=round((time.monotonic()-clock)*1000));raise
     dq=depth_quote(sym,d);base=out.get(sym) or {};base.update({k:dq[k] for k in dq if dq.get(k) is not None or k not in base});out[sym]=base
    al.note('quote_batch_response',batch_id=depth_id,request_started_at=depth_at,response_received_at=now(),duration_ms=round((time.monotonic()-clock)*1000),symbols_count=len(need_depth),fyers_budget=(self.budget.snapshot() if hasattr(self,'budget') else None))
   for sym in symbols:out.setdefault(sym,{'symbol':sym,'price':None,'quote_at':None,'provider_status':'missing','source':'FYERS_QUOTES'})
