@@ -303,9 +303,29 @@ class CandidateSignalTests(unittest.TestCase):
         uni = _c105_universe()
         win = uni[uni['symbol'] == 'WIN-EQ'].reset_index(drop=True)
         out_w = ac.candidate_signals(105, win, universe=uni)
-        self.assertEqual(_edge_dates(out_w, 'entry_condition'), ['2024-12-18'])
-        # Hold expiry (63 sessions after entry) and the rank exit both fire.
-        self.assertEqual(_edge_dates(out_w, 'exit_condition'), ['2025-03-17', '2025-05-21'])
+        # Monthly rebalances, state-aware walk: enter only when not holding.
+        # 2025-01-01 is the first rebalance after the rank becomes known
+        # (2024-12-18); re-entry at 2025-04-01, the next rebalance after the
+        # first position's expiry.
+        self.assertEqual(_edge_dates(out_w, 'entry_condition'), ['2025-01-01', '2025-04-01'])
+        # 2025-03-31 is exactly entry+63 sessions after the 2025-01-01 entry;
+        # 2025-06-02 is the first rebalance after the rank left the top 30%
+        # (2025-05-21), before the second entry's 2025-06-27 expiry.
+        self.assertEqual(_edge_dates(out_w, 'exit_condition'), ['2025-03-31', '2025-06-02'])
+        # Invariants: every entry fires at a rebalance; every exit is either
+        # a rebalance (rank exit) or an entry+63 expiry from an actual entry.
+        # No ghost expiry: the 2025-05-01 expiry from the never-opened
+        # 2025-02-03 edge (monthly gating without state) is gone.
+        dates = win['trade_date'].astype(str).tolist()
+        reb = {dates[i] for i in range(len(dates))
+               if i == 0 or dates[i][:7] != dates[i - 1][:7]}
+        entry_true = [dates[i] for i in range(len(dates)) if out_w['entry_condition'].iloc[i]]
+        self.assertTrue(all(d in reb for d in entry_true))
+        expiries = {dates[i + 63] for i in (dates.index(d) for d in entry_true)
+                    if i + 63 < len(dates)}
+        exit_true = [dates[i] for i in range(len(dates)) if out_w['exit_condition'].iloc[i]]
+        self.assertTrue(all(d in reb or d in expiries for d in exit_true))
+        self.assertNotIn('2025-05-01', exit_true)
         flat = uni[uni['symbol'] == 'FLAT1-EQ'].reset_index(drop=True)
         self.assertEqual(int(ac.candidate_signals(105, flat, universe=uni)['entry_condition'].sum()), 0)
         # Flagged as adapted, not the paper's exact rule, everywhere.

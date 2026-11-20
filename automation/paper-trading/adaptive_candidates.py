@@ -36,9 +36,10 @@ Per-candidate notes / fallbacks (brief §6):
 - C105 is an ADAPTATION of Jegadeesh & Titman (1993), whose rule is
   cross-sectional (rank all stocks, buy the top decile). The single-name
   version ranks the Track A universe by 12-1 return; it is flagged
-  "adapted, not the paper's exact rule" everywhere. Rank is evaluated daily
-  (the paper rebalances monthly); the 63-session hold expiry and the
-  top-30% rank exit are applied as specified.
+  "adapted, not the paper's exact rule" everywhere. Rank is evaluated at
+  monthly rebalances (first session of each month); the 63-session hold
+  expiry and the top-30% rank exit are applied as specified, from the
+  actual entry only (state-aware walk, no ghost expiries).
 - No candidate has a fixed stop (exits are indicator-based, like the frozen
   seven). initial_stop is therefore None with a note; the B4 compare report
   uses the ATR(14)-based 1R reporting convention (plan §4.4).
@@ -319,49 +320,68 @@ def _rank_frame(closes):
     return rank, n
 
 
+def _c105_walk(df, universe=None):
+    """State-aware monthly-rebalance walk for C105 (Grok Q4 answer, plan §9).
+
+    Walks sessions in order; at a rebalance (first session of a calendar
+    month): if not holding and in the top decile -> enter; if holding and
+    out of the top 30% -> exit at that rebalance. If holding and the
+    session is entry+63 -> exit (exact expiry, from the ACTUAL entry only).
+    Expiries are therefore never generated from entry edges that never
+    opened a position (no ghost expiries). Exits are applied before entries
+    on the same bar, so a same-bar expiry + re-entry at one rebalance
+    closes then re-opens (the sim processes exits before entries on the
+    same bar). Returns (entry_condition, exit_condition) boolean Series.
+    """
+    entry = pd.Series(False, index=df.index)
+    exit_cond = pd.Series(False, index=df.index)
+    dates = df['trade_date'].astype(str).tolist()
+    n = len(df)
+    sym = str(df['symbol'].iloc[0]) if 'symbol' in df.columns and len(df) else None
+    if universe is None or sym is None:
+        return entry, exit_cond
+    closes = _universe_closes(universe)
+    rank, cnt = _rank_frame(closes)
+    if rank is None or sym not in rank.columns:
+        return entry, exit_cond
+    r = rank[sym].reindex(dates)
+    nn = cnt.reindex(dates)
+    top = (r <= np.maximum(1, np.ceil(0.10 * nn)))
+    top30 = (r <= np.maximum(1, np.ceil(0.30 * nn)))
+    holding = False
+    entry_idx = None
+    for i in range(n):
+        # Exact 63-session hold expiry, from the actual entry only.
+        if holding and entry_idx is not None and i == entry_idx + 63:
+            exit_cond.iloc[i] = True
+            holding = False
+            entry_idx = None
+        # Monthly rebalance: first session of a calendar month.
+        if i == 0 or dates[i][:7] != dates[i - 1][:7]:
+            if holding and r.notna().iloc[i] and not bool(top30.iloc[i]):
+                exit_cond.iloc[i] = True
+                holding = False
+                entry_idx = None
+            if not holding and bool(top.iloc[i]):
+                entry.iloc[i] = True
+                holding = True
+                entry_idx = i
+    return entry, exit_cond
+
+
 def _c105_entries(df, universe=None):
     g = df.copy()
-    sym = str(df['symbol'].iloc[0]) if 'symbol' in df.columns and len(df) else None
-    entry = pd.Series(False, index=g.index)
-    if universe is not None and sym is not None:
-        closes = _universe_closes(universe)
-        rank, n = _rank_frame(closes)
-        if rank is not None and sym in rank.columns:
-            dates = g['trade_date'].astype(str)
-            top = (rank[sym] <= np.maximum(1, np.ceil(0.10 * n))).reindex(dates)
-            entry = top.fillna(False).astype(bool)
-            entry.index = g.index
+    entry, _ = _c105_walk(df, universe)
     g['entry_condition'] = entry
     return g
 
 
 def _c105_exits(df, universe=None, entry_dates=None):
+    # entry_dates is accepted for signature compatibility but ignored: the
+    # walk derives expiries from its own actual entries, so no expiry can
+    # come from an edge that never opened a position (ghost expiry).
     g = df.copy()
-    sym = str(df['symbol'].iloc[0]) if 'symbol' in df.columns and len(df) else None
-    exit_cond = pd.Series(False, index=g.index)
-    dates = g['trade_date'].astype(str).tolist()
-    if universe is not None and sym is not None:
-        closes = _universe_closes(universe)
-        rank, n = _rank_frame(closes)
-        if rank is not None and sym in rank.columns:
-            top30 = (rank[sym] <= np.maximum(1, np.ceil(0.30 * n))).reindex(dates)
-            # Rank exit only once the rank is known (no warm-up artefact).
-            exit_cond = (rank[sym].reindex(dates).notna() & (~top30.fillna(True))).astype(bool)
-            exit_cond.index = g.index
-    if entry_dates is None:
-        # Hold expiry from the entry series itself: exit on the 63rd session
-        # after each entry edge (the entry date is at or before the exit date,
-        # so this is point-in-time safe).
-        en = _c105_entries(df, universe)['entry_condition'].to_numpy()
-        entry_dates = [dates[i] for i in range(1, len(dates)) if en[i] and not en[i - 1]]
-    if entry_dates:
-        # 63-session hold expiry: exit on the 63rd session after entry.
-        pos = {d: i for i, d in enumerate(dates)}
-        for e in entry_dates:
-            if e in pos:
-                j = pos[e] + 63
-                if j < len(g):
-                    exit_cond.iloc[j] = True
+    _, exit_cond = _c105_walk(df, universe)
     g['exit_condition'] = exit_cond
     return g
 
@@ -425,8 +445,10 @@ CANDIDATE_STRATEGIES = {
         'adapted': True,
         'notes': "ADAPTED, not the paper's exact rule: the paper is cross-sectional "
                  '(rank all stocks, buy the top decile); this single-name version ranks '
-                 'the Track A universe by 12-1 return. Rank is evaluated daily (the '
-                 'paper rebalances monthly). Needs the full universe panel.',
+                 'the Track A universe by 12-1 return. Rank is evaluated at monthly '
+                 'rebalances (first session of each month) in a state-aware walk; '
+                 'the 63-session hold expiry comes from the actual entry only. '
+                 'Needs the full universe panel.',
     },
 }
 
