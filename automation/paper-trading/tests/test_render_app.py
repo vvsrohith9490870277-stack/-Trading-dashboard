@@ -74,14 +74,18 @@ class HealthFieldsTests(unittest.TestCase):
     Task 6.3 field, with exactly those names."""
 
     # Top-level keys a live snapshot must have (trial adds two more).
-    # 'breakers' is the Task 2 (render-deploy-03) crash-loop breaker map.
+    # 'breakers' is the Task 2 (render-deploy-03) crash-loop breaker map;
+    # 'store_ok'/'store_age_s'/'reasons'/'peak_job_rss_mb'/
+    # 'last_job_peak_rss_mb'/'job_rss_cap_mb' are the Task 3 fields.
     LIVE_KEYS = {
         'ok', 'mode', 'login_allowed', 'state', 'namespace', 'role',
         'runner_id', 'epoch', 'uptime_s', 'now_ist', 'session_open',
         'calendar_valid_through', 'calendar_days_left', 'worker',
         'last_tick_ist', 'last_lease_renew_age_s', 'jobs_today',
         'last_job', 'rss_mb', 'children_rss_mb', 'fyers_budget', 'auth',
-        'git_sha', 'version', 'breakers',
+        'git_sha', 'version', 'breakers', 'store_ok', 'store_age_s',
+        'reasons', 'peak_job_rss_mb', 'last_job_peak_rss_mb',
+        'job_rss_cap_mb',
         # kept from the original snapshot:
         'status', 'active_runner', 'lease', 'jobs', 'uptime_seconds',
         'memory_mb',
@@ -119,7 +123,8 @@ class HealthFieldsTests(unittest.TestCase):
                          {'day_used', 'day_cap', 'minute_cap'})
         self.assertEqual(set(trial['box_conflict_check']),
                          {'paper_v2_heartbeat_present',
-                          'paper_v2_heartbeat_age_s'})
+                          'paper_v2_heartbeat_age_s',
+                          'paper_v2_active_runner'})
         # the keyword form a monitor matches (documented): "ok": true
         self.assertIn('"ok": true', json.dumps(live))
         self.assertIn('"ok": true', json.dumps(trial))
@@ -184,6 +189,319 @@ class HealthFieldsTests(unittest.TestCase):
                     os.environ.pop(k, None)
                 else:
                     os.environ[k] = v
+
+
+class _CountingStore:
+    """Wraps a store and counts execute() calls (the per-request read
+    test). Delegates everything else to the wrapped store."""
+
+    def __init__(self, store):
+        self._store = store
+        self.count = 0
+
+    def execute(self, sql, args=()):
+        self.count += 1
+        return self._store.execute(sql, args)
+
+    def execute_many(self, statements):
+        return self._store.execute_many(statements)
+
+    def affected_rows(self, sql, args=()):
+        return self._store.affected_rows(sql, args)
+
+    def close(self):
+        return self._store.close()
+
+
+class HealthStoreTests(unittest.TestCase):
+    """Task 3 (render-deploy-03): /health store-read fields come from a
+    background refresher (at most once per RENDER_HEALTH_REFRESH_S),
+    never from a per-request store read. Values that cannot be computed
+    stay null with a reasons map, never a made-up zero."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self.tmp.name) / 'health.sqlite'
+        self._old_refresh = os.environ.get('RENDER_HEALTH_REFRESH_S')
+        os.environ['RENDER_HEALTH_REFRESH_S'] = '60'
+
+    def tearDown(self):
+        if self._old_refresh is None:
+            os.environ.pop('RENDER_HEALTH_REFRESH_S', None)
+        else:
+            os.environ['RENDER_HEALTH_REFRESH_S'] = self._old_refresh
+        self.tmp.cleanup()
+
+    def _store(self):
+        store = rs.SqliteStore(self.path)
+        rs.migrate(store)
+        return store
+
+    def _today(self):
+        from datetime import datetime
+        return datetime.now(rh.IST).date().isoformat()
+
+    def _seed(self, store, namespace='paper_render_trial_v1',
+              with_monitor=True):
+        """Seed a store the way production looks: three job runs today
+        (scan ok, history_sync ok, eod killed by the memory guard),
+        a worker heartbeat, both budget counters, the box lease + flag
+        for paper_v2, and this namespace's own lease row."""
+        import render_jobs as rj
+        from datetime import datetime, timedelta, timezone
+        today = self._today()
+        rj.run_job(store, namespace, 'scan', today,
+                   owner_id='render:h:1:1',
+                   runner=lambda name: {'status': 'ok',
+                                        'peak_rss_mb': 210})
+        rj.run_job(store, namespace, 'history_sync', today,
+                   owner_id='render:h:1:1',
+                   runner=lambda name: {'status': 'ok',
+                                        'peak_rss_mb': 95})
+        rj.run_job(store, namespace, 'eod', today,
+                   owner_id='render:h:1:1',
+                   runner=lambda name: {'exit_code': -9, 'stdout_tail': '',
+                                        'stderr_tail': '',
+                                        'killed_reason': 'memory_cap',
+                                        'rss_cap_mb': 350,
+                                        'peak_rss_mb': 340})
+        now_utc = datetime.now(timezone.utc)
+        utc_s = now_utc.strftime('%Y-%m-%dT%H:%M:%S')
+        if with_monitor:
+            # paper_monitor_health is a box table (schema.sql), not in
+            # the render schema: the test creates it, as the box does
+            # in production.
+            store.execute(
+                'CREATE TABLE IF NOT EXISTS paper_monitor_health('
+                'namespace TEXT PRIMARY KEY, pid INTEGER NOT NULL,'
+                'heartbeat_at TEXT NOT NULL, status TEXT NOT NULL,'
+                'detail_json TEXT NOT NULL)')
+            hb = datetime.now(rh.IST) - timedelta(seconds=12)
+            store.execute(
+                'INSERT INTO paper_monitor_health(namespace, pid,'
+                ' heartbeat_at, status, detail_json) VALUES(?,?,?,?,?)',
+                (namespace, 1234, hb.isoformat(), 'ok', '{}'))
+        for key, n in (('fyers_budget', 1234),
+                       ('fyers_budget_trial', 57)):
+            store.execute(
+                'INSERT OR REPLACE INTO paper_runtime_kv(scope, key,'
+                ' value, updated_at) VALUES(?,?,?,?)',
+                ('_global', key, json.dumps(
+                    {'day': today, 'requests': n, 'by_route': {},
+                     'times': []}), utc_s))
+        hb_box = (now_utc - timedelta(seconds=45)).strftime(
+            '%Y-%m-%dT%H:%M:%S')
+        store.execute(
+            'INSERT OR REPLACE INTO paper_runner_lease(namespace,'
+            ' owner_id, owner_kind, epoch, acquired_unix, expires_unix,'
+            ' heartbeat_at, detail_json) VALUES(?,?,?,?,?,?,?,?)',
+            ('paper_v2', 'box:h:1:1', 'box', 1,
+             int(now_utc.timestamp()), int(now_utc.timestamp()) + 90,
+             hb_box, '{}'))
+        store.execute(
+            'INSERT OR REPLACE INTO paper_runtime_kv(scope, key, value,'
+            ' updated_at) VALUES(?,?,?,?)',
+            ('paper_v2', 'active_runner', 'box', utc_s))
+        store.execute(
+            'INSERT OR REPLACE INTO paper_runner_lease(namespace,'
+            ' owner_id, owner_kind, epoch, acquired_unix, expires_unix,'
+            ' heartbeat_at, detail_json) VALUES(?,?,?,?,?,?,?,?)',
+            (namespace, 'render:h:1:1', 'render', 3,
+             int(now_utc.timestamp()), int(now_utc.timestamp()) + 90,
+             utc_s, '{}'))
+        return today
+
+    def _sup(self, store, namespace='paper_render_trial_v1',
+             mode='trial'):
+        import render_app as ra
+        sup = ra.Supervisor.__new__(ra.Supervisor)
+        sup.store = store
+        sup.namespace = namespace
+        sup.mode = mode
+        sup.owner_id = 'render:h:1:1'
+        sup.config = {'calendar_valid_from': '2026-01-01',
+                      'calendar_valid_through': '2026-12-31',
+                      'regular_session': ['09:15', '15:30'],
+                      'holidays': [], 'special_sessions': {}}
+        sup.lease_held = True
+        sup.stopping = False
+        sup.store_error = None
+        sup.started_at = time.time() - 60
+        sup.last_tick_at = time.time()
+        sup.last_lease_renew_at = time.time()
+        sup.last_flag = 'render'
+        sup.breakers = {}
+
+        class FakeWorker:
+            def describe(self):
+                return {'state': 'running', 'pid': 123, 'rss_mb': 95,
+                        'restarts': 0, 'restarts_10m': 0,
+                        'last_heartbeat_age_s': None}
+        sup.worker = FakeWorker()
+        return sup
+
+    def test_health_store_fields_filled_from_fake_store(self):
+        store = self._store()
+        try:
+            today = self._seed(store)
+            sup = self._sup(store)
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            # Worker heartbeat: seeded 12 s ago (allow drift).
+            hb = snap['worker']['last_heartbeat_age_s']
+            self.assertIsInstance(hb, int)
+            self.assertGreaterEqual(hb, 0)
+            self.assertLessEqual(hb, 30)
+            # Jobs today: 2 ok, 1 failed.
+            self.assertEqual(snap['jobs_today'], {'ok': 2, 'failed': 1})
+            # Last job: the eod, killed by the memory guard.
+            last = snap['last_job']
+            self.assertEqual(last['name'], 'eod')
+            self.assertEqual(last['status'], 'failed')
+            self.assertEqual(last['reason'], 'memory_cap')
+            self.assertIsInstance(last['duration_s'], int)
+            self.assertGreaterEqual(last['duration_s'], 0)
+            self.assertTrue(last['started_at_ist'].startswith(today))
+            # Budgets: the same counters the engine budget uses.
+            self.assertEqual(snap['fyers_budget']['day_used'], 1234)
+            self.assertEqual(snap['trial_budget']['day_used'], 57)
+            # Box conflict: the box lease is heartbeating on paper_v2.
+            box = snap['box_conflict_check']
+            self.assertIs(box['paper_v2_heartbeat_present'], True)
+            self.assertIsInstance(box['paper_v2_heartbeat_age_s'], int)
+            self.assertLessEqual(box['paper_v2_heartbeat_age_s'], 120)
+            self.assertEqual(box['paper_v2_active_runner'], 'box')
+            # Peaks: the largest job-tree peak today, and the last
+            # job's peak.
+            self.assertEqual(snap['peak_job_rss_mb'], 340)
+            self.assertEqual(snap['last_job_peak_rss_mb'], 340)
+            self.assertEqual(snap['job_rss_cap_mb'], 350)
+            # The refresher ran: store_ok true, age small, no reasons.
+            self.assertIs(snap['store_ok'], True)
+            self.assertIsInstance(snap['store_age_s'], int)
+            self.assertLessEqual(snap['store_age_s'], 30)
+            self.assertEqual(snap['reasons'], {})
+            # The lease + jobs come from the cache too.
+            self.assertEqual(snap['lease']['owner_id'], 'render:h:1:1')
+            self.assertIn('scan', snap['jobs'])
+            self.assertIn('history_sync', snap['jobs'])
+            # ok:true is still the literal substring the monitor
+            # matches.
+            self.assertIn('"ok": true', json.dumps(snap))
+        finally:
+            store.close()
+
+    def test_health_survives_store_failure(self):
+        # A store that raises on every read: /health must still answer
+        # 200, with store_ok false and the fields null with reasons.
+        class BrokenStore:
+            def execute(self, sql, args=()):
+                raise RuntimeError('store_down')
+
+            def execute_many(self, statements):
+                raise RuntimeError('store_down')
+
+            def close(self):
+                pass
+        sup = self._sup(BrokenStore())
+        sup._refresh_health_store(force=True)
+        snap = sup.snapshot('render')
+        code, _payload = rh.health_response(snap)
+        self.assertEqual(code, 200)
+        self.assertIs(snap['store_ok'], False)
+        self.assertIs(snap['last_job'], None)
+        self.assertIs(snap['fyers_budget']['day_used'], None)
+        self.assertIs(snap['trial_budget']['day_used'], None)
+        self.assertIs(snap['worker']['last_heartbeat_age_s'], None)
+        self.assertIs(snap['peak_job_rss_mb'], None)
+        self.assertTrue(snap['reasons'])
+        self.assertIn('jobs_today', snap['reasons'])
+        self.assertIn('last_job', snap['reasons'])
+
+    def test_health_does_not_query_store_per_request(self):
+        store = self._store()
+        try:
+            self._seed(store)
+            counting = _CountingStore(store)
+            sup = self._sup(counting)
+            sup._refresh_health_store(force=True)
+            before = counting.count
+            for _ in range(100):
+                snap = sup.snapshot('render')
+            self.assertEqual(snap['fyers_budget']['day_used'], 1234)
+            # At most one more store read across 100 snapshots (a
+            # refresh falling due); normally zero.
+            self.assertLessEqual(counting.count - before, 1)
+        finally:
+            store.close()
+
+    def test_health_no_secret_values(self):
+        store = self._store()
+        try:
+            self._seed(store)
+            # A canary that looks like a secret, planted where a
+            # careless refresher would echo it: the token KV row and a
+            # job's result_json. /health must never repeat it.
+            store.execute(
+                'INSERT INTO paper_runtime_kv(scope, key, value,'
+                ' updated_at) VALUES(?,?,?,?)',
+                ('_global', 'fyers_token',
+                 'SECRET_CANARY_9f3a7b1c', '2026-11-20T00:00:00'))
+            import render_jobs as rj
+            rj.run_job(store, 'paper_render_trial_v1', 'scan',
+                       self._today(), owner_id='render:h:1:1',
+                       runner=lambda name: {
+                           'status': 'ok',
+                           'note': 'SECRET_CANARY_9f3a7b1c'})
+            sup = self._sup(store)
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            raw = json.dumps(snap)
+            self.assertNotIn('SECRET_CANARY_9f3a7b1c', raw)
+            self.assertNotIn('libsql://', raw)
+            self.assertNotIn('TURSO_AUTH_TOKEN', raw)
+        finally:
+            store.close()
+
+    def test_health_trial_fields_only_in_trial_mode(self):
+        store = self._store()
+        try:
+            self._seed(store)
+            sup = self._sup(store, namespace='paper_v2', mode='live')
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertNotIn('trial_budget', snap)
+            self.assertNotIn('box_conflict_check', snap)
+            self.assertEqual(snap['fyers_budget']['day_used'], 1234)
+            # Trial mode carries both.
+            sup_t = self._sup(store, mode='trial')
+            sup_t._refresh_health_store(force=True)
+            snap_t = sup_t.snapshot('render')
+            self.assertIn('trial_budget', snap_t)
+            self.assertIn('box_conflict_check', snap_t)
+            self.assertEqual(snap_t['trial_budget']['day_used'], 57)
+        finally:
+            store.close()
+
+    def test_health_missing_monitor_table_leaves_only_heartbeat_null(self):
+        # paper_monitor_health is a box table, not in the render
+        # schema: a fresh render store has no such table. The refresher
+        # must leave only the heartbeat null (with a reason), not fail
+        # the whole refresh.
+        store = self._store()
+        try:
+            self._seed(store, with_monitor=False)
+            sup = self._sup(store)
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertIs(snap['store_ok'], True)
+            self.assertIs(snap['worker']['last_heartbeat_age_s'], None)
+            self.assertEqual(snap['reasons'].get(
+                'worker_last_heartbeat_age_s'), 'table_missing')
+            self.assertEqual(snap['fyers_budget']['day_used'], 1234)
+            self.assertEqual(snap['jobs_today'], {'ok': 2, 'failed': 1})
+        finally:
+            store.close()
 
 
 class CheckNamespaceTests(unittest.TestCase):
@@ -402,6 +720,9 @@ class JobGuardTests(unittest.TestCase):
         self.assertEqual(res.get('killed_reason'), 'memory_cap')
         self.assertEqual(res.get('rss_cap_mb'), 50)
         self.assertNotEqual(res['exit_code'], 0)
+        # The guard's sampled peak: it must have exceeded the cap, or
+        # the child would not have been killed.
+        self.assertGreaterEqual(res.get('peak_rss_mb', 0), 50)
 
     def test_job_rss_cap_records_failed(self):
         import render_app as ra
