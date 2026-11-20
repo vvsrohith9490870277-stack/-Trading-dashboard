@@ -139,11 +139,11 @@ class TaxonomyTests(unittest.TestCase):
         store.close()
         db.c.close()
         # No host events in the 9-Nov fixture: findings identical to before A1
-        # (pre-A2 severities: scan_missed / monitor_staleness still SEV2 here;
-        # A2 moves them to SEV1 and updates this expectation).
+        # except the A2 severity change (scan_missed / monitor_staleness are
+        # CRITICAL / SEV1 now).
         self.assertEqual(out['by_severity'], {
-            'SEV1': ['fill_sizing_anomaly', 'sleeve_over_limit_new_buy'],
-            'SEV2': ['lock_blocked_gap', 'monitor_staleness', 'scan_missed', 'worker_down'],
+            'SEV1': ['fill_sizing_anomaly', 'monitor_staleness', 'scan_missed', 'sleeve_over_limit_new_buy'],
+            'SEV2': ['lock_blocked_gap', 'worker_down'],
             'SEV3': ['error_taxonomy_gap', 'quote_batch_failed', 'signal_to_fill_latency'],
             'SEV4': ['exit_path_unexercised'],
         })

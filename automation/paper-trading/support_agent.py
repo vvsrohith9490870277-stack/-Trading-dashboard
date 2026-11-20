@@ -13,6 +13,7 @@ from pathlib import Path
 import reconciliation as rec
 import capital
 import support_taxonomy as taxonomy
+import support_severity as sev
 
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text(encoding='utf8'))
@@ -287,6 +288,34 @@ class SupportStore:
 
     def close(self):
         self.c.close()
+
+
+def audit_spool_status(only_in_audit, only_in_turso, session_ended):
+    """A2 condition 6: audit spool not replayed (SEV1) when only_in_audit > 0 after the session ended.
+
+    ``only_in_turso`` is intentionally ignored: engine-log events merged into
+    Turso make it large on a normal day (1209 on 19 Nov) and it is harmless.
+    Returns a finding dict, or None when there is nothing to report.
+    """
+    if not session_ended:
+        return None
+    try:
+        pending = int(only_in_audit or 0)
+    except Exception:
+        return None
+    if pending <= 0:
+        return None
+    rule = sev.rule_for('audit_spool_unreplayed')
+    return {
+        'detector': 'audit_spool_unreplayed',
+        'severity': 'SEV1',
+        'details': {
+            'only_in_audit': pending,
+            'only_in_turso': int(only_in_turso or 0),
+            'reason': 'audit spool events never replayed to Turso after session end',
+            'action': rule['action'] if rule else '',
+        },
+    }
 
 
 def read_audit_spool(spool_dir=None):
@@ -597,6 +626,10 @@ def record_episode(db, namespace, session_day, expectation, detector, event_at, 
             'episode_status': 'OPEN',
             'seen_event_ids': [ev_token],
         }
+        # A2: every finding carries its one-line action from the severity table.
+        _rule = sev.rule_for(detector)
+        if _rule is not None:
+            ep_details['action'] = _rule['action']
         res = append_finding(
             db, namespace, detector, cid, str(event_at), session_day,
             severity=cur_sev, status='OPEN', details=ep_details,
@@ -1176,6 +1209,10 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
     not_evaluable = {}
 
     def emit(detector, cid, first_at, severity, details):
+        # A2: every finding carries its one-line action from the severity table.
+        _rule = sev.rule_for(detector)
+        if _rule is not None and 'action' not in (details or {}):
+            details = {**(details or {}), 'action': _rule['action']}
         res = append_finding(
             db, namespace, detector, cid, str(first_at), session_day,
             severity=severity, status='OPEN', details=details,
@@ -1252,7 +1289,7 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         ep = record_episode(
             db, namespace, session_day, 'premarket_scan_0845', 'scan_missed',
             first_at, blind_seconds=float(scan_exp['grace_minutes']) * 60,
-            base_severity='SEV2', details={
+            base_severity='SEV1', details={
                 'expected_at': scan_exp['expected_at'],
                 'deadline_at': scan_deadline.isoformat(),
                 'failed_events': len(premarket_failed),
@@ -1353,7 +1390,7 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                     # last check vs close is only final after the close (avoids one evidence row per pass).
                     ms_details['last_check'] = last_check_dt.strftime('%H:%M:%S')
                     ms_details['last_check_gap_to_close_seconds'] = (session_end - last_check_dt).total_seconds()
-                emit('monitor_staleness', f'monitor_staleness:{session_day}', first_ev['source_at'], 'SEV2', ms_details)
+                emit('monitor_staleness', f'monitor_staleness:{session_day}', first_ev['source_at'], 'SEV1', ms_details)
 
     # Position marks that stop updating during the session (worker emits position_marks_stale).
     mark_events = [ev for ev in events if ev['event_type'] == 'position_marks_stale']
@@ -1494,6 +1531,47 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                 )
 
 
+    # 4b. Fyers auth / budget block (A2, SEV1). Real reason strings from
+    # engine.py: auth_circuit_open_30min, token_refresh_failed,
+    # market_data_budget_exhausted_* (engine.py:151-200); the same words
+    # appear as outcomes / reasons in paper_events (audit.py REASONS).
+    _AUTH_BLOCK_REASONS = {
+        'token_refresh_failed', 'fyers_budget_exhausted',
+        'market_data_budget_exhausted', 'market_data_budget_exhausted_second',
+        'market_data_budget_exhausted_minute', 'market_data_budget_exhausted_day',
+        'market_data_budget_exhausted_reserve',
+    }
+
+    def _is_auth_block(reason):
+        reason = str(reason or '')
+        return reason in _AUTH_BLOCK_REASONS or reason.startswith('auth_circuit_open')
+
+    auth_block_events = []
+    for ev in events:
+        try:
+            _data = json.loads(ev.get('data_json') or '{}')
+        except Exception:
+            _data = {}
+        if not isinstance(_data, dict):
+            _data = {}
+        _matched = None
+        for _field in ('reason', 'error_code', 'error'):
+            if _is_auth_block(_data.get(_field)):
+                _matched = str(_data[_field])
+                break
+        if _matched is None and _is_auth_block(ev.get('outcome')):
+            _matched = str(ev.get('outcome'))
+        if _matched is not None:
+            auth_block_events.append((ev, _matched))
+    if auth_block_events:
+        emit('fyers_auth_or_budget_block', f'fyers_auth_or_budget_block:{session_day}', auth_block_events[0][0]['source_at'], 'SEV1', {
+            'count': len(auth_block_events),
+            'reasons': sorted({reason for _, reason in auth_block_events}),
+            'first_at': auth_block_events[0][0]['source_at'],
+            'last_at': auth_block_events[-1][0]['source_at'],
+            'event_ids': [ev.get('event_id') for ev, _ in auth_block_events],
+        })
+
     # 5. Quotes -> quote_batch_failed + recovery (SEV3) & quote_field_regression (SEV1)
     quote_failed_open = False
     for ev in events:
@@ -1620,6 +1698,39 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             'duplicate_count': len(dup_fills),
             'fills': [d.get('id') for d in dup_fills],
         })
+
+    # 7b. Fill on a stale quote (A2, SEV1). The engine already enforces a
+    # maximum quote age (config.json quote_max_age_seconds, engine.py:365);
+    # reuse that number, never invent one. A missing value is not_evaluable.
+    max_quote_age = CFG.get('quote_max_age_seconds')
+    if max_quote_age is None:
+        not_evaluable['fill_on_stale_quote'] = 'policy_value_missing'
+    else:
+        stale_fills = []
+        for f in day_fills:
+            quote_at = f.get('quote_at')
+            filled_at = f.get('filled_at')
+            if not quote_at or not filled_at:
+                continue
+            try:
+                age = (parse_ist(filled_at) - parse_ist(quote_at)).total_seconds()
+            except Exception:
+                continue
+            if age > float(max_quote_age):
+                stale_fills.append({
+                    'signal_id': f.get('signal_id'),
+                    'symbol': f.get('symbol'),
+                    'side': f.get('side'),
+                    'quote_age_seconds': age,
+                    'quote_at': quote_at,
+                    'filled_at': filled_at,
+                })
+        if stale_fills:
+            emit('fill_on_stale_quote', f'fill_on_stale_quote:{session_day}', stale_fills[0]['filled_at'], 'SEV1', {
+                'count': len(stale_fills),
+                'max_quote_age_seconds': float(max_quote_age),
+                'samples': stale_fills,
+            })
 
     if not bands:
         not_evaluable['asm_gsm_buy'] = 'reference_feed_not_loaded_for_session'

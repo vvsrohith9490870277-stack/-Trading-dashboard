@@ -353,9 +353,11 @@ class SupportAgentV3ProductionPlanTests(unittest.TestCase):
         # Re-run replay to prove idempotency and zero duplicates
         out_again = sa.run_virtual_clock_replay(self.support_store, self.trading_db, 'paper_v1', '2026-11-09')
         self.assertEqual(len(out['findings']), len(out_again['findings']))
+        # A2 (adaptive-support-tuning-01): scan_missed and monitor_staleness
+        # are CRITICAL (SEV1) now; the old SEV2 mapping is superseded.
         self.assertEqual(out['by_severity'], {
-            'SEV1': ['fill_sizing_anomaly', 'sleeve_over_limit_new_buy'],
-            'SEV2': ['lock_blocked_gap', 'monitor_staleness', 'scan_missed', 'worker_down'],
+            'SEV1': ['fill_sizing_anomaly', 'monitor_staleness', 'scan_missed', 'sleeve_over_limit_new_buy'],
+            'SEV2': ['lock_blocked_gap', 'worker_down'],
             'SEV3': ['error_taxonomy_gap', 'quote_batch_failed', 'signal_to_fill_latency'],
             'SEV4': ['exit_path_unexercised'],
         })
