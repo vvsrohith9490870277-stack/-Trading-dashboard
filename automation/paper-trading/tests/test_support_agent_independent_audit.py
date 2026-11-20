@@ -114,9 +114,11 @@ class RealShapeReplayTests(unittest.TestCase):
         self.assertEqual(rows_after_first, len(self.store.query('SELECT * FROM support_findings')))
         self.assertEqual({f['finding_id'] for f in out['findings']}, {f['finding_id'] for f in again['findings']})
         by_sev = {k: [d for d in v if d != 'policy_value_missing'] for k, v in again['by_severity'].items()}
+        # A2 (adaptive-support-tuning-01): scan_missed and monitor_staleness
+        # are CRITICAL (SEV1) now; the old SEV2 mapping is superseded.
         self.assertEqual(by_sev, {
-            'SEV1': ['fill_sizing_anomaly', 'sleeve_over_limit_new_buy'],
-            'SEV2': ['lock_blocked_gap', 'monitor_staleness', 'scan_missed', 'worker_down'],
+            'SEV1': ['fill_sizing_anomaly', 'monitor_staleness', 'scan_missed', 'sleeve_over_limit_new_buy'],
+            'SEV2': ['lock_blocked_gap', 'worker_down'],
             'SEV3': ['error_taxonomy_gap', 'quote_batch_failed', 'signal_to_fill_latency'],
             'SEV4': ['exit_path_unexercised'],
         })

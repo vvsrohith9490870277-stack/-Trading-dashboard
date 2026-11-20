@@ -12,6 +12,8 @@ from datetime import date, datetime, time as dt_time, timedelta, timezone
 from pathlib import Path
 import reconciliation as rec
 import capital
+import support_taxonomy as taxonomy
+import support_severity as sev
 
 ROOT = Path(__file__).resolve().parent
 CFG = json.loads((ROOT / 'config.json').read_text(encoding='utf8'))
@@ -286,6 +288,34 @@ class SupportStore:
 
     def close(self):
         self.c.close()
+
+
+def audit_spool_status(only_in_audit, only_in_turso, session_ended):
+    """A2 condition 6: audit spool not replayed (SEV1) when only_in_audit > 0 after the session ended.
+
+    ``only_in_turso`` is intentionally ignored: engine-log events merged into
+    Turso make it large on a normal day (1209 on 19 Nov) and it is harmless.
+    Returns a finding dict, or None when there is nothing to report.
+    """
+    if not session_ended:
+        return None
+    try:
+        pending = int(only_in_audit or 0)
+    except Exception:
+        return None
+    if pending <= 0:
+        return None
+    rule = sev.rule_for('audit_spool_unreplayed')
+    return {
+        'detector': 'audit_spool_unreplayed',
+        'severity': 'SEV1',
+        'details': {
+            'only_in_audit': pending,
+            'only_in_turso': int(only_in_turso or 0),
+            'reason': 'audit spool events never replayed to Turso after session end',
+            'action': rule['action'] if rule else '',
+        },
+    }
 
 
 def read_audit_spool(spool_dir=None):
@@ -596,6 +626,10 @@ def record_episode(db, namespace, session_day, expectation, detector, event_at, 
             'episode_status': 'OPEN',
             'seen_event_ids': [ev_token],
         }
+        # A2: every finding carries its one-line action from the severity table.
+        _rule = sev.rule_for(detector)
+        if _rule is not None:
+            ep_details['action'] = _rule['action']
         res = append_finding(
             db, namespace, detector, cid, str(event_at), session_day,
             severity=cur_sev, status='OPEN', details=ep_details,
@@ -1135,8 +1169,14 @@ def collapse_duplicate_findings(db, namespace, session_day, recorded_at=None):
     return closed
 
 
-def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading_db=None, observation_only=True, check_policy_hygiene=False, box_metrics=None, dashboard_probe=None, recorded_at=None):
-    """Run the full Production Action Plan v3 detector suite (SEV1-SEV4 + expectation ledger + episodes)."""
+def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading_db=None, observation_only=True, check_policy_hygiene=False, box_metrics=None, dashboard_probe=None, recorded_at=None, render_scan_completed=False, render_eod_completed=False):
+    """Run the full Production Action Plan v3 detector suite (SEV1-SEV4 + expectation ledger + episodes).
+
+    ``render_scan_completed`` / ``render_eod_completed`` (A3): when Render is
+    the expected runner, the scan / EOD expectation accepts a successful
+    Render paper_job_runs row for the session day instead of a box
+    paper_events row.
+    """
     assert_support_policy_lock()
     reader = trading_db if trading_db is not None else db
     session_day = ist_session_day(session_day)
@@ -1161,6 +1201,9 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         f for f in fills
         if f.get('filled_at') and ist_session_day(f['filled_at']) == session_day and parse_ist(f['filled_at']) <= now_ist
     ]
+    # A1: host-pause windows (from host_freeze_detected events) explain
+    # monitor-staleness gaps that overlap them; computed once, used in §2 and §4.
+    host_pause_windows = taxonomy.pause_windows(events)
     signals = reader.query('SELECT * FROM paper_signals WHERE namespace=?', (namespace,))
     sig_by_id = {str(s['id']): s for s in signals}
     try:
@@ -1172,6 +1215,10 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
     not_evaluable = {}
 
     def emit(detector, cid, first_at, severity, details):
+        # A2: every finding carries its one-line action from the severity table.
+        _rule = sev.rule_for(detector)
+        if _rule is not None and 'action' not in (details or {}):
+            details = {**(details or {}), 'action': _rule['action']}
         res = append_finding(
             db, namespace, detector, cid, str(first_at), session_day,
             severity=severity, status='OPEN', details=details,
@@ -1242,13 +1289,13 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         ev for ev in events
         if ev['event_type'] == 'scan_failed' and parse_ist(ev['source_at']) <= scan_deadline
     ]
-    scan_ok = bool(premarket_scans) or bool(started_and_finished)
+    scan_ok = bool(premarket_scans) or bool(started_and_finished) or render_scan_completed
     if now_ist >= scan_deadline and (not scan_ok or (premarket_failed and not scan_ok)):
         first_at = premarket_failed[0]['source_at'] if premarket_failed else f"{session_day}T{scan_exp['expected_at']}:00+05:30"
         ep = record_episode(
             db, namespace, session_day, 'premarket_scan_0845', 'scan_missed',
             first_at, blind_seconds=float(scan_exp['grace_minutes']) * 60,
-            base_severity='SEV2', details={
+            base_severity='SEV1', details={
                 'expected_at': scan_exp['expected_at'],
                 'deadline_at': scan_deadline.isoformat(),
                 'failed_events': len(premarket_failed),
@@ -1332,6 +1379,9 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                         'from_ist': a.strftime('%H:%M:%S'),
                         'to_ist': b.strftime('%H:%M:%S'),
                         'gap_seconds': gap_s,
+                        # A1: a gap overlapping a host-pause window is explained
+                        # by the pause (severity unchanged; unexplained gaps stay).
+                        'explained_by_host_pause': taxonomy.gap_explained_by_host_pause(a, b, host_pause_windows),
                     })
             if initial_gap > float(w_exp['grace_seconds']) or max_gap > stale_s or late_last:
                 ms_details = {
@@ -1346,7 +1396,7 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                     # last check vs close is only final after the close (avoids one evidence row per pass).
                     ms_details['last_check'] = last_check_dt.strftime('%H:%M:%S')
                     ms_details['last_check_gap_to_close_seconds'] = (session_end - last_check_dt).total_seconds()
-                emit('monitor_staleness', f'monitor_staleness:{session_day}', first_ev['source_at'], 'SEV2', ms_details)
+                emit('monitor_staleness', f'monitor_staleness:{session_day}', first_ev['source_at'], 'SEV1', ms_details)
 
     # Position marks that stop updating during the session (worker emits position_marks_stale).
     mark_events = [ev for ev in events if ev['event_type'] == 'position_marks_stale']
@@ -1411,20 +1461,51 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                 results.append({**ep, 'detector': 'lock_blocked_gap'})
 
     # 4. Worker errors -> error_taxonomy_gap (SEV3)
+    # A1: events that classify to a known class (support_taxonomy) are no
+    # longer counted as unclassified. error_taxonomy_gap fires only for truly
+    # unknown ones and lists counts per (event_type, outcome).
+    classified = []
     unclassified_events = []
     for ev in events:
         raw = str(ev.get('data_json') or '')
         if ev['event_type'] == 'worker_error_unclassified' or ERROR_TAXONOMY_PATTERN.search(raw) or ev.get('outcome') == 'unclassified_condition':
-            unclassified_events.append(ev)
+            cls = taxonomy.classify_event(ev)
+            if cls['class'] == 'unclassified':
+                unclassified_events.append(ev)
+            else:
+                classified.append((ev, cls))
     for dec in day_decisions:
         raw = str(dec.get('payload_json') or '')
         if ERROR_TAXONOMY_PATTERN.search(raw) or dec.get('cause') == 'unclassified_condition':
-            unclassified_events.append(dec)
+            cls = taxonomy.classify_event({'event_type': 'paper_decision', 'outcome': dec.get('cause'), 'data_json': raw})
+            if cls['class'] == 'unclassified':
+                unclassified_events.append(dec)
+            else:
+                classified.append((dec, cls))
+    pause_events = [(ev, cls) for ev, cls in classified if cls['class'] == 'box_host_pause']
+    resume_events = [(ev, cls) for ev, cls in classified if cls['class'] == 'box_host_resume']
+    if pause_events:
+        pause_rows = [ev for ev, _ in pause_events]
+        windows = taxonomy.pause_windows(pause_rows)
+        emit('box_host_pause', f'box_host_pause:{session_day}', pause_events[0][0]['source_at'], 'WARN', {
+            'pause_count': len(pause_events),
+            'resume_count': len(resume_events),
+            'total_paused_seconds': taxonomy.total_paused_seconds(pause_rows),
+            'pauses': [
+                {'event_id': ev.get('event_id'), 'started': w['started'], 'stopped': w['stopped'], 'frozen_seconds': w['frozen_seconds']}
+                for ev, w in zip(pause_rows, windows)
+            ],
+        })
     if unclassified_events:
         first_src = unclassified_events[0].get('source_at') or f'{session_day}T09:15:00+05:30'
         last_src = unclassified_events[-1].get('source_at') or first_src
+        counts_by_type = {}
+        for x in unclassified_events:
+            key = f"{x.get('event_type') or 'paper_decision'}|{x.get('outcome') or x.get('cause') or ''}"
+            counts_by_type[key] = counts_by_type.get(key, 0) + 1
         emit('error_taxonomy_gap', f'error_taxonomy_gap:{session_day}', first_src, 'SEV3', {
             'unclassified_count': len(unclassified_events),
+            'counts_by_type': counts_by_type,
             'events': [str(x.get('event_id') or x.get('correlation_id')) for x in unclassified_events],
             'last_at': last_src,
         })
@@ -1455,6 +1536,47 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
                     extra_details={'recovered': True, 'recovered_at': recovered_at, 'last_unclassified_at': last_src},
                 )
 
+
+    # 4b. Fyers auth / budget block (A2, SEV1). Real reason strings from
+    # engine.py: auth_circuit_open_30min, token_refresh_failed,
+    # market_data_budget_exhausted_* (engine.py:151-200); the same words
+    # appear as outcomes / reasons in paper_events (audit.py REASONS).
+    _AUTH_BLOCK_REASONS = {
+        'token_refresh_failed', 'fyers_budget_exhausted',
+        'market_data_budget_exhausted', 'market_data_budget_exhausted_second',
+        'market_data_budget_exhausted_minute', 'market_data_budget_exhausted_day',
+        'market_data_budget_exhausted_reserve',
+    }
+
+    def _is_auth_block(reason):
+        reason = str(reason or '')
+        return reason in _AUTH_BLOCK_REASONS or reason.startswith('auth_circuit_open')
+
+    auth_block_events = []
+    for ev in events:
+        try:
+            _data = json.loads(ev.get('data_json') or '{}')
+        except Exception:
+            _data = {}
+        if not isinstance(_data, dict):
+            _data = {}
+        _matched = None
+        for _field in ('reason', 'error_code', 'error'):
+            if _is_auth_block(_data.get(_field)):
+                _matched = str(_data[_field])
+                break
+        if _matched is None and _is_auth_block(ev.get('outcome')):
+            _matched = str(ev.get('outcome'))
+        if _matched is not None:
+            auth_block_events.append((ev, _matched))
+    if auth_block_events:
+        emit('fyers_auth_or_budget_block', f'fyers_auth_or_budget_block:{session_day}', auth_block_events[0][0]['source_at'], 'SEV1', {
+            'count': len(auth_block_events),
+            'reasons': sorted({reason for _, reason in auth_block_events}),
+            'first_at': auth_block_events[0][0]['source_at'],
+            'last_at': auth_block_events[-1][0]['source_at'],
+            'event_ids': [ev.get('event_id') for ev, _ in auth_block_events],
+        })
 
     # 5. Quotes -> quote_batch_failed + recovery (SEV3) & quote_field_regression (SEV1)
     quote_failed_open = False
@@ -1583,6 +1705,39 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
             'fills': [d.get('id') for d in dup_fills],
         })
 
+    # 7b. Fill on a stale quote (A2, SEV1). The engine already enforces a
+    # maximum quote age (config.json quote_max_age_seconds, engine.py:365);
+    # reuse that number, never invent one. A missing value is not_evaluable.
+    max_quote_age = CFG.get('quote_max_age_seconds')
+    if max_quote_age is None:
+        not_evaluable['fill_on_stale_quote'] = 'policy_value_missing'
+    else:
+        stale_fills = []
+        for f in day_fills:
+            quote_at = f.get('quote_at')
+            filled_at = f.get('filled_at')
+            if not quote_at or not filled_at:
+                continue
+            try:
+                age = (parse_ist(filled_at) - parse_ist(quote_at)).total_seconds()
+            except Exception:
+                continue
+            if age > float(max_quote_age):
+                stale_fills.append({
+                    'signal_id': f.get('signal_id'),
+                    'symbol': f.get('symbol'),
+                    'side': f.get('side'),
+                    'quote_age_seconds': age,
+                    'quote_at': quote_at,
+                    'filled_at': filled_at,
+                })
+        if stale_fills:
+            emit('fill_on_stale_quote', f'fill_on_stale_quote:{session_day}', stale_fills[0]['filled_at'], 'SEV1', {
+                'count': len(stale_fills),
+                'max_quote_age_seconds': float(max_quote_age),
+                'samples': stale_fills,
+            })
+
     if not bands:
         not_evaluable['asm_gsm_buy'] = 'reference_feed_not_loaded_for_session'
     else:
@@ -1705,7 +1860,7 @@ def run_v3_production_detectors(db, namespace, session_day, now_at=None, trading
         eh, em, tzinfo=IST,
     ) + timedelta(minutes=int(eod_exp['grace_minutes']))
     eod_events = [ev for ev in events if ev['event_type'] in ('eod_completed', 'eod_reconciled')]
-    if now_ist >= eod_deadline and not eod_events:
+    if now_ist >= eod_deadline and not eod_events and not render_eod_completed:
         ep = record_episode(
             db, namespace, session_day, 'eod_1615', 'eod_missed',
             eod_deadline.isoformat(), blind_seconds=float(eod_exp['grace_minutes']) * 60,
@@ -1840,7 +1995,7 @@ def build_nov9_replay_fixture(db, namespace=None):
     db.batch(stmts)
 
 
-def run_virtual_clock_replay(support_db, trading_db, namespace=None, session_day='2026-11-09', ticks=None, observation_only=True):
+def run_virtual_clock_replay(support_db, trading_db, namespace=None, session_day='2026-11-09', ticks=None, observation_only=True, render_scan_completed=False, render_eod_completed=False):
     """Run virtual-clock replay across a session day and verify zero duplicate findings on repeat ticks."""
     namespace = CFG['namespace'] if namespace is None else namespace
     session_day = ist_session_day(session_day)
@@ -1860,6 +2015,8 @@ def run_virtual_clock_replay(support_db, trading_db, namespace=None, session_day
             observation_only=observation_only,
             check_policy_hygiene=False,
             recorded_at=tick,
+            render_scan_completed=render_scan_completed,
+            render_eod_completed=render_eod_completed,
         )
     findings = current_findings(support_db, namespace, session_day)
     by_sev = {'SEV1': [], 'SEV2': [], 'SEV3': [], 'SEV4': []}
