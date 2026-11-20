@@ -447,3 +447,12 @@ No "R" exists in the codebase. Proposed definition for the B4 compare report:
   with the user. No PRs, no deploy, no touching production Turso/Fyers/
   Render, no touching `feat/render-deploy` or anything live (Fri 20 Nov is
   the Render trial day; Grok is handling it).
+
+## 9. Grok's §6 answers (received 2026-11-20 ~08:58 IST via VVS — these replace the §6 fallbacks above)
+
+- **Q1. A3 lease names — YES.** `paper_runner_lease`, `paper_job_runs` and `paper_runtime_kv` are the real deployed names, already migrated in production Turso. Keep the test and the `lease_schema_mismatch` fallback anyway.
+- **Q2. Candidate 101, criterion 8 — do NOT drop it.** Compute RS rank from bars already held: percentile (0–100) of each stock's 252-session return within the 692 eligible universe on the same bar. Label it `derived_rs_rank (in-universe)`, NOT IBD's rating. If a stock's history is missing, criterion 8 = `not_evaluable` (`rs_rank_unavailable`) for that stock only.
+- **Q3. "R" definition — ATR-based, with 1R = qty × 2 × ATR(14) at entry (in paise)**, to match the brief's default stop of entry − 2×ATR(14). R-multiple = net P&L ÷ 1R. Also show raw paise P&L. No pass/fail on R. (This supersedes §4.4's 1R = qty × ATR(14).)
+- **Q4. Candidate 105 — CONFIRMED.** Top decile of the universe by 12-month return skipping the latest month, rebalanced monthly, flagged "adapted, not the paper's exact rule" everywhere.
+- **Q5. Candidate 103 squeeze — lowest BandWidth in 126 sessions** (Bollinger's own rule). No percentile threshold.
+- **Standing rule CONFIRMED:** no invented numbers; anything without a policy value stays `not_evaluable`.
