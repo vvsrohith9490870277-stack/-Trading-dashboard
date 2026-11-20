@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -14,6 +15,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
 import render_ctl as ctl
+import render_jobs as rj
 import render_lease as rl
 import render_state as rs
 
@@ -678,6 +680,110 @@ class FixtureCtlTests(unittest.TestCase):
         r = self._run('budget-check', '--fixture-trial', '1000',
                       '--fixture-box', '4001')
         self.assertEqual(r.returncode, 2)
+
+
+class BreakerClearCtlTests(unittest.TestCase):
+    """breaker-clear (render-deploy-03 Task 2): the CLI command that
+    clears a job's crash-loop breaker after the cause is fixed. M10:
+    it must never write scheduling state for a namespace other than
+    the one this mode resolves to."""
+
+    IST = timezone(timedelta(hours=5, minutes=30))
+    TRIAL_NS = 'paper_render_trial_v1'
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db_path = Path(self.tmp.name) / 'ctl.sqlite'
+        self.store = rs.SqliteStore(self.db_path)
+        rs.migrate(self.store)
+        self.old = {}
+        for k in ('PAPER_RUNTIME', 'RENDER_MODE', 'PAPER_NAMESPACE_OVERRIDE',
+                  'PAPER_TEST_DATABASE', 'PAPER_STATE_DIR',
+                  'TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN'):
+            self.old[k] = os.environ.pop(k, None)
+
+    def tearDown(self):
+        self.store.close()
+        self.tmp.cleanup()
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    def _env(self):
+        env = dict(os.environ)
+        env.update({
+            'PAPER_RUNTIME': 'render',
+            'RENDER_MODE': 'trial',
+            'PAPER_NAMESPACE_OVERRIDE': self.TRIAL_NS,
+            'PAPER_TEST_DATABASE': str(self.db_path),
+            'PAPER_STATE_DIR': self.tmp.name,
+        })
+        return env
+
+    def _run(self, *argv):
+        return subprocess.run(
+            [sys.executable, str(CTL), *argv],
+            capture_output=True, text=True, env=self._env(), timeout=120,
+            cwd=str(HERE.parent))
+
+    def _seed_breaker(self, job='scan'):
+        day = datetime.now(self.IST).date().isoformat()
+        for _ in range(3):
+            rj.run_job(self.store, self.TRIAL_NS, job, day,
+                       owner_id='render:h:1:1',
+                       runner=lambda name: {'status': 'failed',
+                                            'reason': 'memory_cap'})
+        self.assertTrue(rj.breaker_open(
+            self.store, self.TRIAL_NS, job, day, max_starts=3,
+            window_min=30))
+        return day
+
+    def test_breaker_clear_clears_open_breaker(self):
+        day = self._seed_breaker()
+        r = self._run('breaker-clear', '--job', 'scan', '--day', day,
+                      '--yes')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        d = json.loads(r.stdout)
+        self.assertTrue(d['ok'])
+        self.assertTrue(d['cleared'])
+        self.assertFalse(d['breaker_open'])
+        self.assertFalse(rj.breaker_open(
+            self.store, self.TRIAL_NS, 'scan', day, max_starts=3,
+            window_min=30))
+
+    def test_breaker_clear_needs_yes(self):
+        day = self._seed_breaker()
+        r = self._run('breaker-clear', '--job', 'scan', '--day', day)
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertTrue(rj.breaker_open(
+            self.store, self.TRIAL_NS, 'scan', day, max_starts=3,
+            window_min=30))
+
+    def test_breaker_clear_refuses_non_trial_namespace(self):
+        # M10 write-spy: --namespace paper_v2 in trial mode must be
+        # refused (exit 3) and the store must be unchanged — the
+        # breaker still open, the starts still there, and no paper_v2
+        # row created.
+        day = self._seed_breaker()
+        r = self._run('breaker-clear', '--job', 'scan', '--day', day,
+                      '--namespace', 'paper_v2', '--yes')
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertTrue(rj.breaker_open(
+            self.store, self.TRIAL_NS, 'scan', day, max_starts=3,
+            window_min=30))
+        self.assertEqual(len(rj.job_starts(
+            self.store, self.TRIAL_NS, 'scan', day)), 3)
+        self.assertIsNone(rj._job_row(
+            self.store, 'paper_v2', 'scan', day))
+
+    def test_breaker_clear_matching_namespace_ok(self):
+        day = self._seed_breaker()
+        r = self._run('breaker-clear', '--job', 'scan', '--day', day,
+                      '--namespace', self.TRIAL_NS, '--yes')
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(json.loads(r.stdout)['cleared'])
 
 
 if __name__ == '__main__':

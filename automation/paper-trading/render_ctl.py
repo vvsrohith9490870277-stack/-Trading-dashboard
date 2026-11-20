@@ -519,7 +519,16 @@ def cmd_breaker_clear(args):
               file=sys.stderr)
         return 3
     if getattr(args, 'namespace', None):
-        namespace = args.namespace
+        if args.namespace != namespace:
+            # The override must name the namespace this mode resolves
+            # to (trial -> the trial namespace, live -> paper_v2). A
+            # different namespace would write scheduling state for a
+            # namespace this run must not touch, so refuse it (exit 3)
+            # without touching the store.
+            print('namespace refused: --namespace does not match the'
+                  ' resolved namespace; breaker-clear not applied',
+                  file=sys.stderr)
+            return 3
     day = getattr(args, 'day', None) or datetime.now(IST).date().isoformat()
     store = _store()
     cleared = rj.clear_breaker(store, namespace, args.job, day)

@@ -271,6 +271,21 @@ class BreakerTests(unittest.TestCase):
         self.assertEqual(rows[0]['attempt'], 4)
         self.assertEqual(rows[0]['status'], 'ok')
 
+    def test_breaker_resets_next_ist_day(self):
+        # The breaker is keyed by session_day (one row per
+        # namespace/job/day), so a new day starts with no starts and
+        # the breaker is closed even though yesterday's was open.
+        self._run_starts(3)
+        self.assertTrue(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', '2026-11-20',
+            max_starts=3, window_min=30))
+        self.assertFalse(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', '2026-11-21',
+            max_starts=3, window_min=30))
+        self.assertEqual(rj.open_breakers(
+            self.store, 'paper_v2', '2026-11-21',
+            max_starts=3, window_min=30), {})
+
 
 if __name__ == '__main__':
     unittest.main()
