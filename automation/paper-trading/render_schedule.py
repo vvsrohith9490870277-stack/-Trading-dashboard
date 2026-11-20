@@ -5,6 +5,7 @@ All times are IST. A job is due at its slot time, and for
 due again. No job is due on a day the market is closed.
 """
 import json
+import os
 from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -24,6 +25,12 @@ def load_schedule(path=SCHEDULE_PATH, mode='live'):
         trial = data.get('modes', {}).get('trial', {})
         if 'jobs' in trial:
             jobs = trial['jobs']
+    # Ops switch: RENDER_DISABLED_JOBS=scan,eod keeps those jobs from being
+    # scheduled at all (no job rows are written for them).
+    disabled = {n.strip() for n in
+                os.environ.get('RENDER_DISABLED_JOBS', '').split(',')
+                if n.strip()}
+    jobs = [j for j in jobs if j.get('name') not in disabled]
     return {
         'timezone': data.get('timezone', 'Asia/Kolkata'),
         'catch_up_minutes': data.get('catch_up_minutes',

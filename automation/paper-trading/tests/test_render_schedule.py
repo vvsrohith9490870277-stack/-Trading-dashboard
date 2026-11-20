@@ -93,6 +93,21 @@ class ScheduleTests(unittest.TestCase):
         by_name = {j['name']: j for j in sched['jobs']}
         self.assertEqual(by_name['scan']['time'], '08:45')
 
+    def test_disabled_jobs_env_switch(self):
+        import os
+        os.environ['RENDER_DISABLED_JOBS'] = 'scan, eod ,support'
+        try:
+            for mode in ('live', 'trial'):
+                names = {j['name'] for j in rsch.load_schedule(mode=mode)['jobs']}
+                self.assertNotIn('scan', names)
+                self.assertNotIn('eod', names)
+                self.assertNotIn('support', names)
+                self.assertIn('record_outages', names)
+        finally:
+            del os.environ['RENDER_DISABLED_JOBS']
+        names = {j['name'] for j in rsch.load_schedule(mode='trial')['jobs']}
+        self.assertIn('scan', names)
+
 
 class JobRunTests(unittest.TestCase):
     def setUp(self):
