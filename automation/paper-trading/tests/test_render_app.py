@@ -918,6 +918,17 @@ class JobGuardTests(unittest.TestCase):
         finally:
             store.close()
 
+    def _today_ist(self):
+        # Today's date in IST: the session day the seeded breaker
+        # runs must carry. _refresh_breakers reads today's IST date,
+        # so runs seeded under a fixed past date never count and the
+        # breaker never opens (this test failed on Sat 21 Nov 2026
+        # IST with the runs dated 2026-11-20 — proven identical on
+        # pristine base 0df291e).
+        from datetime import datetime as _dt
+        from zoneinfo import ZoneInfo as _ZI
+        return _dt.now(_ZI('Asia/Kolkata')).date().isoformat()
+
     def _sup_with_breaker(self, store, breaker_open=True):
         import render_app as ra
         import render_jobs as rj
@@ -927,7 +938,7 @@ class JobGuardTests(unittest.TestCase):
             # does not count in last_run_times, so the job is still due
             # — and the breaker must stop it from starting again.
             for _ in range(3):
-                rj.run_job(store, 'paper_v2', 'scan', '2026-11-20',
+                rj.run_job(store, 'paper_v2', 'scan', self._today_ist(),
                            owner_id='render:h:1:1',
                            runner=lambda name: {
                                'exit_code': -9, 'stdout_tail': '',
@@ -961,15 +972,23 @@ class JobGuardTests(unittest.TestCase):
         try:
             sup = self._sup_with_breaker(store, breaker_open=True)
             self.assertIn('scan', rj.open_breakers(
-                store, 'paper_v2', '2026-11-20',
+                store, 'paper_v2', self._today_ist(),
                 max_starts=3, window_min=30))
             orig = rsch.load_schedule
             rsch.load_schedule = lambda mode='live': \
                 self._due_scan_schedule()
+            # The due-scan fixture is fake (a slot 5 min ago); the
+            # calendar check inside due_jobs is incidental to this
+            # test, so pin today to a trading day. Without this the
+            # test fails on weekends: due_jobs returns [] and the
+            # breaker is never refreshed.
+            orig_day = rsch.is_trading_day
+            rsch.is_trading_day = lambda day: True
             try:
                 sup._manage_jobs()
             finally:
                 rsch.load_schedule = orig
+                rsch.is_trading_day = orig_day
             self.assertIsNone(sup._job_thread,
                               'breaker-open job must not start')
             self.assertIn('scan', sup.breakers)
@@ -1012,7 +1031,7 @@ class JobGuardTests(unittest.TestCase):
 
         def kill_run(store):
             return rj.run_job(
-                store, 'paper_v2', 'scan', '2026-11-20',
+                store, 'paper_v2', 'scan', self._today_ist(),
                 owner_id='render:h:1:1',
                 runner=lambda name: {'exit_code': -9,
                                      'stdout_tail': '',
@@ -1028,7 +1047,7 @@ class JobGuardTests(unittest.TestCase):
                 store.close()
                 store = self._store()
             self.assertTrue(rj.breaker_open(
-                store, 'paper_v2', 'scan', '2026-11-20',
+                store, 'paper_v2', 'scan', self._today_ist(),
                 max_starts=3, window_min=30))
             sup = ra.Supervisor.__new__(ra.Supervisor)
             sup.store = store
@@ -1060,10 +1079,17 @@ class JobGuardTests(unittest.TestCase):
             orig = rsch.load_schedule
             rsch.load_schedule = lambda mode='live': \
                 self._due_scan_schedule()
+            # Pin today to a trading day: the due-scan fixture is fake
+            # and the calendar check inside due_jobs is incidental
+            # here. Without this the test fails on weekends (due_jobs
+            # returns [], breaker never refreshed).
+            orig_day = rsch.is_trading_day
+            rsch.is_trading_day = lambda day: True
             try:
                 sup._manage_jobs()
             finally:
                 rsch.load_schedule = orig
+                rsch.is_trading_day = orig_day
             self.assertIsNone(sup._job_thread)
             # /health: worker running, state degraded, HTTP 200.
             snap = sup.snapshot('render')
