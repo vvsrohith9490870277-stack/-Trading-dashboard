@@ -510,8 +510,16 @@ class Supervisor:
             worker = dict(worker, state='crashed')
         # The heartbeat age comes from the store refresher (the worker
         # process itself does not report it); the rest is in-memory.
+        # Fix 2: the worker's own status, consecutive failures and
+        # last successful quote also come from the refresher (they are
+        # read from the heartbeat row / the audit events, not from the
+        # process), so /health shows a backoff instead of hiding it.
         worker = dict(worker, last_heartbeat_age_s=fields.get(
-            'worker_last_heartbeat_age_s'))
+            'worker_last_heartbeat_age_s'),
+            status=fields.get('worker_status'),
+            consecutive_failures=fields.get(
+                'worker_consecutive_failures'),
+            last_quote_ok_at=fields.get('worker_last_quote_ok_at'))
         breakers = getattr(self, 'breakers', None) or {}
         if self.stopping:
             state = 'stopping'

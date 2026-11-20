@@ -216,7 +216,8 @@ _HEALTH_FIELDS = (
     'lease', 'jobs', 'worker_last_heartbeat_age_s', 'jobs_today',
     'last_job', 'fyers_budget_day_used', 'trial_budget_day_used',
     'box_conflict_check', 'peak_job_rss_mb', 'last_job_peak_rss_mb',
-    'breakers')
+    'breakers', 'worker_status', 'worker_consecutive_failures',
+    'worker_last_quote_ok_at')
 
 
 def new_health_cache():
@@ -232,7 +233,9 @@ def new_health_cache():
             'last_job': None, 'fyers_budget_day_used': None,
             'trial_budget_day_used': None, 'box_conflict_check': None,
             'peak_job_rss_mb': None, 'last_job_peak_rss_mb': None,
-            'breakers': {},
+            'breakers': {}, 'worker_status': None,
+            'worker_consecutive_failures': None,
+            'worker_last_quote_ok_at': None,
         },
         'reasons': {k: 'not_refreshed_yet' for k in _HEALTH_FIELDS},
     }
@@ -251,7 +254,8 @@ def refresh_store_fields(store, namespace, mode, now=None):
     - fields: lease, jobs, worker_last_heartbeat_age_s, jobs_today,
       last_job, fyers_budget_day_used, trial_budget_day_used (trial
       only), box_conflict_check (trial only), peak_job_rss_mb,
-      last_job_peak_rss_mb, breakers.
+      last_job_peak_rss_mb, breakers, worker_status,
+      worker_consecutive_failures, worker_last_quote_ok_at.
     - reasons: {field: reason} for every field that could not be
       computed (never a made-up zero).
     - ok: True when at least one read group succeeded; False only when
@@ -361,23 +365,88 @@ def refresh_store_fields(store, namespace, mode, now=None):
     # namespace, upserted by the engine worker). A missing table is a
     # schema gap (the table is a box table, not in render_schema.sql),
     # not an outage: only this field goes null.
+    # Fix 2 (Grok box test): /health showed ok:true/restarts 0 while
+    # the worker was in backoff with 153 consecutive quote failures,
+    # so the watch log rows 09:29-11:26 were marked UNVERIFIED. The
+    # heartbeat row carries the truth: its status ('backoff',
+    # 'healthy', 'polling'...) and the consecutive failure count in
+    # detail_json['failures'] (the worker resets it to 0 on a
+    # successful cycle). last_quote_ok_at is the latest successful
+    # quote batch (a quote_batch_response event); a failed batch never
+    # moves it, so a worker failing all day still shows the last time
+    # quotes actually worked. All three are null with a reason when
+    # uncomputable, never a made-up value.
     try:
         rows = store.execute(
-            'SELECT heartbeat_at FROM paper_monitor_health'
-            ' WHERE namespace=?', (namespace,))
+            'SELECT heartbeat_at, status, detail_json'
+            ' FROM paper_monitor_health WHERE namespace=?', (namespace,))
         if rows:
-            hb = _parse_ts(rows[0].get('heartbeat_at'))
+            row = rows[0]
+            hb = _parse_ts(row.get('heartbeat_at'))
             if hb is not None:
                 fields['worker_last_heartbeat_age_s'] = int(
                     (now - hb).total_seconds())
             else:
                 reasons['worker_last_heartbeat_age_s'] = \
                     'heartbeat_unparseable'
+            status = row.get('status')
+            if isinstance(status, str) and status:
+                fields['worker_status'] = status
+            else:
+                reasons['worker_status'] = 'heartbeat_status_missing'
+            try:
+                detail = json.loads(row.get('detail_json') or '{}')
+            except Exception:
+                detail = {}
+            failures = detail.get('failures') if isinstance(
+                detail, dict) else None
+            if isinstance(failures, int) and not isinstance(
+                    failures, bool):
+                fields['worker_consecutive_failures'] = failures
+            else:
+                reasons['worker_consecutive_failures'] = \
+                    'heartbeat_failures_missing'
         else:
             reasons['worker_last_heartbeat_age_s'] = 'no_heartbeat_row'
+            reasons['worker_status'] = 'no_heartbeat_row'
+            reasons['worker_consecutive_failures'] = 'no_heartbeat_row'
         ok_groups += 1
     except Exception as ex:
-        reasons['worker_last_heartbeat_age_s'] = _read_reason(ex)
+        reason = _read_reason(ex)
+        reasons['worker_last_heartbeat_age_s'] = reason
+        reasons['worker_status'] = reason
+        reasons['worker_consecutive_failures'] = reason
+
+    # --- last successful quote batch (paper_events). One SELECT for
+    # the latest quote_batch_response event; its response_received_at
+    # (UTC, written by the audit clean()) is converted to IST. A
+    # failed batch (quote_batch_failed) is a different event type and
+    # never moves this. No row (quotes never succeeded) leaves it
+    # null with a reason, not a made-up timestamp.
+    try:
+        rows = store.execute(
+            'SELECT data_json, recorded_at FROM paper_events'
+            " WHERE namespace=? AND event_type='quote_batch_response'"
+            ' ORDER BY recorded_at DESC LIMIT 1', (namespace,))
+        if rows:
+            try:
+                data = json.loads(rows[0].get('data_json') or '{}')
+            except Exception:
+                data = {}
+            at = _parse_ts(data.get('response_received_at')) \
+                if isinstance(data, dict) else None
+            if at is None:
+                at = _parse_ts(rows[0].get('recorded_at'))
+            if at is not None:
+                fields['worker_last_quote_ok_at'] = at.isoformat()
+            else:
+                reasons['worker_last_quote_ok_at'] = \
+                    'quote_response_unparseable'
+        else:
+            reasons['worker_last_quote_ok_at'] = 'no_quote_response_found'
+        ok_groups += 1
+    except Exception as ex:
+        reasons['worker_last_quote_ok_at'] = _read_reason(ex)
 
     # --- budgets (paper_runtime_kv): the same counter the engine
     # budget uses (TokenStore.get_budget reads these exact keys), read
@@ -521,6 +590,13 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
         'restarts': worker.get('restarts', 0),
         'restarts_10m': worker.get('restarts_10m'),
         'last_heartbeat_age_s': worker.get('last_heartbeat_age_s'),
+        # Fix 2 (Grok box test): the worker's own status
+        # ('backoff'/'healthy'/...), its consecutive quote failures,
+        # and the last time a quote batch succeeded — from the store
+        # refresher, null with a reason when uncomputable.
+        'status': worker.get('status'),
+        'consecutive_failures': worker.get('consecutive_failures'),
+        'last_quote_ok_at': worker.get('last_quote_ok_at'),
     }
     if login_allowed is None:
         import render_trial as rt

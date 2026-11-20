@@ -110,12 +110,15 @@ class HealthFieldsTests(unittest.TestCase):
                          self.LIVE_KEYS | {'trial_budget',
                                            'box_conflict_check'})
         # worker subkeys (brief 6.3): state, pid, restarts_10m,
-        # last_heartbeat_age_s (plus the kept rss_mb/restarts)
+        # last_heartbeat_age_s (plus the kept rss_mb/restarts), and
+        # Fix 2 (Grok box test): status, consecutive_failures,
+        # last_quote_ok_at (null until the refresher fills them).
         for snap in (live, trial):
             self.assertEqual(
                 set(snap['worker']),
                 {'state', 'pid', 'rss_mb', 'restarts', 'restarts_10m',
-                 'last_heartbeat_age_s'})
+                 'last_heartbeat_age_s', 'status',
+                 'consecutive_failures', 'last_quote_ok_at'})
             self.assertEqual(set(snap['fyers_budget']),
                              {'day_used', 'per_day_limit'})
             self.assertEqual(set(snap['auth']), {'circuit_open'})
@@ -280,7 +283,8 @@ class HealthStoreTests(unittest.TestCase):
             store.execute(
                 'INSERT INTO paper_monitor_health(namespace, pid,'
                 ' heartbeat_at, status, detail_json) VALUES(?,?,?,?,?)',
-                (namespace, 1234, hb.isoformat(), 'ok', '{}'))
+                (namespace, 1234, hb.isoformat(), 'healthy',
+                 json.dumps({'failures': 0})))
         for key, n in (('fyers_budget', 1234),
                        ('fyers_budget_trial', 57)):
             store.execute(
@@ -344,6 +348,22 @@ class HealthStoreTests(unittest.TestCase):
         store = self._store()
         try:
             today = self._seed(store)
+            # A successful quote batch today, so last_quote_ok_at is
+            # filled (Fix 2): the latest quote_batch_response event.
+            from datetime import datetime as _dt, timezone as _tz
+            store.execute(
+                'CREATE TABLE IF NOT EXISTS paper_events('
+                'namespace TEXT, event_type TEXT, session_day TEXT,'
+                ' recorded_at TEXT, data_json TEXT)')
+            store.execute(
+                'INSERT INTO paper_events(namespace, event_type,'
+                ' session_day, recorded_at, data_json)'
+                ' VALUES(?,?,?,?,?)',
+                ('paper_render_trial_v1', 'quote_batch_response', today,
+                 _dt.now(_tz.utc).isoformat(), json.dumps(
+                     {'response_received_at':
+                      _dt.now(_tz.utc).isoformat(),
+                      'symbols_count': 12})))
             sup = self._sup(store)
             sup._refresh_health_store(force=True)
             snap = sup.snapshot('render')
@@ -352,6 +372,11 @@ class HealthStoreTests(unittest.TestCase):
             self.assertIsInstance(hb, int)
             self.assertGreaterEqual(hb, 0)
             self.assertLessEqual(hb, 30)
+            # Worker status (Fix 2): healthy, 0 consecutive failures,
+            # and a last successful quote just now.
+            self.assertEqual(snap['worker']['status'], 'healthy')
+            self.assertEqual(snap['worker']['consecutive_failures'], 0)
+            self.assertIsNotNone(snap['worker']['last_quote_ok_at'])
             # Jobs today: 2 ok, 1 failed.
             self.assertEqual(snap['jobs_today'], {'ok': 2, 'failed': 1})
             # Last job: the eod, killed by the memory guard.
@@ -532,6 +557,72 @@ class HealthStoreTests(unittest.TestCase):
                 'worker_last_heartbeat_age_s'), 'table_missing')
             self.assertEqual(snap['fyers_budget']['day_used'], 1234)
             self.assertEqual(snap['jobs_today'], {'ok': 2, 'failed': 1})
+        finally:
+            store.close()
+
+    def test_health_worker_status_failures_and_last_quote_ok(self):
+        # Fix 2 (Grok box test): /health must show the worker is in
+        # backoff, not just ok:true/restarts 0. The watch log rows
+        # 09:29-11:26 were marked UNVERIFIED because /health hid the
+        # backoff. The three fields come from the store refresher:
+        # status + consecutive failures from the heartbeat row,
+        # last_quote_ok_at from the latest quote_batch_response event.
+        store = self._store()
+        try:
+            self._seed(store)
+            ns = 'paper_render_trial_v1'
+            store.execute(
+                'UPDATE paper_monitor_health SET status=?,'
+                ' detail_json=? WHERE namespace=?',
+                ('backoff', json.dumps(
+                    {'failures': 153, 'error': 'RuntimeError',
+                     'error_detail': 'connection reset by peer'}),
+                 ns))
+            store.execute(
+                'CREATE TABLE IF NOT EXISTS paper_events('
+                'namespace TEXT, event_type TEXT, session_day TEXT,'
+                ' recorded_at TEXT, data_json TEXT)')
+            store.execute(
+                'INSERT INTO paper_events(namespace, event_type,'
+                ' session_day, recorded_at, data_json)'
+                ' VALUES(?,?,?,?,?)',
+                (ns, 'quote_batch_response', self._today(),
+                 '2026-11-20T05:30:00+00:00', json.dumps(
+                     {'response_received_at': '2026-11-20T05:30:00+00:00',
+                      'symbols_count': 12})))
+            # An older failed batch must not move last_quote_ok_at.
+            store.execute(
+                'INSERT INTO paper_events(namespace, event_type,'
+                ' session_day, recorded_at, data_json)'
+                ' VALUES(?,?,?,?,?)',
+                (ns, 'quote_batch_failed', self._today(),
+                 '2026-11-20T05:31:00+00:00', json.dumps(
+                     {'error_code': 'RuntimeError'})))
+            sup = self._sup(store)
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertEqual(snap['worker']['status'], 'backoff')
+            self.assertEqual(snap['worker']['consecutive_failures'], 153)
+            self.assertEqual(snap['worker']['last_quote_ok_at'],
+                             '2026-11-20T11:00:00+05:30')
+        finally:
+            store.close()
+
+    def test_health_worker_fields_null_when_uncomputable(self):
+        # No heartbeat row and no quote response: the three fields
+        # stay null with reasons, never a made-up zero or 'healthy'.
+        store = self._store()
+        try:
+            self._seed(store, with_monitor=False)
+            sup = self._sup(store)
+            sup._refresh_health_store(force=True)
+            snap = sup.snapshot('render')
+            self.assertIs(snap['worker']['status'], None)
+            self.assertIs(snap['worker']['consecutive_failures'], None)
+            self.assertIs(snap['worker']['last_quote_ok_at'], None)
+            self.assertIn('worker_status', snap['reasons'])
+            self.assertIn('worker_consecutive_failures', snap['reasons'])
+            self.assertIn('worker_last_quote_ok_at', snap['reasons'])
         finally:
             store.close()
 
