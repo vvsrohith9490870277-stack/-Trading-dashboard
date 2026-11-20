@@ -1,36 +1,52 @@
 # Render blueprint: Track A paper-trading backend (free tier).
 # One web service + in-process supervisor; all state in Turso.
-# Env vars are sync: false: they are prompted at Blueprint creation and
-# never stored in this repo.
+# Secret env vars are sync: false: Render prompts for them at Blueprint
+# creation and they are never stored in this repo.
+# First deploy = Friday trial defaults (RENDER_MODE=trial on a trial
+# namespace, no login). The Monday handoff switches these in the dashboard
+# (see deploy/render/DEPLOY.md).
 services:
   - type: web
     name: signal-atlas-paper
-    env: python
+    runtime: docker
     region: singapore
     plan: free
     autoDeployTrigger: "off"  # quoted: unquoted off parses as boolean false
     healthCheckPath: /health
     maxShutdownDelaySeconds: 30
-    dockerfilePath: deploy/render/Dockerfile
+    dockerfilePath: ./deploy/render/Dockerfile
     dockerContext: .
     envVars:
       - key: PAPER_RUNTIME
         value: render
-        sync: false
+      - key: PAPER_SESSIOND_DISABLE
+        value: "1"
+      - key: TZ
+        value: Asia/Kolkata
+      - key: PAPER_STATE_DIR
+        value: /tmp/paper-state
       - key: RENDER_MODE
-        value: live
-        sync: false
+        value: trial
       - key: PAPER_NAMESPACE_OVERRIDE
-        sync: false
+        value: paper_render_trial_v1
+      - key: FYERS_AUTO_LOGIN
+        value: "0"
+      - key: RENDER_TRIAL_DAY_CAP
+        value: "1000"
       - key: TURSO_DATABASE_URL
         sync: false
       - key: TURSO_AUTH_TOKEN
         sync: false
       - key: TOKEN_ENC_KEY
         sync: false
-      - key: FYERS_AUTO_LOGIN
-        value: "0"
+      - key: FYERS_APP_ID
         sync: false
-      - key: PAPER_SESSIOND_DISABLE
-        value: "1"
+      # Live mode only (Monday handoff). Leave unset during the trial.
+      - key: FYERS_CLIENT_ID
+        sync: false
+      - key: FYERS_SECRET_ID
+        sync: false
+      - key: FYERS_PIN
+        sync: false
+      - key: FYERS_TOTP_SECRET
         sync: false

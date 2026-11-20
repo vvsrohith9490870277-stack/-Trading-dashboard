@@ -16,24 +16,36 @@ class PackagingTests(unittest.TestCase):
         data = yaml.safe_load((ROOT / 'render.yaml').read_text())
         svc = data['services'][0]
         self.assertEqual(svc['type'], 'web')
-        self.assertEqual(svc['env'], 'python')
+        # Docker runtime: with env/runtime python Render ignores the Dockerfile
+        self.assertEqual(svc.get('runtime'), 'docker')
+        self.assertNotIn('env', svc)
         self.assertEqual(svc['plan'], 'free')
         self.assertEqual(svc['region'], 'singapore')
         self.assertEqual(svc['healthCheckPath'], '/health')
         self.assertEqual(svc['maxShutdownDelaySeconds'], 30)
-        self.assertEqual(svc['dockerfilePath'],
+        self.assertEqual(svc['dockerfilePath'].lstrip('./'),
                          'deploy/render/Dockerfile')
         # autoDeploy is deprecated; the spec uses autoDeployTrigger: off
         self.assertNotIn('autoDeploy', svc)
         self.assertEqual(svc['autoDeployTrigger'], 'off')
-        env_names = {e['key']: e for e in svc['envVars']}
-        for key in ('PAPER_RUNTIME', 'RENDER_MODE', 'TURSO_DATABASE_URL',
-                    'TURSO_AUTH_TOKEN', 'TOKEN_ENC_KEY', 'FYERS_AUTO_LOGIN',
-                    'PAPER_NAMESPACE_OVERRIDE'):
-            self.assertIn(key, env_names, key)
-            self.assertFalse(env_names[key].get('sync', True),
-                             key + ' must be sync: false')
-        self.assertEqual(env_names['PAPER_RUNTIME'].get('value'), 'render')
+        env = {e['key']: e for e in svc['envVars']}
+        # secrets: prompted (sync: false), never inlined
+        for key in ('TURSO_DATABASE_URL', 'TURSO_AUTH_TOKEN', 'TOKEN_ENC_KEY',
+                    'FYERS_APP_ID', 'FYERS_CLIENT_ID', 'FYERS_SECRET_ID',
+                    'FYERS_PIN', 'FYERS_TOTP_SECRET'):
+            self.assertIn(key, env, key)
+            self.assertIs(env[key].get('sync'), False, key)
+            self.assertNotIn('value', env[key], key)
+        # first deploy = Friday trial defaults, no login
+        self.assertEqual(env['PAPER_RUNTIME']['value'], 'render')
+        self.assertEqual(env['RENDER_MODE']['value'], 'trial')
+        self.assertRegex(env['PAPER_NAMESPACE_OVERRIDE']['value'],
+                         r'^paper_render_trial_[a-z0-9_]{1,24}$')
+        self.assertEqual(env['FYERS_AUTO_LOGIN']['value'], '0')
+        self.assertEqual(env['RENDER_TRIAL_DAY_CAP']['value'], '1000')
+        for key in ('PAPER_RUNTIME', 'RENDER_MODE', 'PAPER_NAMESPACE_OVERRIDE',
+                    'FYERS_AUTO_LOGIN', 'PAPER_SESSIOND_DISABLE'):
+            self.assertNotIn('sync', env[key], key + ': plain value, no sync')
 
     def test_dockerfile_has_expected_steps(self):
         text = (DEPLOY / 'Dockerfile').read_text()
