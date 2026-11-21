@@ -11,6 +11,14 @@ Safety rules:
   exactly like a failed per-call write, so the caller's existing spool/backoff handling applies.
 - Every (re)start first runs one per-call query, so db.mjs's freeze-lock check still gates the session.
 - Restarts are bounded per window; past the bound the helper stays off and the per-call path serves all.
+Read counter (turso-move Task 4): stats['reads'] counts every 'query' action dispatched through the
+helper, one per _roundtrip, so a retry that re-executes the query counts again; an attempt that then
+fails still counts (a failed read consumed a Turso read if it reached the server). Batches and every
+other action never count. The per-call path counts its own queries in engine.DB._reads (including the
+helper's fallback queries and its freeze-lock gate); DB.read_count() is the sum, so each execution
+counts exactly once, at exactly one layer. The counter lives on this Helper object: it survives a
+helper restart and resets only with a new Helper (process restart). No limits are enforced: this
+only counts.
 """
 import atexit,collections,itertools,json,subprocess,threading,time
 
@@ -29,7 +37,7 @@ class Helper:
   self.root,self.test_database,self.cfg,self.per_call=root,test_database,cfg,per_call
   self.log_fn,self.popen,self.sleep,self.clock=log,popen,sleep,clock
   self.proc=None;self.lock=threading.RLock();self.pending={};self.ids=itertools.count(1);self.restarts=collections.deque();self.disabled_until=0.0;self.closed=False
-  self.stats={'helper_requests':0,'helper_ok':0,'fallbacks':0,'starts':0,'restarts':0,'retries':0,'timeouts':0,'errors':0,'write_unconfirmed':0}
+  self.stats={'helper_requests':0,'helper_ok':0,'reads':0,'fallbacks':0,'starts':0,'restarts':0,'retries':0,'timeouts':0,'errors':0,'write_unconfirmed':0}
   atexit.register(self.close)
  def log(self,event,**data):
   if self.log_fn:
@@ -113,7 +121,7 @@ class Helper:
    last=attempt==tries-1
    try:
     if not self._ensure():raise HelperUnavailable('disabled_or_start_failed')
-    self.stats['helper_requests']+=1;r=self._roundtrip(req,timeout);self.stats['helper_ok']+=1;return r
+    self.stats['helper_requests']+=1;self.stats['reads']+=action=='query';r=self._roundtrip(req,timeout);self.stats['helper_ok']+=1;return r
    except HelperUnavailable as ex:
     return self._fallback(a,str(ex))
    except HelperError as ex:

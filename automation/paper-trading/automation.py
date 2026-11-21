@@ -415,6 +415,15 @@ def frozen_since(detail):
  if not detail.get('boot_id') or detail.get('boot_id')!=boot_id():return 0.0
  return max(0.0,mono_offset()-off)
 def heartbeat(e,db,status,**detail):
+ # Turso-move Task 4: the worker's read count, so /health's refresher can pick it up from detail_json.
+ # Both keys are the same number by construction: the counter's epoch is process start. The write
+ # itself is a batch, so writing the heartbeat never increments the count. Duck-typed DBs without
+ # read_count() (tests) simply get no keys.
+ read_count=getattr(db,'read_count',None)
+ if callable(read_count):
+  try:n=read_count()
+  except Exception:n=None
+  if isinstance(n,int) and not isinstance(n,bool):detail['db_reads_total']=n;detail['db_reads_since_start']=n
  detail['process_start']=(Path('/proc')/str(os.getpid())/'stat').read_text().split()[21]
  detail['mono_offset']=round(mono_offset(),3);detail['boot_id']=boot_id()
  db.batch([('INSERT INTO paper_monitor_health(namespace,pid,heartbeat_at,status,detail_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace) DO UPDATE SET pid=excluded.pid,heartbeat_at=excluded.heartbeat_at,status=excluded.status,detail_json=excluded.detail_json',(e.NS,os.getpid(),e.now().isoformat(),status,e.js(detail)))])

@@ -41,7 +41,15 @@ def log(kind,**data):
  with (ROOT/('logs/tests.jsonl' if NS.startswith('test_') else 'logs/engine.jsonl')).open('a') as f:f.write(js(r)+'\n')
  return r
 class DB:
- def __init__(self,test_database=None):self.test_database=test_database;self.helper=None
+ def __init__(self,test_database=None):self.test_database=test_database;self.helper=None;self._reads=0
+ def read_count(self):
+  """Reads dispatched by this process (turso-move Task 4): per-call queries (self._reads) plus helper
+  queries (Helper.stats['reads']). Each query execution counts once, at exactly one layer; a retry
+  counts again because it re-executes the query, and an attempt that then fails still counts. Batches
+  and every other action never count. Survives a helper restart; resets only with a new DB object
+  (process restart). No limits are enforced: this only counts."""
+  h=self.helper
+  return self._reads+(h.stats.get('reads',0) if h is not None else 0)
  def enable_helper(self):
   """Long-running callers (the worker) route query/batch through one persistent connection; see db_helper.py."""
   if self.helper is None and CFG.get('db_helper',{}).get('enabled'):self.helper=dbh.Helper(ROOT,self.test_database,CFG['db_helper'],self._call_per_process,log)
@@ -61,6 +69,7 @@ class DB:
   h=CFG.get('db_helper') or {}
   return float(h.get('per_call_timeout_seconds') or h.get('batch_timeout_seconds') or 30)
  def _call_per_process(self,a):
+  if a.get('action')=='query':self._reads+=1  # count at dispatch: every execution incl. retries/fallbacks/gate; writes never count
   if self.test_database:a={**a,'test_database':self.test_database}
   try:r=subprocess.run(['node',str(ROOT/'db.mjs')],input=js(a),text=True,capture_output=True,timeout=self._call_timeout())
   except subprocess.TimeoutExpired as ex:raise RuntimeError('HELPER_TIMEOUT') from ex
