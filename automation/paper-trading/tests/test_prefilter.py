@@ -50,6 +50,27 @@ class CalculationTests(unittest.TestCase):
     if 'open,high' in sql:rows[0]['trade_date']='2026-11-04'
     return rows
   with self.assertRaisesRegex(RuntimeError,'missing_verified_exchange_session'):p.benchmark(e,GapDB(),date(2026,11,6))
+ def test_benchmark_reference_uses_configured_symbol_not_hardcoded_nifty500(self):
+  # The session-date reference query must use the configured benchmark symbol
+  # (POLICY['benchmark_db_symbol'] = 'NIFTY50-INDEX'), not a hardcoded 'NIFTY500'.
+  # A stray NIFTY500 row on a non-session day must not trip the completeness check.
+  from datetime import date
+  dates=pd.bdate_range(end='2026-11-06',periods=253).strftime('%Y-%m-%d')
+  bench=[{'trade_date':d,'open':100,'high':101,'low':99,'close':100,'volume':0} for d in dates]
+  stray='2026-10-31'  # Saturday inside the range: not a session day, no benchmark row.
+  self.assertEqual(date(2026,10,31).weekday(),5)
+  class RefDB:
+   def __init__(self):self.reference_symbols=[]
+   def query(self,sql,args):
+    if 'open,high' in sql:return [dict(r) for r in bench]
+    self.reference_symbols.append(args[0])
+    if args[0]=='NIFTY500':return [{'trade_date':d} for d in dates]+[{'trade_date':stray}]
+    return [{'trade_date':d} for d in dates]
+  db=RefDB()
+  frame=p.benchmark(e,db,date(2026,11,6))
+  self.assertEqual(len(frame),253)
+  self.assertEqual(db.reference_symbols,[p.POLICY['benchmark_db_symbol']])
+  self.assertEqual(p.POLICY['benchmark_db_symbol'],'NIFTY50-INDEX')
  def test_strict_trend_not_equal(self):
   s,b=frames();s[['open','close']]=100;s.high=101;s.low=99;r=p.evaluate(s,b,'2026-11-06');self.assertFalse(r['checks']['close_above_sma50']);self.assertFalse(r['checks']['sma50_above_sma200']);self.assertFalse(r['checks']['return20_positive'])
 

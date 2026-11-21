@@ -56,7 +56,7 @@ def benchmark(e,db,target,api=None,sync=False):
    start=end+e.timedelta(days=1)
   db.batch(statements);rows=db.query('SELECT trade_date,open,high,low,close,volume FROM index_ohlcv WHERE symbol=? AND trade_date<=? ORDER BY trade_date',(symbol,str(target)))
  if rows:
-  first=rows[-253:][0]['trade_date'];expected={r['trade_date'] for r in db.query('SELECT trade_date FROM index_ohlcv WHERE symbol=? AND trade_date>=? AND trade_date<=?',('NIFTY500',first,str(target)))}
+  first=rows[-253:][0]['trade_date'];expected={r['trade_date'] for r in db.query('SELECT trade_date FROM index_ohlcv WHERE symbol=? AND trade_date>=? AND trade_date<=?',(symbol,first,str(target)))}
   day=e.date.fromisoformat(first)
   while day<=target:
    if e.session(day) and str(day) not in MUHURAT_INDICATOR_EXCLUDED:expected.add(str(day))
