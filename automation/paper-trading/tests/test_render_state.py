@@ -190,6 +190,21 @@ class TursoHttpTests(unittest.TestCase):
             store.execute("SELECT * FROM no_such_table_xyz")
         self.assertNotIn('SECRETTOKEN123', str(cm.exception))
 
+    def test_read_counter_counts_reads_only(self):
+        sess = FakeTursoSession()
+        store = rs.TursoHttpStore('libsql://mydb-myorg.turso.io', 'T', session=sess)
+        rs.migrate(store)
+        base = store.read_count()
+        store.execute('SELECT 1 AS n')
+        self.assertEqual(store.read_count(), base + 1)
+        store.execute("INSERT INTO paper_runtime_kv(scope,key,value,updated_at) VALUES(?,?,?,?)",
+                      ('_global', 'k', 'v', '2026-11-19T00:00:00+05:30'))
+        store.execute_many([("INSERT INTO paper_runtime_kv(scope,key,value,updated_at) VALUES(?,?,?,?)",
+                             ('_global', 'k2', 'v', '2026-11-19T00:00:00+05:30'))])
+        self.assertEqual(store.read_count(), base + 1, 'writes never count')
+        store.server_time()
+        self.assertEqual(store.read_count(), base + 2, 'server_time is a SELECT')
+
     def test_server_time_used_not_local(self):
         # The store must ask the server for time (strftime('%s','now') in SQL),
         # never compute it from the container clock.

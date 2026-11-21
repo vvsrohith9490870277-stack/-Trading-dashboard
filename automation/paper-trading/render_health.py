@@ -23,7 +23,7 @@ decides whether the tick may read the store for them.
 
 Render-deploy-03 Task 3 is that decision: a background refresher
 (`refresh_store_fields`, driven from the supervisor tick) reads the
-store at most once every RENDER_HEALTH_REFRESH_S (default 60 s) and
+store at most once every RENDER_HEALTH_REFRESH_S (default 300 s) and
 caches the result; /health serves the cache and never touches the
 store. A store error sets store_ok false and never raises into
 /health. Values that cannot be computed stay null with a `reasons`
@@ -37,7 +37,7 @@ from zoneinfo import ZoneInfo
 IST = ZoneInfo('Asia/Kolkata')
 MEMORY_LIMIT_MB = 450
 # /health payload version; bump when the /health shape changes.
-VERSION = '1.0.0'
+VERSION = '1.1.0'
 
 
 def memory_rss_mb():
@@ -129,11 +129,11 @@ def memory_over_limit(rss_mb, limit=MEMORY_LIMIT_MB):
 
 def health_refresh_seconds():
     """Background refresher interval in seconds (env
-    RENDER_HEALTH_REFRESH_S, default 60)."""
+    RENDER_HEALTH_REFRESH_S, default 300)."""
     try:
-        return max(1, int(os.environ.get('RENDER_HEALTH_REFRESH_S', '60')))
+        return max(1, int(os.environ.get('RENDER_HEALTH_REFRESH_S', '300')))
     except ValueError:
-        return 60
+        return 300
 
 
 def _parse_ts(value):
@@ -217,7 +217,7 @@ _HEALTH_FIELDS = (
     'last_job', 'fyers_budget_day_used', 'trial_budget_day_used',
     'box_conflict_check', 'peak_job_rss_mb', 'last_job_peak_rss_mb',
     'breakers', 'worker_status', 'worker_consecutive_failures',
-    'worker_last_quote_ok_at', 'quote_probe')
+    'worker_last_quote_ok_at', 'quote_probe', 'store_reads_total')
 
 
 def new_health_cache():
@@ -236,6 +236,7 @@ def new_health_cache():
             'breakers': {}, 'worker_status': None,
             'worker_consecutive_failures': None,
             'worker_last_quote_ok_at': None, 'quote_probe': None,
+            'store_reads_total': None,
         },
         'reasons': {k: 'not_refreshed_yet' for k in _HEALTH_FIELDS},
     }
@@ -255,7 +256,9 @@ def refresh_store_fields(store, namespace, mode, now=None):
       last_job, fyers_budget_day_used, trial_budget_day_used (trial
       only), box_conflict_check (trial only), peak_job_rss_mb,
       last_job_peak_rss_mb, breakers, worker_status,
-      worker_consecutive_failures, worker_last_quote_ok_at.
+      worker_consecutive_failures, worker_last_quote_ok_at,
+      store_reads_total (no store read: the counter lives on the
+      store object in this process).
     - reasons: {field: reason} for every field that could not be
       computed (never a made-up zero).
     - ok: True when at least one read group succeeded; False only when
@@ -538,6 +541,22 @@ def refresh_store_fields(store, namespace, mode, now=None):
         except Exception as ex:
             reasons['quote_probe'] = _read_reason(ex)
 
+    # --- supervisor store reads (no store read: the counter lives on
+    # the store object in this process, so sampling it costs nothing
+    # and is not a read group — it does not change `ok`). The value is
+    # sampled after the groups above, so it includes this refresh's own
+    # reads. A store without a counter (a duck-typed test double, or a
+    # wrapper that does not delegate read_count) leaves the field null
+    # with a reason, never a made-up zero.
+    read_count = getattr(store, 'read_count', None)
+    if callable(read_count):
+        try:
+            fields['store_reads_total'] = read_count()
+        except Exception:
+            reasons['store_reads_total'] = 'counter_unreadable'
+    else:
+        reasons['store_reads_total'] = 'store_has_no_read_counter'
+
     return {'ok': ok_groups > 0, 'fields': fields, 'reasons': reasons}
 
 
@@ -554,7 +573,7 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
                    breakers=None, store_ok=None, store_age_s=None,
                    reasons=None, peak_job_rss_mb=None,
                    last_job_peak_rss_mb=None, job_rss_cap_mb=None,
-                   quote_probe=None):
+                   quote_probe=None, store_reads_total=None):
     """Build the /health payload (brief 01 Task 6.3).
 
     The first nine arguments are the original snapshot inputs and keep
@@ -574,6 +593,10 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
     values), `peak_job_rss_mb` / `last_job_peak_rss_mb` (largest
     job-tree peak today / the last job's peak, from the guard's sampled
     RSS in the job rows), `job_rss_cap_mb` (the cap in force).
+    `store_reads_total` (Turso reads dispatched by the supervisor
+    process since it started, from the store object's counter —
+    sampled by the refresher, never a store read, at most every
+    RENDER_HEALTH_REFRESH_S like the other Task 3 fields).
     """
     if active_runner != 'render':
         status = 'idle_not_active_runner'
@@ -658,6 +681,7 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
         'breakers': breakers if breakers is not None else {},
         'store_ok': store_ok,
         'store_age_s': store_age_s,
+        'store_reads_total': store_reads_total,
         'reasons': reasons if reasons is not None else {},
         'peak_job_rss_mb': peak_job_rss_mb,
         'last_job_peak_rss_mb': last_job_peak_rss_mb,

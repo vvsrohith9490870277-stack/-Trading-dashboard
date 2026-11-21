@@ -84,7 +84,8 @@ class HealthFieldsTests(unittest.TestCase):
         'last_tick_ist', 'last_lease_renew_age_s', 'jobs_today',
         'last_job', 'rss_mb', 'children_rss_mb', 'fyers_budget', 'auth',
         'git_sha', 'version', 'breakers', 'store_ok', 'store_age_s',
-        'reasons', 'peak_job_rss_mb', 'last_job_peak_rss_mb',
+        'store_reads_total', 'reasons', 'peak_job_rss_mb',
+        'last_job_peak_rss_mb',
         'job_rss_cap_mb',
         # kept from the original snapshot:
         'status', 'active_runner', 'lease', 'jobs', 'uptime_seconds',
@@ -416,6 +417,11 @@ class HealthStoreTests(unittest.TestCase):
             self.assertIsInstance(snap['store_age_s'], int)
             self.assertLessEqual(snap['store_age_s'], 30)
             self.assertEqual(snap['reasons'], {})
+            # Read counter (Task 4): the refresher sampled the store's
+            # counter — an int, and positive: it includes this refresh's
+            # own reads.
+            self.assertIsInstance(snap['store_reads_total'], int)
+            self.assertGreater(snap['store_reads_total'], 0)
             # The lease + jobs come from the cache too.
             self.assertEqual(snap['lease']['owner_id'], 'render:h:1:1')
             self.assertIn('scan', snap['jobs'])
@@ -860,6 +866,59 @@ class SupervisorTests(unittest.TestCase):
 if __name__ == '__main__':
     unittest.main()
 
+
+class SupervisorTickTests(unittest.TestCase):
+    """Read-usage guard: the supervisor main loop ticks every 60 s
+    (was 5 s), so the /health store refresher and worker checks run
+    far less often."""
+
+    def test_tick_is_60_seconds(self):
+        import inspect
+
+        import render_app as ra
+        self.assertEqual(ra.SUPERVISOR_TICK_SECONDS, 60)
+        # The main loop must sleep the 60 s tick from the constant, not
+        # a literal: reverting the loop to time.sleep(5) fails this test.
+        # The sleep is sliced into 1 s waits so SIGTERM (which sets
+        # sup.stopping) is honoured within ~1 s — a single 60 s
+        # time.sleep() would retry after the handler (PEP 475) and
+        # delay shutdown past the 25 s exit guarantee.
+        src = inspect.getsource(ra.main)
+        self.assertIn('range(SUPERVISOR_TICK_SECONDS)', src)
+        self.assertIn('time.sleep(1)', src)
+        self.assertNotIn('time.sleep(5)', src)
+        self.assertNotIn('time.sleep(SUPERVISOR_TICK_SECONDS)', src)
+
+
+
+class HealthRefreshTests(unittest.TestCase):
+    """Read-usage guard: RENDER_HEALTH_REFRESH_S defaults to 300 s
+    (was 60 s); an invalid value falls back to the same 300 s default
+    as an unset one."""
+
+    def setUp(self):
+        self._old = os.environ.pop('RENDER_HEALTH_REFRESH_S', None)
+
+    def tearDown(self):
+        if self._old is None:
+            os.environ.pop('RENDER_HEALTH_REFRESH_S', None)
+        else:
+            os.environ['RENDER_HEALTH_REFRESH_S'] = self._old
+
+    def test_default_is_300_seconds(self):
+        self.assertEqual(rh.health_refresh_seconds(), 300)
+
+    def test_explicit_value_is_respected(self):
+        os.environ['RENDER_HEALTH_REFRESH_S'] = '60'
+        self.assertEqual(rh.health_refresh_seconds(), 60)
+
+    def test_invalid_value_falls_back_to_300(self):
+        os.environ['RENDER_HEALTH_REFRESH_S'] = 'not-a-number'
+        self.assertEqual(rh.health_refresh_seconds(), 300)
+
+    def test_value_is_clamped_to_at_least_1(self):
+        os.environ['RENDER_HEALTH_REFRESH_S'] = '0'
+        self.assertEqual(rh.health_refresh_seconds(), 1)
 
 class JobGuardTests(unittest.TestCase):
     """Task 2 (render-deploy-03): per-job memory guard + crash-loop

@@ -71,12 +71,23 @@ class SqliteStore:
         self.conn.execute('PRAGMA busy_timeout=30000')
         self._lock = threading.RLock()
 
+        # Read counter (turso-move Task 4): SELECT/WITH statements
+        # dispatched through this store since the process started.
+        # Same rule as TursoHttpStore; no limits are enforced.
+        self.reads = 0
+
     def execute(self, sql, args=()):
         with self._lock:
+            if sql.strip().upper().startswith(('SELECT', 'WITH')):
+                self.reads += 1
             cur = self.conn.execute(sql, args)
             rows = [dict(r) for r in cur.fetchall()] if cur.description is not None else []
             self.conn.commit()
             return rows
+
+    def read_count(self):
+        """Reads dispatched through this store since the process started."""
+        return self.reads
 
     def execute_many(self, statements):
         counts = []
@@ -147,6 +158,16 @@ class TursoHttpStore:
         self.session = session or requests.Session()
         self.timeout = timeout
 
+        # Read counter (turso-move Task 4): read statements dispatched
+        # over HTTP since the supervisor process started. Incremented
+        # in _pipeline (below), the single place a statement is actually
+        # sent; no limits are enforced, this only counts.
+        self.reads = 0
+
+    def read_count(self):
+        """Reads dispatched through this store since the process started."""
+        return self.reads
+
     def _pipeline(self, reqs, read_only=False):
         body = {'requests': reqs}
         headers = {'Authorization': 'Bearer ' + self.token,
@@ -154,6 +175,14 @@ class TursoHttpStore:
         attempts = 0
         while True:
             try:
+                # Count every read statement dispatched, including
+                # _pipeline retries (read-only pipelines are re-sent up
+                # to twice on transport failure). Writes
+                # (read_only=False) never count. execute() is the only
+                # read entry point: it sets read_only from the SQL
+                # (SELECT/WITH), the same test its retry policy uses.
+                if read_only:
+                    self.reads += 1
                 r = self.session.post(self.base + '/v2/pipeline', headers=headers,
                                       json=body, timeout=self.timeout)
             except Exception:

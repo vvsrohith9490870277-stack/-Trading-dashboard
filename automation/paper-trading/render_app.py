@@ -34,6 +34,9 @@ import runtime_mode as rm
 IST = ZoneInfo('Asia/Kolkata')
 WORKER_BACKOFF_SECONDS = (5, 10, 20, 40, 60)
 WORKER_STOP_TIMEOUT_SECONDS = 20
+# Main-loop tick (read-usage guard): the supervisor re-checks the worker
+# and refreshes the /health store fields at most once per tick. Was 5 s.
+SUPERVISOR_TICK_SECONDS = 60
 
 
 def repo_config_namespace():
@@ -362,7 +365,7 @@ class Supervisor:
 
     def _refresh_health_store(self, force=False):
         """Refresh the cached /health store fields (Task 3), at most
-        once per RENDER_HEALTH_REFRESH_S (default 60 s) unless forced.
+        once per RENDER_HEALTH_REFRESH_S (default 300 s) unless forced.
         One refresh is a handful of SELECTs; /health itself never
         touches the store. A failed refresh keeps the last good values
         (stale, with store_age_s growing) and marks store_ok false;
@@ -726,6 +729,7 @@ class Supervisor:
             last_job_peak_rss_mb=fields.get('last_job_peak_rss_mb'),
             job_rss_cap_mb=job_rss_cap_mb(),
             quote_probe=fields.get('quote_probe'),
+            store_reads_total=fields.get('store_reads_total'),
             fyers_budget={
                 'day_used': fields.get('fyers_budget_day_used'),
                 'per_day_limit': int(
@@ -829,7 +833,15 @@ def main(argv=None):
             sup.tick()
         except Exception:
             pass
-        time.sleep(5)
+        # Sleep the 60 s tick in 1 s slices so SIGTERM (which sets
+        # sup.stopping) is honoured within ~1 s, not up to 60 s:
+        # time.sleep() retries after a signal handler (PEP 475), so a
+        # single 60 s sleep would delay shutdown past the 25 s exit
+        # guarantee the SIGTERM test pins.
+        for _ in range(SUPERVISOR_TICK_SECONDS):
+            if sup.stopping:
+                break
+            time.sleep(1)
     sup.shutdown()
     httpd.shutdown()
     print('render supervisor stopped', flush=True)
