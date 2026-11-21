@@ -1,0 +1,7 @@
+{"at_IST": "2026-11-19T09:30:00+05:30", "namespace": "paper_v2", "kind": "monitor_completed", "status": "ok", "fills": 0, "fresh_quotes": 690}
+{"at_IST": "2026-11-19T15:30:00+05:30", "namespace": "paper_v2", "kind": "monitor_completed", "status": "ok", "fills": 0, "fresh_quotes": 688}
+{"at_IST": "2026-11-20T09:31:00+05:30", "namespace": "paper_v2", "kind": "paper_fill_attempt", "strategy": 2, "symbol": "RELIANCE", "result": {"filled": false, "reason": "missing_or_failed_current_prefilter_proof", "execution_path": "LTP_LEGACY", "correlation_id": "bb01"}}
+{"at_IST": "2026-11-20T09:32:00+05:30", "namespace": "paper_v2", "kind": "order_skipped", "strategy": 2, "symbol": "RELIANCE", "signal_id": "bb01", "cause": "missing_or_failed_current_prefilter_proof", "price": 1523.4, "open_positions": 0, "quantity": 0}
+{"at_IST": "2026-11-20T10:15:00+05:30", "namespace": "paper_v2", "kind": "monitor_completed", "status": "ok", "fills": 0, "fresh_quotes": 691}
+{"at_IST": "2026-11-20T15:30:00+05:30", "namespace": "paper_v2", "kind": "monitor_completed", "status": "ok", "fills": 0, "fresh_quotes": 689}
+{"at_IST": "2026-11-20T10:20:00+05:30", "namespace": "paper_v1", "kind": "paper_fill_attempt", "strategy": 1, "symbol": "TCS", "result": {"filled": true, "side": "BUY", "qty": 10, "price": 4100.0, "realized_pnl": 0, "execution_path": "LTP_LEGACY", "correlation_id": "ff01"}}

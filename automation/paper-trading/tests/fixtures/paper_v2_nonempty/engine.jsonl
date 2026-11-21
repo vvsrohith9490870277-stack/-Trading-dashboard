@@ -1,0 +1,4 @@
+{"at_IST": "2026-11-19T09:30:00+05:30", "namespace": "paper_v2", "kind": "monitor_completed", "status": "ok", "fills": 0, "fresh_quotes": 690}
+{"at_IST": "2026-11-20T09:31:00+05:30", "namespace": "paper_v2", "kind": "paper_fill_attempt", "strategy": 2, "symbol": "RELIANCE", "result": {"filled": true, "side": "BUY", "qty": 32, "price": 1523.4, "realized_pnl": 0, "execution_path": "LTP_LEGACY", "correlation_id": "cc01"}}
+{"at_IST": "2026-11-20T09:32:00+05:30", "namespace": "paper_v2", "kind": "order_skipped", "strategy": 2, "symbol": "RELIANCE", "signal_id": "cc02", "cause": "position_guard", "price": 1523.4, "open_positions": 1, "quantity": 0}
+{"at_IST": "2026-11-20T10:15:00+05:30", "namespace": "paper_v2", "kind": "monitor_completed", "status": "ok", "fills": 1, "fresh_quotes": 691}
