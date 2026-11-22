@@ -1,4 +1,4 @@
-"""Candidate shadow runner (B3): evaluate registry challengers 101-105 in
+"""Candidate shadow runner (B3): evaluate registry challengers 101-106 in
 shadow / observation mode only.
 
 - Uses adaptive_engine.simulate_track_window with the signal_evaluator hook,
@@ -62,20 +62,23 @@ def _check_namespace(namespace):
         raise ValueError(f'protected_namespace:{namespace}')
 
 
-def make_evaluator(strategy, stock_df):
+def make_evaluator(strategy, stock_df, sector_map=None):
     """signal_evaluator for simulate_track_window: registry signals for one
-    candidate. For 101 (derived_rs_rank) and 105 (cross-sectional rank) the
-    full universe panel is captured so ranks are computed point-in-time
-    (bars up to each signal date only)."""
+    candidate. For 101 (derived_rs_rank), 105 (cross-sectional rank) and
+    106 (sector-adjusted rank) the full universe panel is captured so ranks
+    are computed point-in-time (bars up to each signal date only). 106 also
+    needs a symbol->sector map (explicit sector_map, or a 'sector' /
+    'industry' column on the panel); without one it enters nothing."""
     s = int(strategy)
-    if s in (101, 105):
-        # Precompute 101/105 signals once on the full panel (each rank at a
+    if s in (101, 105, 106):
+        # Precompute 101/105/106 signals once on the full panel (each rank at a
         # date uses only closes up to that date, so this is PIT-safe).
         # Corp-action back-adjustment is not applied to the rank panel; the
         # simulator's adj_hist is used only for the fill prices.
         precomputed = {}
         for sym, sdf in stock_df.groupby('symbol'):
-            precomputed[str(sym)] = ac.candidate_signals(s, sdf.reset_index(drop=True), universe=stock_df)
+            precomputed[str(sym)] = ac.candidate_signals(s, sdf.reset_index(drop=True), universe=stock_df,
+                                                          sector_map=sector_map)
 
         def evaluator(_s, adj_hist):
             sym = str(adj_hist['symbol'].iloc[0])
@@ -89,7 +92,7 @@ def make_evaluator(strategy, stock_df):
 
 
 def run_shadow(db, namespace, stock_df, index_df, warm_start_dates, eval_dates,
-               strategies=None, session_day=None):
+               strategies=None, session_day=None, sector_map=None):
     """Evaluate candidates in shadow mode and persist the results.
 
     Returns {strategy: {'status': 'SHADOW_SIMULATED', 'closed_trades': n,
@@ -105,7 +108,7 @@ def run_shadow(db, namespace, stock_df, index_df, warm_start_dates, eval_dates,
         ws = int(c['warm_start_days'])
         ws_dates = [str(d) for d in warm_start_dates][-ws:]
         ev_dates = [str(d) for d in eval_dates]
-        evaluator = make_evaluator(s, stock_df)
+        evaluator = make_evaluator(s, stock_df, sector_map=sector_map)
         res = ae.simulate_track_window(db, namespace, s, dict(c['params']), stock_df, index_df,
                                        ws_dates, ev_dates, signal_evaluator=evaluator)
         stamp = _utc_now()
@@ -132,7 +135,7 @@ def run_shadow(db, namespace, stock_df, index_df, warm_start_dates, eval_dates,
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description='Shadow-evaluate candidate strategies 101-105 (observation only).')
+    ap = argparse.ArgumentParser(description='Shadow-evaluate candidate strategies 101-106 (observation only).')
     ap.add_argument('--db', required=True, help='sidecar adaptive.sqlite path')
     ap.add_argument('--session', required=True, help='session day YYYY-MM-DD')
     ap.add_argument('--namespace', default='adaptive_v1')

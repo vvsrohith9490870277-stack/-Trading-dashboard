@@ -1,0 +1,109 @@
+{
+  "_provenance": {
+    "generated_from": "automation/paper-trading/adaptive_candidates.py CANDIDATE_STRATEGIES (ids 101-106)",
+    "generated_by": "python3 -c import of the registry, run 2026-11-21; no metrics are in this file, only registry facts (name, source, tier, warm-up, params, notes)",
+    "status": "shadow_only: candidates never enter BASELINE_PARAMS, adaptive_policy.json tiers, strategy_rules.json or the spawn loop; they are evaluated only in shadow",
+    "note": "S9 PEAD is parked (no free point-in-time EPS feed) and is NOT a candidate; S8 Connors RSI(2) is candidate C102"
+  },
+  "candidates": [
+    {
+      "id": 101,
+      "name": "Minervini Trend Template + breakout",
+      "source": "Minervini, Trade Like a Stock Market Wizard (McGraw-Hill, 2013), Trend Template (8 criteria)",
+      "tier": "trend",
+      "warm_start_days": 252,
+      "params": {
+        "sma_fast": 50,
+        "sma_mid": 150,
+        "sma_slow": 200,
+        "sma200_trend_lookback": 20,
+        "above_52w_low_pct": 30,
+        "within_52w_high_pct": 25,
+        "breakout_lookback": 20,
+        "rs_rank_min": 70
+      },
+      "adapted": false,
+      "notes": "Full 8-criterion template. Criterion 8 uses derived_rs_rank (in-universe), NOT IBD's rating: percentile (0-100) of the 252-session return within the eligible universe on the same bar; missing history -> criterion 8 not_evaluable (rs_rank_unavailable) for that stock only.",
+      "status": "shadow_only"
+    },
+    {
+      "id": 102,
+      "name": "Connors RSI(2) in uptrend",
+      "source": "Connors & Alvarez, Short Term Trading Strategies That Work (2008), 2-period RSI",
+      "tier": "fast_swing",
+      "warm_start_days": 200,
+      "params": {
+        "rsi_period": 2,
+        "rsi_entry": 10.0,
+        "sma_trend": 200,
+        "sma_exit": 5
+      },
+      "adapted": false,
+      "notes": "No stop in the published rule; risk is carried by position size and the fast SMA5 exit.",
+      "status": "shadow_only"
+    },
+    {
+      "id": 103,
+      "name": "Bollinger squeeze breakout (Method I)",
+      "source": "Bollinger, Bollinger on Bollinger Bands (McGraw-Hill, 2001), %b / BandWidth / Squeeze",
+      "tier": "fast_swing",
+      "warm_start_days": 126,
+      "params": {
+        "bb_period": 20,
+        "bb_std": 2.0,
+        "squeeze_lookback": 126,
+        "squeeze_recent": 5
+      },
+      "adapted": false,
+      "notes": "Squeeze = BandWidth lowest in 126 sessions within the last 5 sessions; breakout gives direction.",
+      "status": "shadow_only"
+    },
+    {
+      "id": 104,
+      "name": "Wilder ADX/DMI trend",
+      "source": "Wilder, New Concepts in Technical Trading Systems (1978), Directional Movement System",
+      "tier": "trend",
+      "warm_start_days": 200,
+      "params": {
+        "adx_period": 14,
+        "adx_entry": 25.0
+      },
+      "adapted": false,
+      "notes": "Entry is +DI crossing above -DI with ADX(14) > 25 (plan text). Wilder's extreme-point rule is NOT applied (daily-close harness).",
+      "status": "shadow_only"
+    },
+    {
+      "id": 105,
+      "name": "12-1 cross-sectional momentum (adapted)",
+      "source": "Jegadeesh & Titman, \"Returns to Buying Winners and Selling Losers\", Journal of Finance 48(1), 65-91 (1993)",
+      "tier": "trend",
+      "warm_start_days": 252,
+      "params": {
+        "formation_lookback": 252,
+        "skip_sessions": 21,
+        "top_decile": 0.1,
+        "exit_top_share": 0.3,
+        "hold_sessions": 63
+      },
+      "adapted": true,
+      "notes": "ADAPTED, not the paper's exact rule: the paper is cross-sectional (rank all stocks, buy the top decile); this single-name version ranks the Track A universe by 12-1 return. Rank is evaluated at monthly rebalances (first session of each month) in a state-aware walk; the 63-session hold expiry comes from the actual entry only. Needs the full universe panel.",
+      "status": "shadow_only"
+    },
+    {
+      "id": 106,
+      "name": "Sector-adjusted 12-1 momentum (top 30)",
+      "source": "Ceta Research, \"Sector-adjusted momentum, India (BSE/NSE, 2000-2025)\"; Jegadeesh & Titman, \"Returns to Buying Winners and Selling Losers\", Journal of Finance 48(1), 65-91 (1993)",
+      "tier": "trend",
+      "warm_start_days": 252,
+      "params": {
+        "formation_lookback": 252,
+        "skip_sessions": 21,
+        "top_n": 30,
+        "rebalance": "monthly"
+      },
+      "adapted": false,
+      "notes": "Sector-adjusted variant of 12-1 momentum: rank by the 12-1 return MINUS the stock's sector average 12-1 return; buy the top 30 at each monthly rebalance, exit at the next rebalance when the stock drops out of the top 30. No 63-session expiry (the published sector-adjusted rule has none). Different ranking from C105 (whole-market rank), so not a duplicate of C105. Needs the full universe panel AND a symbol->sector map (explicit sector_map, or a sector/industry column on the universe frame); with no usable map it enters nothing.",
+      "status": "shadow_only"
+    }
+  ]
+}

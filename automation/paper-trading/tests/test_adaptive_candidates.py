@@ -176,6 +176,69 @@ def _c105_universe(n_days=400):
     return pd.DataFrame(rows)
 
 
+def _c106_universe(n_days=400):
+    """40-symbol universe for C106: 4 sectors x 10 stocks, constant daily
+    growth for the first 260 sessions, then -0.5%/day. Sector means differ
+    sharply, so the sector-adjusted ranking differs from the raw ranking:
+    COLD-STAR (raw 12-1 return only ~+59%, mid-pack raw) is #2 by
+    sector-adjusted return (+0.52) because its sector is flat, while HOT0
+    (raw ~+900%, top by raw return) is LAST by sector-adjusted return
+    (-0.53) because its hot sector's mean is higher than its own return."""
+    import numpy as np
+    import pandas as pd
+    days = trading_days(n_days)
+    rows, smap = [], {}
+    specs = []
+    for k in range(10):
+        specs.append((f'HOT{k}-EQ', 'HOT', 0.0100 + k * 0.00005))
+        specs.append((f'WARM{k}-EQ', 'WARM', 0.0050 + k * 0.00005))
+        specs.append((f'COOL{k}-EQ', 'COOL', 0.0010 + k * 0.00005))
+    for k in range(9):
+        specs.append((f'COLD{k}-EQ', 'COLD', 0.0000 + k * 0.00001))
+    specs.append(('COLD-STAR-EQ', 'COLD', 0.002))
+    for sym, sec, r in specs:
+        smap[sym] = sec
+        px = 1000.0
+        for i, d in enumerate(days):
+            g = r if i < 260 else -0.005
+            px *= (1 + g)
+            o = px / (1 + g)
+            rows.append({'symbol': sym, 'trade_date': d, 'open': round(o, 2),
+                         'high': round(max(o, px) * 1.002, 2), 'low': round(min(o, px) * 0.998, 2),
+                         'close': round(px, 2), 'volume': 300000})
+    return pd.DataFrame(rows), smap
+
+
+def _c106_fade_universe(n_days=320):
+    """32-symbol universe for the C106 exit rule: 31 STEADY stocks grow
+    +0.5%/day throughout; FADE grows +1%/day for 200 sessions, then falls
+    -1%/day. FADE is rank 1 by sector-adjusted return at the 2025-01-01
+    rebalance (enters) and rank 32 at the 2025-02-03 rebalance (exits)."""
+    import pandas as pd
+    days = trading_days(n_days)
+    rows, smap = [], {}
+    for k in range(31):
+        sym = f'STEADY{k}-EQ'
+        smap[sym] = 'BIG'
+        px = 1000.0
+        for i, d in enumerate(days):
+            px *= 1.005
+            o = px / 1.005
+            rows.append({'symbol': sym, 'trade_date': d, 'open': round(o, 2),
+                         'high': round(max(o, px) * 1.002, 2), 'low': round(min(o, px) * 0.998, 2),
+                         'close': round(px, 2), 'volume': 300000})
+    smap['FADE-EQ'] = 'BIG'
+    px = 1000.0
+    for i, d in enumerate(days):
+        g = 0.01 if i < 200 else -0.01
+        px *= (1 + g)
+        o = px / (1 + g)
+        rows.append({'symbol': 'FADE-EQ', 'trade_date': d, 'open': round(o, 2),
+                     'high': round(max(o, px) * 1.002, 2), 'low': round(min(o, px) * 0.998, 2),
+                     'close': round(px, 2), 'volume': 300000})
+    return pd.DataFrame(rows), smap
+
+
 def _c101_universe():
     """5-symbol universe for C101: SYN-EQ (the _c101_closes series) has the
     best 252-session return, so its derived_rs_rank is 100 at idx 252; the
@@ -262,6 +325,77 @@ class CandidateSignalTests(unittest.TestCase):
         out = ac.candidate_signals(101, df)
         self.assertTrue(out['derived_rs_rank'].isna().all())
         self.assertEqual(int(out['entry_condition'].sum()), 0)
+
+    def test_c106_sector_adjusted_entry_exit(self):
+        uni, smap = _c106_universe()
+        # Sector-adjusted 12-1 return at the first rebalance (2025-01-01):
+        # COLD-STAR is #2 (+0.52) despite a mid-pack raw return, because its
+        # sector is flat; HOT0 is LAST (-0.53) despite the highest raw
+        # return, because its hot sector's mean beats it. This is the
+        # discrimination C106 adds over C105's whole-market rank.
+        closes = ac._universe_closes(uni)
+        adj = ac._sector_adjusted_frame(closes, smap)
+        row = adj.loc['2025-01-01']
+        self.assertAlmostEqual(row['COLD-STAR-EQ'], 0.5195, places=3)
+        self.assertAlmostEqual(row['HOT0-EQ'], -0.5315, places=3)
+        rank = row.rank(ascending=False, method='min')
+        self.assertEqual(int(rank['COLD-STAR-EQ']), 2)
+        self.assertEqual(int(rank['HOT0-EQ']), 40)
+        # Entries at the first rebalance where ranks are computable.
+        star = uni[uni['symbol'] == 'COLD-STAR-EQ'].reset_index(drop=True)
+        out_star = ac.candidate_signals(106, star, universe=uni, sector_map=smap)
+        self.assertEqual(_edge_dates(out_star, 'entry_condition'), ['2025-01-01'])
+        hot0 = uni[uni['symbol'] == 'HOT0-EQ'].reset_index(drop=True)
+        out_hot0 = ac.candidate_signals(106, hot0, universe=uni, sector_map=smap)
+        self.assertEqual(int(out_hot0['entry_condition'].sum()), 0)
+        # Every entry fires at a monthly rebalance.
+        dates = star['trade_date'].astype(str).tolist()
+        reb = {dates[i] for i in range(len(dates))
+               if i == 0 or dates[i][:7] != dates[i - 1][:7]}
+        entry_true = [dates[i] for i in range(len(dates)) if out_star['entry_condition'].iloc[i]]
+        self.assertTrue(all(d in reb for d in entry_true))
+        # Registry entry: top 30, monthly rebalance, no 63-session expiry.
+        c106 = ac.CANDIDATE_STRATEGIES[106]
+        self.assertEqual(c106['params']['top_n'], 30)
+        self.assertEqual(c106['params']['rebalance'], 'monthly')
+        self.assertNotIn('hold_sessions', c106['params'])
+        self.assertEqual(c106['warm_start_days'], 252)
+        self.assertIn('C105', c106['notes'])
+        self.assertIn('sector', c106['name'].lower())
+
+    def test_c106_exit_on_drop_out_of_top30(self):
+        uni, smap = _c106_fade_universe()
+        fade = uni[uni['symbol'] == 'FADE-EQ'].reset_index(drop=True)
+        out = ac.candidate_signals(106, fade, universe=uni, sector_map=smap)
+        # Rank 1 at 2025-01-01 (adjusted +1.099) -> enter; rank 32 at
+        # 2025-02-03 (adjusted -0.437) -> exit at that rebalance.
+        self.assertEqual(_edge_dates(out, 'entry_condition'), ['2025-01-01'])
+        self.assertEqual(_edge_dates(out, 'exit_condition'), ['2025-02-03'])
+        closes = ac._universe_closes(uni)
+        adj = ac._sector_adjusted_frame(closes, smap)
+        self.assertAlmostEqual(adj.loc['2025-01-01', 'FADE-EQ'], 1.0991, places=3)
+        self.assertAlmostEqual(adj.loc['2025-02-03', 'FADE-EQ'], -0.4367, places=3)
+
+    def test_c106_no_sector_map_no_entries(self):
+        uni, smap = _c106_universe()
+        star = uni[uni['symbol'] == 'COLD-STAR-EQ'].reset_index(drop=True)
+        # No map and no sector column on the universe: enters nothing.
+        out = ac.candidate_signals(106, star, universe=uni)
+        self.assertEqual(int(out['entry_condition'].sum()), 0)
+        # Symbol missing from the map: enters nothing.
+        out = ac.candidate_signals(106, star, universe=uni,
+                                   sector_map={'OTHER-EQ': 'COLD'})
+        self.assertEqual(int(out['entry_condition'].sum()), 0)
+        # A 'sector' column on the universe frame supplies the map.
+        uni2 = uni.copy()
+        uni2['sector'] = uni2['symbol'].map(smap)
+        out = ac.candidate_signals(106, star, universe=uni2)
+        self.assertEqual(_edge_dates(out, 'entry_condition'), ['2025-01-01'])
+        # An 'industry' column works the same way.
+        uni3 = uni.copy()
+        uni3['industry'] = uni3['symbol'].map(smap)
+        out = ac.candidate_signals(106, star, universe=uni3)
+        self.assertEqual(_edge_dates(out, 'entry_condition'), ['2025-01-01'])
 
     def test_c102_connors_rsi2_entry_exit(self):
         df = _bars(_c102_closes())
@@ -366,6 +500,16 @@ class CandidateSignalTests(unittest.TestCase):
         for col in ('entry_condition', 'exit_condition'):
             self.assertTrue((full[col].iloc[:350].to_numpy() == trunc[col].to_numpy()).all(),
                             f'candidate 105: {col} changes when future bars are removed')
+        # C106 needs its universe and sector map; truncating both must not
+        # change past signals.
+        uni106, smap106 = _c106_universe()
+        star = uni106[uni106['symbol'] == 'COLD-STAR-EQ'].reset_index(drop=True)
+        full = ac.candidate_signals(106, star, universe=uni106, sector_map=smap106)
+        trunc_uni = uni106[uni106['trade_date'] <= star['trade_date'].iloc[349]]
+        trunc = ac.candidate_signals(106, star.iloc[:350], universe=trunc_uni, sector_map=smap106)
+        for col in ('entry_condition', 'exit_condition'):
+            self.assertTrue((full[col].iloc[:350].to_numpy() == trunc[col].to_numpy()).all(),
+                            f'candidate 106: {col} changes when future bars are removed')
 
     def test_registry_not_in_baseline_params(self):
         ids = set(ac.CANDIDATE_STRATEGIES)
@@ -458,7 +602,7 @@ class ShadowRunnerTests(unittest.TestCase):
             blob = json.dumps(args, default=str)
             for ns in ('paper_v1', 'paper_v2', 'paper_demo_v1'):
                 self.assertNotIn(ns, blob)
-        self.assertEqual(set(self.out), {101, 102, 103, 104, 105})
+        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106})
         for s, r in self.out.items():
             self.assertEqual(r['status'], 'SHADOW_SIMULATED')
             self.assertEqual(r['mode'], 'shadow')
@@ -486,7 +630,7 @@ class ShadowRunnerTests(unittest.TestCase):
         daily = self.db.query('SELECT * FROM adaptive_candidate_daily')
         self.assertGreater(len(daily), 0)
         self.assertTrue(all(r['mode'] == 'shadow' and r['simulated'] == 1 for r in daily))
-        self.assertEqual({r['strategy'] for r in daily}, {101, 102, 103, 104, 105})
+        self.assertEqual({r['strategy'] for r in daily}, {101, 102, 103, 104, 105, 106})
         trades = self.db.query('SELECT * FROM adaptive_candidate_trades')
         self.assertTrue(all(r['mode'] == 'shadow' and r['simulated'] == 1 for r in trades))
 

@@ -7,6 +7,7 @@ export const PORTAL_ROUTES = [
   {path: '/strategy-tester', key: 'tester', title: 'Strategy tester'},
   {path: '/strategy-comparison', key: 'compare', title: 'Compare'},
   {path: '/performance', key: 'performance', title: 'Performance'},
+  {path: '/adaptive-engine', key: 'adaptive', title: 'Adaptive Engine'},
 ];
 
 const SYMBOL = /^[A-Z0-9&_.-]{1,80}$/;
