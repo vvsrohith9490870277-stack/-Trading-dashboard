@@ -1,0 +1,119 @@
+// Adaptive Engine screen: the frozen seven vs the shadow candidates 101-106.
+// Read-only. Nothing here promotes, demotes, spawns or trades anything.
+// Data provenance, stated on the screen itself:
+//   - Main 7: public/data/historical.json (saved research export, as of 2026-11-06).
+//     Win rate, mean gross return and closed trades come from each strategy's
+//     `metrics`. The export has no average holding period, so that cell is
+//     "not available" for the main 7, never estimated from the top/bottom lists.
+//   - Candidates 101-106: public/data/adaptive-candidates.json (registry facts
+//     generated from automation/paper-trading/adaptive_candidates.py) for names
+//     and sources, and public/data/adaptive-compare.json for numbers.
+//     There is NO live compare output for any candidate, so every live candidate
+//     metric is "not available". The only candidate numbers that exist are the
+//     synthetic fixture compare, shown in their own labelled panel below.
+import {useStatic} from './data';
+import {fmt, pct, strategyName, STRATEGY_HUES} from './format';
+import {Blank, Callout, KeyValues, Loading, Section, SortTable, Tag, Tile} from './ui';
+import {adaptiveHealth, candidateRows, mainHealth, mainRows, MAIN_IDS, NOT_AVAILABLE} from './adaptive';
+
+const na = <span className="ad-muted">{NOT_AVAILABLE}</span>;
+const SYNTHETIC_LABEL = 'Synthetic fixture only (4 symbols, 130 days) — not real NSE results';
+
+function HealthList({health, tone}) {
+  if (!health?.available) return <Blank title="Not available" text="The data file for this engine did not load, so its filters cannot be checked."/>;
+  return <ul className="ad-outages">{health.checks.map(c => <li key={c.label} className="ad-outage-row">
+    <span>{c.label}</span>
+    <span className="ad-muted ad-fine">{c.value}</span>
+    <Tag tone={c.ok ? 'good' : 'warn'}>{c.ok ? 'ok' : 'check'}</Tag>
+  </li>)}</ul>;
+}
+
+export default function AdaptiveEngine() {
+  const history = useStatic('/data/historical.json');
+  const compare = useStatic('/data/adaptive-compare.json');
+  const catalogue = useStatic('/data/adaptive-candidates.json');
+
+  if (history.error) return <Callout tone="error">{history.error}</Callout>;
+  if (!history.data) return <Loading label="Loading saved runs…"/>;
+  const mains = mainRows(history.data);
+  const cands = candidateRows(catalogue.data, compare.data);
+  const aHealth = adaptiveHealth(compare.data);
+  const mHealth = mainHealth(history.data);
+  const synth = compare.data?.historical_replay?.strategies ?? {};
+  const synthIds = Object.keys(synth).map(Number).sort((a, b) => a - b);
+
+  return <div className="ad-screen">
+    <div className="ad-hero"><div><span className="ad-eyebrow">Adaptive engine · shadow only</span><h1>Adaptive Engine</h1>
+      <p>The frozen seven run the live paper book. Candidates 101–106 only watch from the side (shadow mode) and never trade. This screen compares them side by side and says plainly where the numbers come from — and where there are no numbers yet. No promotion or demotion happens here.</p></div>
+      <div className="ad-hero-figure"><span>Last compare run</span><strong>{aHealth.sessionDay ?? '—'}</strong>
+        <small>{aHealth.available ? 'Synthetic fixture session day' : 'No compare output loaded'}</small></div>
+    </div>
+    <div className="ad-tiles">
+      <Tile label="Adaptive candidates" value={String(cands.length)} hint="101–106 · shadow only"/>
+      <Tile label="Main strategies" value="7" hint="Frozen · run the paper book"/>
+      <Tile label="Forward shadow days" value={aHealth.forwardDays === null || aHealth.forwardDays === undefined ? '—' : String(aHealth.forwardDays)} hint={aHealth.available ? 'Observed live shadow, not replay' : NOT_AVAILABLE}/>
+      <Tile label="Candidates with a compare row" value={`${cands.filter(c => c.synthetic).length} / ${cands.length}`} hint={cands.filter(c => c.synthetic).length === cands.length ? 'All have a row' : 'Some have no row yet'}/>
+      <Tile label="Research export" value={history.data.asOf ?? '—'} hint={`${history.data.coverage?.current ?? '?'} of ${history.data.coverage?.universe ?? '?'} symbols current`}/>
+    </div>
+
+    <Section eyebrow="Are the filters working?" title="Filter health">
+      <div className="ad-split">
+        <div><h3 className="ad-sub">Adaptive engine</h3>
+          {compare.error
+            ? <Callout tone="warn" title="Compare output unavailable.">{compare.error} Candidate metrics below are therefore all “not available”.</Callout>
+            : <HealthList health={aHealth}/>}
+          {aHealth.available && <p className="ad-muted ad-fine">Mode: {aHealth.mode} · {aHealth.statement}. Replay: {aHealth.replayDays} days, {aHealth.replayTrades} trades. Forward shadow: {aHealth.forwardDays} days, {aHealth.forwardTrades} trades — nothing has been observed live yet. Minimum trades for a sufficient sample: {aHealth.minTrades}.</p>}
+        </div>
+        <div><h3 className="ad-sub">Main engine</h3><HealthList health={mHealth}/>
+          {mHealth.available && <p className="ad-muted ad-fine">Coverage: {mHealth.coverage.current} current, {mHealth.coverage.missing} missing, {mHealth.coverage.stale} stale of {mHealth.coverage.universe}. {mHealth.verificationCount} of 7 strategies verified; {mHealth.caveatCount} caveats recorded in the export.</p>}
+        </div>
+      </div>
+    </Section>
+
+    <Section eyebrow="Candidates 101–106 · live metrics" title="Adaptive candidates">
+      <p className="ad-muted">There is no live compare output for any candidate, so every live metric below is “{NOT_AVAILABLE}”. The only candidate numbers that exist are the synthetic fixture numbers in the next panel — they are not mixed in here.</p>
+      <SortTable caption="adaptive candidates, live metrics" rows={cands} rowKey={r => r.id} columns={[
+        {key: 'id', title: 'Candidate', render: (v, r) => <span><strong>C{v}</strong> · {r.name}</span>},
+        {key: 'winRate', title: 'Win rate', align: 'right', render: () => na},
+        {key: 'meanReturn', title: 'Mean net / trade', align: 'right', render: () => na},
+        {key: 'trades', title: 'Trades', align: 'right', render: () => na},
+        {key: 'avgHoldDays', title: 'Avg hold', align: 'right', render: () => na},
+        {key: 'missingReason', title: 'Why no live number', render: v => <span className="ad-muted ad-fine">{v}</span>},
+        {key: 'status', title: 'Status', render: () => <Tag tone="neutral">shadow only</Tag>},
+      ]}/>
+      <KeyValues items={cands.map(c => [`C${c.id} · ${c.name}`, c.source ?? '—', c.tier ? `tier ${c.tier} · warm-up ${c.warmStartDays ?? '?'} days` : undefined])}/>
+    </Section>
+
+    <Section eyebrow={SYNTHETIC_LABEL} title="Synthetic fixture compare — not real results">
+      <Callout tone="warn" title={SYNTHETIC_LABEL}>These numbers come from the synthetic fixture (4 made-up symbols, 130 days, session 2025-04-04, mode shadow_simulated_observation_only). They show the compare machinery works; they say nothing about real NSE performance. C106 ran and closed 0 trades, so it has no row. C101, C103 and C104 were not run in this fixture.</Callout>
+      {compare.error
+        ? <Callout tone="warn" title="Synthetic compare unavailable.">{compare.error}</Callout>
+        : synthIds.length === 0
+          ? <Blank title="No synthetic rows" text="The fixture compare has no closed candidate trades at all."/>
+          : <SortTable caption="synthetic fixture candidate rows" rows={synthIds.map(id => ({id, ...synth[String(id)]}))} rowKey={r => r.id} columns={[
+            {key: 'id', title: 'Candidate', render: (v, r) => <span><strong>C{v}</strong> · {(cands.find(c => c.id === v) ?? {}).name ?? ''}</span>},
+            {key: 'trades', title: 'Trades', align: 'right'},
+            {key: 'win_rate', title: 'Win rate', align: 'right', render: v => v === null || v === undefined ? na : pct(v * 100)},
+            {key: 'avg_net_return_pct', title: 'Mean net / trade', align: 'right', render: v => v === null || v === undefined ? na : pct(v, 2, true)},
+            {key: 'avg_hold_days', title: 'Avg hold', align: 'right', render: v => v === null || v === undefined ? na : `${fmt(v, 1)} d`},
+            {key: 'max_drawdown_pct', title: 'Max drawdown', align: 'right', render: v => v === null || v === undefined ? na : pct(v, 2)},
+            {key: 'sample_label', title: 'Sample', render: v => <Tag tone={v === 'sufficient' ? 'good' : 'warn'}>{v ?? NOT_AVAILABLE}</Tag>},
+          ]}/>}
+      <p className="ad-muted ad-fine">Source: public/data/adaptive-compare.json, generated by live/candidate_compare.py + live/candidate_shadow.py on the synthetic market fixture (see the file’s _provenance note). Net of the frozen costs; 1R uses the 2× ATR(14) convention, and ATR at entry was not stored, so avg R is not available.</p>
+    </Section>
+
+    <Section eyebrow={`Saved runs · as of ${history.data.asOf}`} title="Main 7 strategies — the comparison">
+      <p className="ad-muted">Gross closed-trade statistics from the saved research export. Costs excluded. Average holding period is “{NOT_AVAILABLE}” for all seven: the export does not record it.</p>
+      <SortTable caption="main seven strategies" rows={mains} rowKey={r => r.id} columns={[
+        {key: 'id', title: 'Strategy', render: (v, r) => <span className="ad-strat"><i style={{background: STRATEGY_HUES[v - 1]}}/>{r.name}</span>},
+        {key: 'trades', title: 'Closed trades', align: 'right', render: v => fmt(v, 0)},
+        {key: 'winRate', title: 'Win rate', align: 'right', render: v => pct(v)},
+        {key: 'meanReturn', title: 'Mean gross / trade', align: 'right', render: v => pct(v, 2, true)},
+        {key: 'medianReturn', title: 'Median gross / trade', align: 'right', render: v => pct(v, 2, true)},
+        {key: 'avgHoldDays', title: 'Avg hold', align: 'right', render: () => na},
+        {key: 'openPositions', title: 'Open at export', align: 'right', render: v => fmt(v, 0)},
+      ]}/>
+      <p className="ad-muted ad-fine">Main 7 and candidates are never blended or ranked together: the main figures are gross, over 2004–2026 on 692 real symbols; the candidate figures are net, over 130 synthetic days on 4 made-up symbols. Strategy names: {MAIN_IDS.map(id => `S${id} ${strategyName(id)}`).join(' · ')}.</p>
+    </Section>
+  </div>;
+}

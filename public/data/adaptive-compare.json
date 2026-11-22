@@ -1,0 +1,106 @@
+{
+  "_provenance": {
+    "fixture": "automation/paper-trading/tests/adaptive_fixtures.py make_market(n_days=330, seed=7, volume=300000): 4 synthetic symbols AAA/BBB/CCC/DDD-EQ, sector map 2+2; eval window 130 days (days[200:]), session day 2025-04-04",
+    "fixture_script": "fixture_compare_106.py (copy kept at ~/workspace/ast-logs-newstrat/fixture_compare_106.py)",
+    "generated_by": "live/candidate_compare.py build_report via live/candidate_shadow.py run_shadow (real shadow + compare flow)",
+    "mode": "shadow_simulated_observation_only",
+    "regenerated_at_ist": "2026-11-21T20:05:01.357514+05:30",
+    "strategies_run": [
+      102,
+      105,
+      106
+    ],
+    "warning": "SYNTHETIC fixture only (4 symbols, 130 days) - NOT real NSE results. C106 ran but closed 0 trades, so it has no row. C101/C103/C104 were not run in this fixture. No live (forward shadow) compare output exists in the repo."
+  },
+  "forward_shadow": {
+    "days": 0,
+    "strategies": {},
+    "trades": 0
+  },
+  "generated_at_ist": "2026-11-21T20:05:01.357514+05:30",
+  "historical_replay": {
+    "days": 130,
+    "strategies": {
+      "102": {
+        "avg_hold_days": 9.78,
+        "avg_net_return_pct": -4.8622,
+        "avg_r": null,
+        "avg_r_note": "atr14_at_entry_not_stored",
+        "exposure": 2.0308,
+        "max_drawdown_pct": 13.027976,
+        "net_pnl_inr": -64825.49,
+        "net_pnl_paise": -6482549,
+        "overlap_with_seven": {
+          "count": 0,
+          "pct": 0.0
+        },
+        "sample_label": "insufficient_sample",
+        "sample_size": 27,
+        "trades": 27,
+        "win_rate": 0.037
+      },
+      "105": {
+        "avg_hold_days": 89.0,
+        "avg_net_return_pct": 9.4596,
+        "avg_r": null,
+        "avg_r_note": "atr14_at_entry_not_stored",
+        "exposure": 0.6846,
+        "max_drawdown_pct": 0.0,
+        "net_pnl_inr": 4675.28,
+        "net_pnl_paise": 467528,
+        "overlap_with_seven": {
+          "count": 0,
+          "pct": 0.0
+        },
+        "sample_label": "insufficient_sample",
+        "sample_size": 1,
+        "trades": 1,
+        "win_rate": 1.0
+      }
+    },
+    "trades": 28
+  },
+  "min_trades_for_sample": 30,
+  "mode": "shadow_simulated_observation_only",
+  "r_definition": "1R per trade = qty x 2 x ATR(14) at entry (paise); R-multiple = net P&L / 1R. No pass/fail on R.",
+  "session_day": "2025-04-04",
+  "statement": "shadow, simulated, observation only, no promotion",
+  "strategies": {
+    "102": {
+      "avg_hold_days": 9.78,
+      "avg_net_return_pct": -4.8622,
+      "avg_r": null,
+      "avg_r_note": "atr14_at_entry_not_stored",
+      "exposure": 2.0308,
+      "max_drawdown_pct": 13.027976,
+      "net_pnl_inr": -64825.49,
+      "net_pnl_paise": -6482549,
+      "overlap_with_seven": {
+        "count": 0,
+        "pct": 0.0
+      },
+      "sample_label": "insufficient_sample",
+      "sample_size": 27,
+      "trades": 27,
+      "win_rate": 0.037
+    },
+    "105": {
+      "avg_hold_days": 89.0,
+      "avg_net_return_pct": 9.4596,
+      "avg_r": null,
+      "avg_r_note": "atr14_at_entry_not_stored",
+      "exposure": 0.6846,
+      "max_drawdown_pct": 0.0,
+      "net_pnl_inr": 4675.28,
+      "net_pnl_paise": 467528,
+      "overlap_with_seven": {
+        "count": 0,
+        "pct": 0.0
+      },
+      "sample_label": "insufficient_sample",
+      "sample_size": 1,
+      "trades": 1,
+      "win_rate": 1.0
+    }
+  }
+}

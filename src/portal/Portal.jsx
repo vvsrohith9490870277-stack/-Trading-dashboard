@@ -12,9 +12,10 @@ const PaperDesk = lazy(() => import('./PaperDesk'));
 const StrategyTester = lazy(() => import('./StrategyTester'));
 const StrategyComparison = lazy(() => import('./StrategyComparison'));
 const Performance = lazy(() => import('./Performance'));
+const AdaptiveEngine = lazy(() => import('./AdaptiveEngine'));
 const StockDetail = lazy(() => import('./StockDetail'));
 
-const TITLES = {paper: 'Paper desk', tester: 'Strategy tester', compare: 'Strategy comparison', performance: 'Performance', stock: 'Stock detail'};
+const TITLES = {paper: 'Paper desk', tester: 'Strategy tester', compare: 'Strategy comparison', performance: 'Performance', adaptive: 'Adaptive Engine', stock: 'Stock detail'};
 
 export default function Portal() {
   const loc = useLocation();
@@ -64,6 +65,7 @@ export default function Portal() {
         {route.key === 'tester' && <StrategyTester {...shared}/>}
         {route.key === 'compare' && <StrategyComparison {...shared}/>}
         {route.key === 'performance' && <Performance {...shared}/>}
+        {route.key === 'adaptive' && <AdaptiveEngine {...shared}/>}
         {route.key === 'stock' && <StockDetail {...shared}/>}
       </Suspense>
     </main>
