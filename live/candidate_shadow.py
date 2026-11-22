@@ -18,6 +18,7 @@ Usage (offline):
   (reads the market snapshot the same way adaptive_daily.py does; see main)
 """
 import argparse
+import csv
 import json
 import sys
 from datetime import datetime, timezone
@@ -31,6 +32,48 @@ for p in (str(HERE), str(LIB)):
 
 import adaptive_candidates as ac
 import adaptive_engine as ae
+
+# Sector source for C106 (Grok's decision, 2026-11-22): the Industry column
+# of automation/paper-trading/universe.csv, which covers all 692 stocks.
+# The NSE official list matched only 545, so it is NOT used.
+UNIVERSE_CSV = HERE.parent / 'automation' / 'paper-trading' / 'universe.csv'
+
+
+def load_universe_sector_map(csv_path=None):
+    """Load {db_symbol: Industry} from universe.csv.
+
+    Keyed by db_symbol (e.g. '3MINDIA-EQ') because the price bars and the
+    universe frame use db_symbol. Rows with an empty db_symbol or an empty
+    Industry are skipped (C106 then has no sector for that symbol and
+    enters nothing for it, the safe default). Raises FileNotFoundError if
+    the CSV does not exist, ValueError if it yields no usable rows.
+    """
+    path = Path(csv_path) if csv_path is not None else UNIVERSE_CSV
+    if not path.exists():
+        raise FileNotFoundError(f'universe_csv_missing:{path}')
+    out = {}
+    with path.open('r', encoding='utf-8', newline='') as f:
+        for row in csv.DictReader(f):
+            db_symbol = (row.get('db_symbol') or '').strip()
+            industry = (row.get('Industry') or '').strip()
+            if db_symbol and industry:
+                out[db_symbol] = industry
+    if not out:
+        raise ValueError(f'universe_csv_no_sectors:{path}')
+    return out
+
+
+def with_sector_column(stock_df, sector_map):
+    """Return a copy of the bars frame with a 'sector' column attached,
+    mapped from the frame's 'symbol' (db_symbol) through sector_map.
+    Symbols with no sector get NaN (C106 skips them safely). The extra
+    column does not affect the other candidates: _universe_closes pivots
+    only on symbol/trade_date/close, and candidate_signals passes the
+    sector map only to C106."""
+    frame = stock_df.copy()
+    if sector_map:
+        frame['sector'] = frame['symbol'].map(sector_map)
+    return frame
 
 PROTECTED_NAMESPACES = frozenset({'paper_v1', 'paper_demo_v1', 'paper_v2'})
 MODE = 'shadow'
@@ -148,6 +191,12 @@ def main(argv=None):
     days = sorted(stock_df['trade_date'].astype(str).unique())
     idx = stock_df[stock_df['symbol'] == 'NIFTY500']
     ws_dates, ev_dates = days[:-1], days[-1:]
+    # C106 sector map (Grok, 2026-11-22): universe.csv Industry by
+    # db_symbol. Attach it to the universe frame and pass it explicitly
+    # to run_shadow, so C106 can rank on the real universe. Without it
+    # C106 enters nothing (the safe default, as before).
+    sector_map = load_universe_sector_map()
+    stock_df = with_sector_column(stock_df, sector_map)
     c = sqlite3.connect(a.db)
     c.row_factory = sqlite3.Row
 
@@ -160,7 +209,8 @@ def main(argv=None):
         def query(self, sql, args=()):
             return [dict(r) for r in c.execute(sql, args).fetchall()]
 
-    out = run_shadow(DB(), a.namespace, stock_df, idx, ws_dates, ev_dates, session_day=a.session)
+    out = run_shadow(DB(), a.namespace, stock_df, idx, ws_dates, ev_dates, session_day=a.session,
+                     sector_map=sector_map)
     print(json.dumps({'session_day': a.session, 'namespace': a.namespace, 'mode': MODE, 'results': out}, indent=2, default=str))
     return out
 
