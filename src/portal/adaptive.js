@@ -131,3 +131,111 @@ export function mainHealth(history) {
     ],
   };
 }
+
+// --- Task 3: recent trend, trailing window, promotion / demotion (proposed) ---
+
+// Full calendar months in the export: the export month itself is partial
+// (asOf is a day inside it), so it is excluded. A month with no closed trades
+// is absent from the breakdown and counts as unavailable, never zero.
+export function fullMonths(monthly, asOf) {
+  const month = String(asOf ?? '').slice(0, 7);
+  return (monthly ?? []).filter(m => m.period < month && Number(m.closed) > 0)
+    .sort((a, b) => a.period.localeCompare(b.period));
+}
+
+// Recent trend, exact definition (stated on the screen too):
+//   recent month = last full month with closed trades;
+//   prior month  = the full month before it;
+//   long-run mean = unweighted mean of the monthly mean returns over all full
+//   months with closed trades.
+// Label: Improving if the recent mean is above BOTH the prior month and the
+// long-run mean; Worsening if below BOTH; otherwise Mixed.
+export function recentTrend(monthly, asOf) {
+  const full = fullMonths(monthly, asOf);
+  if (full.length < 2) return null;
+  const recent = full.at(-1), prior = full.at(-2);
+  const longRunMean = full.reduce((s, m) => s + Number(m.mean), 0) / full.length;
+  const label = recent.mean > prior.mean && recent.mean > longRunMean
+    ? 'Improving'
+    : recent.mean < prior.mean && recent.mean < longRunMean ? 'Worsening' : 'Mixed';
+  return {period: recent.period, trades: recent.closed, winRate: recent.winRate, mean: recent.mean,
+    priorPeriod: prior.period, priorMean: prior.mean, longRunMean, label};
+}
+
+// Trailing 12 full months ending at the recent month, trade-weighted:
+// mean = sum(closed * mean) / sum(closed); win rate the same way.
+export function trailing12(monthly, asOf) {
+  const full = fullMonths(monthly, asOf);
+  if (!full.length) return null;
+  const win = full.slice(-12);
+  const trades = win.reduce((s, m) => s + Number(m.closed), 0);
+  if (!trades) return null;
+  return {from: win[0].period, to: win.at(-1).period, trades,
+    mean: win.reduce((s, m) => s + Number(m.closed) * Number(m.mean), 0) / trades,
+    winRate: win.reduce((s, m) => s + Number(m.closed) * Number(m.winRate), 0) / trades};
+}
+
+// PROPOSED promotion criteria (candidate -> main). A proposal only: nothing
+// here promotes anything, and every promotion still needs Grok's review and
+// VVS's approval. Judged on FORWARD shadow (observed, net of costs), never on
+// the synthetic replay. Sources: NIFTY 50 / Next 50 review practice (fixed
+// semi-annual review, full checklist, six-month data window) and the
+// backtest sample-size arithmetic (30 trades is a floor, not a target;
+// ~100 trades is where a trend starts to show).
+export const PROPOSED_PROMOTION = {
+  minForwardTrades: 100,
+  minForwardSessions: 252, // ~12 months of sessions
+  minWinRatePct: 30,
+  maxDrawdownPct: 15,
+  maxOverlapPct: 50,
+  reviewCycle: 'semi-annual, NIFTY-style (data cutoffs 31 Jan / 31 Jul)',
+  manualReview: 'Rules frozen for the whole shadow window; window covers at least one down month; recent trend not worsening; out-of-sample confirmation. Grok review + VVS approval required in all cases.',
+};
+
+// Read-only promotion label for one candidate. Verdicts:
+//   'not evaluable' — no forward-shadow row at all (nothing observed live yet);
+//   'no'  — a forward row exists but at least one computed check fails;
+//   'yes' — every computed check passes (still only a proposal: see manualReview).
+export function promotionLabel(compare, id) {
+  const fwd = compare?.forward_shadow?.strategies?.[String(id)] ?? null;
+  if (!fwd) return {verdict: 'not evaluable', reasons: ['no forward shadow trades yet — nothing observed live']};
+  const checks = [
+    {key: 'sample', pass: Number(fwd.trades) >= PROPOSED_PROMOTION.minForwardTrades,
+      text: `${fwd.trades} forward trades (need ≥ ${PROPOSED_PROMOTION.minForwardTrades})`},
+    {key: 'duration', pass: Number(compare.forward_shadow.days) >= PROPOSED_PROMOTION.minForwardSessions,
+      text: `${compare.forward_shadow.days ?? 0} forward sessions (need ≥ ${PROPOSED_PROMOTION.minForwardSessions}, ~12 months)`},
+    {key: 'edge', pass: Number(fwd.avg_net_return_pct) > 0 && Number(fwd.win_rate) * 100 >= PROPOSED_PROMOTION.minWinRatePct,
+      text: `mean net ${Number(fwd.avg_net_return_pct).toFixed(2)}% / trade, win ${(Number(fwd.win_rate) * 100).toFixed(1)}% (need mean > 0% and win ≥ ${PROPOSED_PROMOTION.minWinRatePct}%)`},
+    {key: 'drawdown', pass: Number(fwd.max_drawdown_pct) <= PROPOSED_PROMOTION.maxDrawdownPct,
+      text: `max drawdown ${Number(fwd.max_drawdown_pct).toFixed(2)}% (need ≤ ${PROPOSED_PROMOTION.maxDrawdownPct}%)`},
+    {key: 'overlap', pass: fwd.overlap_with_seven?.pct === null || Number(fwd.overlap_with_seven.pct) * 100 < PROPOSED_PROMOTION.maxOverlapPct,
+      text: `overlap with the seven ${fwd.overlap_with_seven?.pct === null ? 'not available' : (Number(fwd.overlap_with_seven.pct) * 100).toFixed(1) + '%'} (need < ${PROPOSED_PROMOTION.maxOverlapPct}%)`},
+  ];
+  const failed = checks.filter(c => !c.pass);
+  return {verdict: failed.length ? 'no' : 'yes', reasons: checks.map(c => `${c.pass ? '✓' : '✗'} ${c.text}`), checks};
+}
+
+// PROPOSED demotion watch (main -> adaptive). A watch flag only, never an
+// automatic move: trailing-12-month mean gross return below 0% AND the recent
+// trend worsening. Reviewed semi-annually; a single bad year never demotes
+// on its own. Grok review + VVS approval required.
+export function demotionWatch(mainRow) {
+  const t12 = mainRow.trailing12, trend = mainRow.trend;
+  if (!t12 || !trend) return {watch: false, evaluable: false, reasons: ['not evaluable — monthly breakdown missing']};
+  const watch = Number(t12.mean) < 0 && trend.label === 'Worsening';
+  return {watch, evaluable: true, reasons: [
+    `trailing 12m mean ${Number(t12.mean).toFixed(2)}% / trade (${t12.from} to ${t12.to}, ${t12.trades} trades)`,
+    `recent trend ${trend.label} (${trend.period} mean ${Number(trend.mean).toFixed(2)}% vs prior ${Number(trend.priorMean).toFixed(2)}% and long-run ${Number(trend.longRunMean).toFixed(2)}%)`,
+  ]};
+}
+
+// Main-7 rows enriched with trend + trailing-12m analytics (Task 3).
+export function mainAnalyticsRows(history) {
+  return mainRows(history).map(r => {
+    const trend = recentTrend(r.monthly, history?.asOf);
+    const t12 = trailing12(r.monthly, history?.asOf);
+    const row = {...r, trend, trailing12: t12};
+    row.demotion = demotionWatch(row);
+    return row;
+  });
+}
