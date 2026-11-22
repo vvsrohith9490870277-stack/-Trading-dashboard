@@ -1,4 +1,4 @@
-"""Candidate-strategy registry (B3): shadow challengers 101-105.
+"""Candidate-strategy registry (B3): shadow challengers 101-106.
 
 Shadow / observation mode ONLY. Candidates never enter BASELINE_PARAMS,
 adaptive_policy.json tiers, strategy_rules.json, or the adaptive_daily.py
@@ -40,6 +40,16 @@ Per-candidate notes / fallbacks (brief §6):
   monthly rebalances (first session of each month); the 63-session hold
   expiry and the top-30% rank exit are applied as specified, from the
   actual entry only (state-aware walk, no ghost expiries).
+- C106 is the SECTOR-ADJUSTED variant of the same momentum family (Ceta
+  Research, sector-adjusted momentum, India 2000-2025): rank by the 12-1
+  return MINUS the stock's sector average 12-1 return, buy the top 30.
+  It is a different ranking from C105's whole-market rank, so it is a new
+  candidate, not a duplicate. It needs the full universe panel AND a
+  symbol->sector map (explicit sector_map argument, or a 'sector' /
+  'industry' column on the universe frame); with no usable map it enters
+  nothing. Monthly rebalance; exit at the next rebalance when the stock
+  drops out of the top 30. No 63-session expiry: the published
+  sector-adjusted rule has none.
 - No candidate has a fixed stop (exits are indicator-based, like the frozen
   seven). initial_stop is therefore None with a note; the B4 compare report
   uses the 2x ATR(14)-based 1R reporting convention (plan §4.4, Grok Q3:
@@ -388,6 +398,110 @@ def _c105_exits(df, universe=None, entry_dates=None):
 
 
 # ---------------------------------------------------------------------------
+# C106 — Sector-adjusted 12-1 momentum, top 30 (Ceta Research, India)
+# ---------------------------------------------------------------------------
+
+def _sector_map_from_universe(universe, sector_map=None):
+    """Symbol -> sector map for C106. An explicit sector_map wins; else a
+    'sector' (or 'industry') column on the universe frame is used (first
+    value per symbol); else None (C106 then enters nothing)."""
+    if sector_map:
+        return {str(k): str(v) for k, v in dict(sector_map).items()}
+    if universe is None:
+        return None
+    u = universe
+    col = None
+    for cand in ('sector', 'industry'):
+        if cand in u.columns:
+            col = cand
+            break
+    if col is None:
+        return None
+    out = {}
+    for sym, sdf in u.groupby('symbol'):
+        vals = sdf[col].dropna()
+        if len(vals):
+            out[str(sym)] = str(vals.iloc[0])
+    return out or None
+
+
+def _sector_adjusted_frame(closes, sector_map):
+    """12-1 return minus the stock's sector average 12-1 return, per day.
+    Same 12-1 window as C105 (sessions -252..-21). A sector's average is
+    the mean over its members with a computable return that day; a stock
+    with no sector, or no computable return, gets NaN."""
+    if closes is None or len(closes) < 253 or not sector_map:
+        return None
+    ret = closes.shift(21) / closes.shift(252) - 1.0
+    sectors = {}
+    for sym in closes.columns:
+        sec = sector_map.get(str(sym))
+        if sec is not None:
+            sectors.setdefault(sec, []).append(sym)
+    adj = pd.DataFrame(np.nan, index=closes.index, columns=closes.columns)
+    for sec, syms in sectors.items():
+        mean = ret[syms].mean(axis=1)
+        for sym in syms:
+            adj[sym] = ret[sym] - mean
+    return adj
+
+
+def _c106_walk(df, universe=None, sector_map=None):
+    """State-aware monthly-rebalance walk for C106 (same rebalance
+    convention as C105: first session of a calendar month).
+
+    At a rebalance: if not holding and the stock's sector-adjusted 12-1
+    return ranks in the top 30 of the universe that day -> enter; if
+    holding and it ranks outside the top 30 -> exit at that rebalance.
+    Exits are applied before entries on the same bar. No hold expiry:
+    the published sector-adjusted rule exits only on dropping out of the
+    top 30. Rank uses method='min' (ties share the best rank), like C105.
+    """
+    entry = pd.Series(False, index=df.index)
+    exit_cond = pd.Series(False, index=df.index)
+    dates = df['trade_date'].astype(str).tolist()
+    n = len(df)
+    sym = str(df['symbol'].iloc[0]) if 'symbol' in df.columns and len(df) else None
+    if universe is None or sym is None:
+        return entry, exit_cond
+    smap = _sector_map_from_universe(universe, sector_map)
+    if not smap or sym not in smap:
+        return entry, exit_cond
+    closes = _universe_closes(universe)
+    adj = _sector_adjusted_frame(closes, smap)
+    if adj is None or sym not in adj.columns:
+        return entry, exit_cond
+    rank = adj.rank(axis=1, ascending=False, method='min')
+    r = rank[sym].reindex(dates)
+    top = (r <= 30)
+    holding = False
+    for i in range(n):
+        # Monthly rebalance: first session of a calendar month.
+        if i == 0 or dates[i][:7] != dates[i - 1][:7]:
+            if holding and (r.isna().iloc[i] or not bool(top.iloc[i])):
+                exit_cond.iloc[i] = True
+                holding = False
+            if not holding and bool(top.iloc[i]):
+                entry.iloc[i] = True
+                holding = True
+    return entry, exit_cond
+
+
+def _c106_entries(df, universe=None, sector_map=None):
+    g = df.copy()
+    entry, _ = _c106_walk(df, universe, sector_map)
+    g['entry_condition'] = entry
+    return g
+
+
+def _c106_exits(df, universe=None, sector_map=None):
+    g = df.copy()
+    _, exit_cond = _c106_walk(df, universe, sector_map)
+    g['exit_condition'] = exit_cond
+    return g
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -451,17 +565,38 @@ CANDIDATE_STRATEGIES = {
                  'the 63-session hold expiry comes from the actual entry only. '
                  'Needs the full universe panel.',
     },
+    106: {
+        'id': 106, 'name': 'Sector-adjusted 12-1 momentum (top 30)',
+        'source': 'Ceta Research, "Sector-adjusted momentum, India (BSE/NSE, 2000-2025)"; '
+                  'Jegadeesh & Titman, "Returns to Buying Winners and Selling Losers", '
+                  'Journal of Finance 48(1), 65-91 (1993)',
+        'tier': 'trend', 'warm_start_days': 252,
+        'params': {'formation_lookback': 252, 'skip_sessions': 21, 'top_n': 30,
+                   'rebalance': 'monthly'},
+        'entries': _c106_entries, 'exits': _c106_exits, 'initial_stop': _NO_STOP,
+        'notes': 'Sector-adjusted variant of 12-1 momentum: rank by the 12-1 return '
+                 'MINUS the stock\'s sector average 12-1 return; buy the top 30 at '
+                 'each monthly rebalance, exit at the next rebalance when the stock '
+                 'drops out of the top 30. No 63-session expiry (the published '
+                 'sector-adjusted rule has none). Different ranking from C105 '
+                 '(whole-market rank), so not a duplicate of C105. Needs the full '
+                 'universe panel AND a symbol->sector map (explicit sector_map, or '
+                 'a sector/industry column on the universe frame); with no usable '
+                 'map it enters nothing.',
+    },
 }
 
 
-def candidate_signals(strategy, df, universe=None, entry_dates=None):
+def candidate_signals(strategy, df, universe=None, entry_dates=None, sector_map=None):
     """Entry + exit conditions for one candidate on one symbol's bars.
 
     Returns df with entry_condition / exit_condition (same convention as
     evaluate_parameterized_strategy). universe (multi-symbol bars frame) is
-    required for 101 (derived_rs_rank) and 105 (cross-sectional rank);
-    entry_dates (entry fill dates for this symbol) enables the 105
-    hold-expiry exit. Signals use only completed bars (no lookahead).
+    required for 101 (derived_rs_rank), 105 (cross-sectional rank) and 106
+    (sector-adjusted rank); entry_dates (entry fill dates for this symbol)
+    enables the 105 hold-expiry exit; sector_map (symbol -> sector) is
+    required for 106, or a 'sector'/'industry' column on the universe
+    frame. Signals use only completed bars (no lookahead).
     """
     s = int(strategy)
     if s not in CANDIDATE_STRATEGIES:
@@ -470,6 +605,9 @@ def candidate_signals(strategy, df, universe=None, entry_dates=None):
     if s == 105:
         en = c['entries'](df, universe)
         ex = c['exits'](df, universe, entry_dates)
+    elif s == 106:
+        en = c['entries'](df, universe, sector_map)
+        ex = c['exits'](df, universe, sector_map)
     elif s == 101:
         en = c['entries'](df, universe)
         ex = c['exits'](df)
