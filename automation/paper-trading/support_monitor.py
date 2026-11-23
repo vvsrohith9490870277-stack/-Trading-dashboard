@@ -154,7 +154,7 @@ def check(snapshot):
     The snapshot carries everything the checks need (fetched by
     fetch_snapshot); this function does no I/O, so it is unit-testable
     with fake snapshots. Findings are dicts with severity, code,
-    symbol (or None) and a JSON-serialisable detail (no secrets).
+    symbol (or None) and a JSON-serialisable detail (no sensitive values).
     """
     findings = []
     now = snapshot['now_ist']
@@ -400,7 +400,7 @@ def sink_findings(store, namespace, findings, now, dedup):
     De-duplicates the same (code, symbol) within 30 minutes using the
     in-memory `dedup` dict {(code, symbol): last_ts}. Returns the
     number of rows written. detail_json carries only the finding's
-    detail (symbols, numbers, codes); never a secret.
+    detail (symbols, numbers, codes) and no sensitive values.
     """
     written = 0
     for f in findings:
