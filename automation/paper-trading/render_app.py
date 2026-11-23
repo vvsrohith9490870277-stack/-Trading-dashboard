@@ -31,6 +31,7 @@ import render_state as rs
 import render_trial as rt
 import render_fyers_auth as rfa
 import runtime_mode as rm
+import support_monitor as sm
 
 IST = ZoneInfo('Asia/Kolkata')
 WORKER_BACKOFF_SECONDS = (5, 10, 20, 40, 60)
@@ -288,6 +289,13 @@ class Supervisor:
         # the store. Replaced wholesale on each refresh (never
         # mutated), so the HTTP thread can read it without a lock.
         self._health_cache = rh.new_health_cache()
+        # Read-only support monitor (brief 23 Nov 2026): the monitor
+        # runner replaces this dict wholesale after each cycle (see
+        # _monitor_state below); snapshot() serves it from memory.
+        # getattr fallbacks in snapshot() keep Supervisors constructed
+        # without __init__ (tests) working.
+        self.support_monitor_state = sm.default_state(
+            enabled=sm.monitor_enabled())
         # Fyers token auto-refresh (brief 23 Nov 2026): one manager
         # per supervisor process. It keeps the token in memory only
         # and never writes it anywhere; see render_fyers_auth.
@@ -807,6 +815,8 @@ class Supervisor:
             job_rss_cap_mb=job_rss_cap_mb(),
             quote_probe=fields.get('quote_probe'),
             store_reads_total=fields.get('store_reads_total'),
+            support_monitor=getattr(
+                self, 'support_monitor_state', None),
             fyers_auth=(mgr.status() if mgr is not None else None),
             fyers_budget={
                 'day_used': fields.get('fyers_budget_day_used'),
@@ -906,6 +916,23 @@ def main(argv=None):
                     pass
 
     threading.Thread(target=_renew_loop, daemon=True).start()
+
+    # Read-only support monitor (brief 23 Nov 2026): its own daemon
+    # thread next to the worker. It reads the paper book from Turso
+    # (SELECT only) and the in-process /health snapshot, and records
+    # findings in support_monitor_findings. A monitor crash never
+    # stops the worker: each cycle is try/except and it backs off
+    # after errors (see support_monitor.Monitor). Disabled entirely
+    # when SUPPORT_MONITOR_ENABLED=0 (the /health field then reports
+    # enabled false). The thread is not started when disabled.
+    def _monitor_state(state):
+        sup.support_monitor_state = state
+
+    sm.start_monitor_thread(
+        store, namespace, sup.config,
+        lambda: sup.last_snapshot,
+        _monitor_state, lambda: sup.stopping)
+
     while not sup.stopping:
         try:
             sup.tick()
