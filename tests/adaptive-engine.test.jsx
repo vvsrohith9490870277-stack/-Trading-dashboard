@@ -46,7 +46,7 @@ const monthly = (rows) => rows.map(([period, closed, winRate, mean]) => ({period
 describe('adaptive logic', () => {
   it('candidate rows have no live metrics: only the synthetic rows exist', () => {
     const rows = candidateRows(realCatalogue, realCompare);
-    expect(rows.map(r => r.id)).toEqual([101, 102, 103, 104, 105, 106]);
+    expect(rows.map(r => r.id)).toEqual([101, 102, 103, 104, 105, 106, 109]);
     for (const r of rows) {
       expect(r.winRate).toBeNull();
       expect(r.meanReturn).toBeNull();
@@ -58,6 +58,11 @@ describe('adaptive logic', () => {
     expect(rows.find(r => r.id === 106).synthetic).toBeNull();
     expect(rows.find(r => r.id === 106).runState).toBe('ran');
     expect(rows.find(r => r.id === 106).missingReason).toMatch(/0 closed trades/);
+    // C109 is in the catalogue but was not run in the synthetic fixture,
+    // so it has no synthetic row and no live metrics either.
+    expect(rows.find(r => r.id === 109).synthetic).toBeNull();
+    expect(rows.find(r => r.id === 109).runState).toBe('not_run');
+    expect(rows.find(r => r.id === 109).missingReason).toMatch(/not run/);
     expect(rows.find(r => r.id === 101).runState).toBe('not_run');
     expect(rows.find(r => r.id === 103).missingReason).toMatch(/not run/);
   });

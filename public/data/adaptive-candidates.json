@@ -1,6 +1,6 @@
 {
   "_provenance": {
-    "generated_from": "automation/paper-trading/adaptive_candidates.py CANDIDATE_STRATEGIES (ids 101-106)",
+    "generated_from": "automation/paper-trading/adaptive_candidates.py CANDIDATE_STRATEGIES (ids 101-106 and 109)",
     "generated_by": "python3 -c import of the registry, run 2026-11-21; no metrics are in this file, only registry facts (name, source, tier, warm-up, params, notes)",
     "status": "shadow_only: candidates never enter BASELINE_PARAMS, adaptive_policy.json tiers, strategy_rules.json or the spawn loop; they are evaluated only in shadow",
     "note": "S9 PEAD is parked (no free point-in-time EPS feed) and is NOT a candidate; S8 Connors RSI(2) is candidate C102"
@@ -103,6 +103,27 @@
       },
       "adapted": false,
       "notes": "Sector-adjusted variant of 12-1 momentum: rank by the 12-1 return MINUS the stock's sector average 12-1 return; buy the top 30 at each monthly rebalance, exit at the next rebalance when the stock drops out of the top 30. No 63-session expiry (the published sector-adjusted rule has none). Different ranking from C105 (whole-market rank), so not a duplicate of C105. Needs the full universe panel AND a symbol->sector map (explicit sector_map, or a sector/industry column on the universe frame); with no usable map it enters nothing.",
+      "status": "shadow_only"
+    },
+    {
+      "id": 109,
+      "name": "Dual MA crossover (S4) + ATR-based position sizing",
+      "source": "MUSE-PLAN-adaptive-risk-fixes.md §3 (risk plan, 2026-11-22); S4 = frozen strategy_4 (EMA20/50 cross with SMA200)",
+      "tier": "trend",
+      "warm_start_days": 200,
+      "params": {
+        "ema_fast": 20,
+        "ema_slow": 50,
+        "sma_trend": 200,
+        "atr_period": 14,
+        "risk_budget_inr": 5000,
+        "max_notional_inr": 50000
+      },
+      "initial_stop": {
+        "type": "none_indicator_exit",
+        "definition": "No fixed stop; exits are indicator-based (see exits). Reporting R uses the 2x ATR(14)-based 1R convention (plan §4.4, Grok Q3)."
+      },
+      "notes": "Mirrors S4 exactly (EMA20/50 cross-up above SMA200 for entry, cross-down for exit) plus ATR-based sizing: qty = risk budget / (2 x ATR(14) at entry), capped so qty x entry price never exceeds Rs 50,000 per trade. Risk budget Rs 5,000 = 1% of the Rs 5,00,000 sleeve capital — a CHOICE, not a policy value, flagged for Senior/Grok to confirm. The Rs 50,000 per-trade maximum and the Rs 5 lakh per-strategy cap do not change. Risk per trade is the budget when the ATR formula binds, less when the value cap binds (very stable stocks). First candidate with ATR-based sizing; the other candidates use the frozen Rs 50,000 fixed sizing.",
       "status": "shadow_only"
     }
   ]
