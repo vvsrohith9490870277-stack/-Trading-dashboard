@@ -573,7 +573,8 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
                    breakers=None, store_ok=None, store_age_s=None,
                    reasons=None, peak_job_rss_mb=None,
                    last_job_peak_rss_mb=None, job_rss_cap_mb=None,
-                   quote_probe=None, store_reads_total=None):
+                   quote_probe=None, store_reads_total=None,
+                   support_monitor=None):
     """Build the /health payload (brief 01 Task 6.3).
 
     The first nine arguments are the original snapshot inputs and keep
@@ -682,6 +683,14 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
         'store_ok': store_ok,
         'store_age_s': store_age_s,
         'store_reads_total': store_reads_total,
+        # Read-only support monitor (brief 23 Nov 2026): the monitor
+        # runner replaces this dict wholesale after each cycle; when
+        # the monitor never ran (or is disabled) the fields are the
+        # disabled default, never a made-up value.
+        'support_monitor': support_monitor if support_monitor is not None
+                           else {'enabled': False, 'last_run_at': None,
+                                 'last_findings_count': 0, 'reads_total': 0,
+                                 'last_error': None},
         'reasons': reasons if reasons is not None else {},
         'peak_job_rss_mb': peak_job_rss_mb,
         'last_job_peak_rss_mb': last_job_peak_rss_mb,
