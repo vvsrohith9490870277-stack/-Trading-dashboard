@@ -50,6 +50,19 @@ class CalculationTests(unittest.TestCase):
     if 'open,high' in sql:rows[0]['trade_date']='2026-11-04'
     return rows
   with self.assertRaisesRegex(RuntimeError,'missing_verified_exchange_session'):p.benchmark(e,GapDB(),date(2026,11,6))
+ def test_benchmark_session_check_uses_policy_symbol(self):
+  # The expected-session query must read the policy benchmark symbol
+  # (NIFTY50-INDEX), not a hardcoded 'NIFTY500'. A row stored under the
+  # wrong symbol must not fail the check: with the hardcoded value the
+  # stray Saturday row below raises spuriously; with the policy value the
+  # same check passes.
+  class SymbolDB:
+   def query(self,sql,args):
+    if 'open,high' in sql:return [{'trade_date':'2026-11-05','open':100,'high':101,'low':99,'close':100,'volume':0},{'trade_date':'2026-11-06','open':101,'high':102,'low':100,'close':101,'volume':0}]
+    if args[0]=='NIFTY500':return [{'trade_date':'2026-11-07'}]
+    return [{'trade_date':'2026-11-05'},{'trade_date':'2026-11-06'}]
+  from datetime import date
+  out=p.benchmark(e,SymbolDB(),date(2026,11,6));self.assertEqual(len(out),2)
  def test_strict_trend_not_equal(self):
   s,b=frames();s[['open','close']]=100;s.high=101;s.low=99;r=p.evaluate(s,b,'2026-11-06');self.assertFalse(r['checks']['close_above_sma50']);self.assertFalse(r['checks']['sma50_above_sma200']);self.assertFalse(r['checks']['return20_positive'])
 
