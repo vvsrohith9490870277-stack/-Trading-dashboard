@@ -3,10 +3,15 @@
 
 Vendored from the attachment handed over with brief render-deploy-01 (the
 script that used to live outside the repo on the box). The HTTP flow is kept
-byte-for-byte equivalent, with the two patches engine.refresh() used to apply
+equivalent to the box script, with one patch engine.refresh() used to apply
 by string-replacing the source built in as the default:
-  - only the first OTP URL (send_login_otp_v2) is tried;
   - only the base64 PIN variant is tried for verify_pin_v2.
+The OTP step tries send_login_otp_v2, then send_login_otp_v3 as fallback,
+exactly as the box script does (fix, brief 23 Nov 2026: Fyers no longer
+issues a request_key on v2 for this client, so a v2-only login fails with
+send_otp_failed while the box succeeds on v3). A send_otp failure carries
+Fyers's classified error detail (s, code, first 160 chars of message) on
+the FyersAuthError, so /health can show it without ever carrying a secret.
 The core is refresh_token(creds) with no .env read or write and no print of
 anything but status codes; main() keeps the CLI use (reads/writes the .env
 next to this file, box path only).
@@ -30,7 +35,16 @@ BASE_API = "https://api-t1.fyers.in/api/v3"
 
 
 class FyersAuthError(RuntimeError):
-    """Classified login failure (no secret in the message)."""
+    """Classified login failure (no secret in the message).
+
+    `detail` is Fyers's classified error detail ({s, code, message})
+    when the failure came with one; None otherwise. The message is
+    already redacted and truncated to 160 chars by the raiser.
+    """
+
+    def __init__(self, code, detail=None):
+        super().__init__(code)
+        self.detail = detail
 
 
 def load_env(path: pathlib.Path) -> dict[str, str]:
@@ -72,6 +86,28 @@ def redact(text: str, secrets: list[str]) -> str:
     return s[:800]
 
 
+def _error_detail(data, secrets):
+    """Fyers's classified error detail from a parsed response body.
+
+    Returns {'s', 'code', 'message'} with the message redacted
+    against `secrets` and truncated to 160 chars. Reads top-level
+    keys first, then the nested 'data' dict. Returns None when `data`
+    is not a dict. Never carries a secret, token, PIN or credential.
+    """
+    if not isinstance(data, dict):
+        return None
+    inner = data.get("data")
+    if not isinstance(inner, dict):
+        inner = {}
+    message = (data.get("message") or data.get("msg")
+               or inner.get("message") or inner.get("msg") or "")
+    return {
+        "s": data.get("s", inner.get("s")),
+        "code": data.get("code", inner.get("code")),
+        "message": redact(str(message), secrets)[:160],
+    }
+
+
 def refresh_token(creds: dict[str, str], session=None, verbose: bool = False) -> dict[str, str]:
     """Run the PIN+TOTP login flow and return {'access_token', 'refresh_token'?}.
 
@@ -104,21 +140,40 @@ def refresh_token(creds: dict[str, str], session=None, verbose: bool = False) ->
         if verbose:
             print(*parts)
 
-    # 1. send login otp (fy_id must be base64). Only the first OTP URL is tried.
-    try:
-        r = session.post(f"{BASE_VAGATOR}/send_login_otp_v2",
-                         json={"fy_id": fy_id_b64, "app_id": "2"}, timeout=30)
-    except Exception:
-        raise FyersAuthError("token_refresh_failed") from None
-    say("send_otp send_login_otp_v2 HTTP", r.status_code)
-    try:
-        data = r.json()
-    except Exception:
-        say("send_otp non-json", redact(r.text, secrets))
-        raise FyersAuthError("send_otp_failed") from None
-    request_key = data.get("request_key") or (data.get("data") or {}).get("request_key")
+    # 1. send login otp (fy_id must be base64). The box version tries
+    # v2, then v3 as fallback with the same payload; only a response
+    # without a request_key tries the next URL. A transport error
+    # still fails at once with token_refresh_failed. If neither URL
+    # returns a request_key, send_otp_failed carries Fyers's error
+    # detail from the last attempt (s, code, first 160 chars of
+    # message, redacted) so /health can show why it failed.
+    request_key = None
+    last_detail = None
+    for otp_url in (f"{BASE_VAGATOR}/send_login_otp_v2",
+                    f"{BASE_VAGATOR}/send_login_otp_v3"):
+        try:
+            r = session.post(otp_url,
+                             json={"fy_id": fy_id_b64, "app_id": "2"},
+                             timeout=30)
+        except Exception:
+            raise FyersAuthError("token_refresh_failed") from None
+        say("send_otp", otp_url.rsplit("/", 1)[-1], "HTTP", r.status_code)
+        try:
+            data = r.json()
+        except Exception:
+            say("send_otp non-json", redact(r.text, secrets))
+            last_detail = {"s": None, "code": None,
+                           "message": "non_json_response"}
+            continue
+        inner = data.get("data")
+        if not isinstance(inner, dict):
+            inner = {}
+        request_key = data.get("request_key") or inner.get("request_key")
+        if request_key:
+            break
+        last_detail = _error_detail(data, secrets)
     if not request_key:
-        raise FyersAuthError("send_otp_failed")
+        raise FyersAuthError("send_otp_failed", detail=last_detail)
 
     # 2. verify TOTP (imported here, not at module top level: pyotp is a
     # third-party package, and the install check treats any top-level

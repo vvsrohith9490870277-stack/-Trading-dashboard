@@ -754,6 +754,7 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
         'fyers_auth': fyers_auth if fyers_auth is not None else {
             'source': None, 'valid': False, 'obtained_at_ist': None,
             'next_refresh_ist': None, 'last_error_code': None,
+            'last_error_detail': None,
             'circuit_open': None, 'attempts_today': 0},
         'login_allowed': login_allowed,
         'git_sha': git_sha if git_sha is not None

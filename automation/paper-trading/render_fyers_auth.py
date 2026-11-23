@@ -147,6 +147,7 @@ class FyersTokenManager:
         self._attempts_today = 0
         self._attempts_date = None
         self._last_error_code = None
+        self._last_error_detail = None
         self._circuit_open_until = None
         self._last_attempt_at = None
         self._last_success_date = None
@@ -237,6 +238,8 @@ class FyersTokenManager:
             self._prune_attempts(now)
             if len(self._attempts) >= MAX_ATTEMPTS_PER_HOUR:
                 self._last_error_code = 'login_attempts_exceeded'
+                # No Fyers response behind this refusal, so no detail.
+                self._last_error_detail = None
                 return None
             if (kind == 'on_demand' and self._last_attempt_at is not None
                     and (now - self._last_attempt_at).total_seconds()
@@ -268,10 +271,14 @@ class FyersTokenManager:
         if refresh_token:
             creds['FYERS_REFRESH_TOKEN'] = refresh_token
         error_code = None
+        error_detail = None
         try:
             result = self._attempt_login(creds, session)
         except fa.FyersAuthError as ex:
             error_code = str(ex) or 'token_refresh_failed'
+            # The classified Fyers error detail (s, code, message),
+            # when the failure carried one; never a secret.
+            error_detail = getattr(ex, 'detail', None)
             result = None
         except Exception as ex:
             error_code = 'token_refresh_failed'
@@ -286,8 +293,10 @@ class FyersTokenManager:
                     self._refresh_token = result['refresh_token']
                 self._circuit_open_until = None
                 self._last_error_code = None
+                self._last_error_detail = None
                 return self._token
             self._last_error_code = error_code
+            self._last_error_detail = error_detail
             if error_code in AUTH_ERROR_CODES:
                 self._open_circuit(self._now_fn())
             return None
@@ -359,6 +368,7 @@ class FyersTokenManager:
                     if self._obtained_at is not None else None),
                 'next_refresh_ist': next_refresh,
                 'last_error_code': self._last_error_code,
+                'last_error_detail': self._last_error_detail,
                 'circuit_open': circuit_open,
                 'attempts_today': attempts_today,
             }
