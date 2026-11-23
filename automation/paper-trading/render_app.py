@@ -30,6 +30,7 @@ import render_schedule as rsch
 import render_state as rs
 import render_trial as rt
 import render_fyers_auth as rfa
+import render_full_schedule as rfs
 import runtime_mode as rm
 import support_monitor as sm
 
@@ -81,10 +82,17 @@ def check_namespace():
     """
     try:
         ns = rm.resolve_namespace({'namespace': repo_config_namespace()})
-        return True, ns
     except Exception as ex:
         print('namespace refused: %s' % type(ex).__name__, flush=True)
         return False, None
+    # Full-schedule startup guard (brief 23 Nov 2026): paper_v1 is the
+    # archived namespace and must never be written to. resolve() already
+    # refuses it in both modes; this is defense in depth so no future
+    # resolver path can start the supervisor under it.
+    if ns == 'paper_v1':
+        print('namespace refused: paper_v1', flush=True)
+        return False, None
+    return True, ns
 
 
 def job_rss_cap_mb():
@@ -396,13 +404,37 @@ class Supervisor:
             return run_job_streaming(cmd, self._child_env(), timeout=1800)
         return runner
 
-    def _run_job_sync(self, job):
-        day = datetime.now(IST).date().isoformat()
+    def _run_job_sync(self, job, now=None):
+        now = now or datetime.now(IST)
+        day = now.date().isoformat()
+        # Record the run in render_job_runs (the scheduler's record);
+        # a job that already completed today is never started (the
+        # guard lives in record_job_start as well as in the due
+        # check). The record is best-effort: run_job's paper_job_runs
+        # row stays authoritative, so a record failure never blocks
+        # the job itself.
+        try:
+            started = rfs.record_job_start(
+                self.store, self.namespace, job['name'], day)
+        except Exception:
+            started = True
+        if not started:
+            return
         try:
             rj.run_job(self.store, self.namespace, job['name'], day,
                        self.owner_id, self._job_runner(job))
+            status, error = 'ok', None
+        except Exception as ex:
+            # Recorded in paper_job_runs; the next tick retries
+            # in-window. A job exception never kills the scheduler
+            # or the worker.
+            status, error = 'error', type(ex).__name__
+        try:
+            rfs.record_job_finish(
+                self.store, self.namespace, job['name'], day,
+                status, error)
         except Exception:
-            pass  # recorded in paper_job_runs; the next tick retries in-window
+            pass
 
     def _refresh_health_store(self, force=False):
         """Refresh the cached /health store fields (Task 3), at most
@@ -423,8 +455,17 @@ class Supervisor:
         err = None
         result = None
         try:
-            result = rh.refresh_store_fields(self.store, self.namespace,
-                                             self.mode)
+            # The loaded schedule and config feed /health.schedule
+            # (full daily schedule, brief 23 Nov 2026). A schedule
+            # load failure leaves that field unknown, never the whole
+            # refresh failed.
+            try:
+                sched = rsch.load_schedule(mode=self.mode)
+            except Exception:
+                sched = None
+            result = rh.refresh_store_fields(
+                self.store, self.namespace, self.mode,
+                schedule=sched, config=self.config)
             if not result.get('ok'):
                 # The store answered nothing: every read group failed.
                 err = 'store_unreachable'
@@ -464,25 +505,59 @@ class Supervisor:
             pass
         return self.breakers
 
-    def _manage_jobs(self):
+    def _manage_jobs(self, now=None):
         if self._job_thread is not None and self._job_thread.is_alive():
             return
+        now = now or datetime.now(IST)
         try:
             sched = rsch.load_schedule(mode=self.mode)
             last = rj.last_run_times(self.store, self.namespace)
-            due = rsch.due_jobs(sched, last_run=last)
         except Exception:
             return
+        # Startup catch-up first (full schedule, brief 23 Nov 2026):
+        # a missed scan (before 15:00) or a missed EOD (after 16:10)
+        # after a restart is a trading job and outranks housekeeping.
+        # The normal 30-minute window is too short for a restart
+        # mid-morning, so catch-up covers it, each exactly once per
+        # trade_date. Completed jobs come from both job tables, so a
+        # job that finished through the older path is not re-run
+        # after a restart. On a normal tick the catch-up is empty
+        # (the slot has not passed yet, or the job already ran).
+        due = []
+        try:
+            completed = rfs.completed_jobs_today(
+                self.store, self.namespace, now.date().isoformat())
+            due = rfs.catch_up_due_jobs(
+                sched, now, completed, self.config)
+        except Exception:
+            pass
         if not due:
-            return
+            try:
+                due = rsch.due_jobs(sched, now=now, last_run=last)
+            except Exception:
+                return
+            if not due:
+                return
         # A job whose breaker is open is not started again today.
         self._refresh_breakers()
         due = [j for j in due if j['name'] not in self.breakers]
         if not due:
             return
         job = due[0]
+        # Single writer (full schedule): a write job only runs when
+        # this supervisor holds the lease. The tick gates on it, so
+        # this is defense in depth for a lease lost mid-tick; the
+        # skip is recorded so /health.schedule shows it.
+        if not self.lease_held:
+            try:
+                rfs.record_job_skipped(
+                    self.store, self.namespace, job['name'],
+                    now.date().isoformat(), 'lease_held_by_other')
+            except Exception:
+                pass
+            return
         self._job_thread = threading.Thread(
-            target=self._run_job_sync, args=(job,), daemon=True)
+            target=self._run_job_sync, args=(job, now), daemon=True)
         self._job_thread.start()
 
     # -- boot-time one-shot actions (Tasks 1-2) ----------------------
@@ -650,7 +725,8 @@ class Supervisor:
             pass
 
     # -- main tick ------------------------------------------------------
-    def tick(self):
+    def tick(self, now=None):
+        now = now or datetime.now(IST)
         self.last_tick_at = time.time()
         # The background refresher (due-checked, at most once per
         # RENDER_HEALTH_REFRESH_S): /health serves its cache.
@@ -694,12 +770,12 @@ class Supervisor:
         self._run_boot_actions()
         # worker first (the primary process), then due jobs
         self._manage_worker()
-        self._manage_jobs()
+        self._manage_jobs(now)
         # Daily 08:30 token refresh (retry window until 09:05). Runs
         # after the worker starts, so a slow calendar read here can
         # never delay the worker or serve a healthy snapshot with
         # the worker still stopped.
-        self._maybe_refresh_token()
+        self._maybe_refresh_token(now)
         self.last_snapshot = self.snapshot(flag)
         return self.last_snapshot
 
@@ -818,6 +894,7 @@ class Supervisor:
             support_monitor=getattr(
                 self, 'support_monitor_state', None),
             fyers_auth=(mgr.status() if mgr is not None else None),
+            schedule=fields.get('schedule'),
             fyers_budget={
                 'day_used': fields.get('fyers_budget_day_used'),
                 'per_day_limit': int(
