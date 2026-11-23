@@ -87,6 +87,12 @@ class HealthFieldsTests(unittest.TestCase):
         'store_reads_total', 'reasons', 'peak_job_rss_mb',
         'last_job_peak_rss_mb',
         'job_rss_cap_mb',
+        # Read-only support monitor (brief 23 Nov 2026).
+        'support_monitor',
+        # Fyers token auto-refresh (brief 23 Nov 2026).
+        'fyers_auth',
+        # Full daily schedule (brief 23 Nov 2026).
+        'schedule',
         # kept from the original snapshot:
         'status', 'active_runner', 'lease', 'jobs', 'uptime_seconds',
         'memory_mb',
