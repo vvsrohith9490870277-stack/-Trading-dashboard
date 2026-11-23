@@ -37,8 +37,9 @@ CREDS = {
 # Only the login / token endpoints are ever called. Any other URL
 # (notably a broker endpoint) is a failure of the module.
 ALLOWED_URL_TAILS = (
-    'send_login_otp_v2', 'verify_otp', 'verify_pin_v2', 'token',
-    'validate-authcode', 'validate-refresh-token',
+    'send_login_otp_v2', 'send_login_otp_v3', 'verify_otp',
+    'verify_pin_v2', 'token', 'validate-authcode',
+    'validate-refresh-token',
 )
 
 
@@ -52,12 +53,33 @@ class FakeResp:
         return self._payload
 
 
+class FakeNonJsonResp:
+    """A Fyers error page: .json() raises, .text is HTML."""
+
+    def __init__(self, text='<html>error</html>', status=502):
+        self.status_code = status
+        self.text = text
+
+    def json(self):
+        raise ValueError('no JSON here')
+
+
 class FakeFyersSession:
-    """Records every login call; emulates the Fyers login endpoints."""
+    """Records every login call; emulates the Fyers login endpoints.
+
+    fail_v2_otp: v2 answers without a request_key (the Render
+    failure); v3 answers with one, so the fallback can be exercised.
+    fail_v2_non_json: v2 answers a non-JSON error page; v3 succeeds.
+    fail_both_otp: both v2 and v3 answer without a request_key (the
+    v3 message is distinct, so the recorded detail is provably the
+    last attempt's).
+    """
 
     def __init__(self, fail_step=None, fail_refresh_token=False,
                  fail_transport=False, access_token='AT-NEW',
-                 refresh_token='RT-NEW', rt_access_token='AT-RT'):
+                 refresh_token='RT-NEW', rt_access_token='AT-RT',
+                 fail_v2_otp=False, fail_v2_non_json=False,
+                 fail_both_otp=False):
         self.calls = []
         self.headers = {}
         self.fail_step = fail_step
@@ -66,6 +88,9 @@ class FakeFyersSession:
         self.access_token = access_token
         self.refresh_token = refresh_token
         self.rt_access_token = rt_access_token
+        self.fail_v2_otp = fail_v2_otp
+        self.fail_v2_non_json = fail_v2_non_json
+        self.fail_both_otp = fail_both_otp
 
     def post(self, url, json=None, timeout=None, **kw):
         self.calls.append({'url': url, 'json': json})
@@ -76,7 +101,17 @@ class FakeFyersSession:
             return FakeResp({'s': 'error', 'code': -1,
                              'message': 'boom'}, 400)
         if step == 'send_login_otp_v2':
+            if self.fail_v2_non_json:
+                return FakeNonJsonResp()
+            if self.fail_v2_otp or self.fail_both_otp:
+                return FakeResp({'s': 'error', 'code': -110,
+                                 'message': 'otp v2 unavailable'}, 400)
             return FakeResp({'request_key': 'rk1', 's': 'ok'})
+        if step == 'send_login_otp_v3':
+            if self.fail_both_otp:
+                return FakeResp({'s': 'error', 'code': -111,
+                                 'message': 'otp v3 unavailable'}, 400)
+            return FakeResp({'request_key': 'rk1-v3', 's': 'ok'})
         if step == 'verify_otp':
             return FakeResp({'request_key': 'rk2', 's': 'ok'})
         if step == 'verify_pin_v2':
@@ -267,6 +302,7 @@ class ManagerRefreshTests(unittest.TestCase):
                               'obtained_at_ist': None,
                               'next_refresh_ist': None,
                               'last_error_code': None,
+                              'last_error_detail': None,
                               'circuit_open': False,
                               'attempts_today': 0})
 
@@ -298,6 +334,122 @@ class ManagerRefreshTests(unittest.TestCase):
             'validate-refresh-token'))
         self.assertEqual(mgr.status()['source'], 'refresh_token')
         self.assertEqual(mgr.status()['attempts_today'], 1)
+
+
+class V3FallbackTests(unittest.TestCase):
+    """send_login_otp_v3 fallback (brief 23 Nov 2026): Fyers no longer
+    issues a request_key on v2 for this client, so the login must try
+    v3 before failing, exactly as the box script does."""
+
+    def test_v2_no_key_falls_back_to_v3(self):
+        mgr, sess, clock, sleep = make_manager(
+            session=FakeFyersSession(fail_v2_otp=True))
+        token = mgr.refresh()
+        self.assertEqual(token, 'AT-NEW')
+        self.assertEqual(mgr.status()['source'], 'totp')
+        self.assertTrue(mgr.status()['valid'])
+        tails = [c['url'].rsplit('/', 1)[-1] for c in sess.calls]
+        self.assertEqual(tails, ['send_login_otp_v2',
+                                 'send_login_otp_v3', 'verify_otp',
+                                 'verify_pin_v2', 'token',
+                                 'validate-authcode'])
+        # Only the client ID (base64) and app_id "2" are sent at
+        # step 1, on both URLs.
+        expect = {'fy_id': base64.b64encode(b'CLIENT1').decode('ascii'),
+                  'app_id': '2'}
+        self.assertEqual(sess.calls[0]['json'], expect)
+        self.assertEqual(sess.calls[1]['json'], expect)
+        self.assertIsNone(mgr.status()['last_error_detail'])
+
+    def test_v2_non_json_falls_back_to_v3(self):
+        mgr, sess, clock, sleep = make_manager(
+            session=FakeFyersSession(fail_v2_non_json=True))
+        self.assertEqual(mgr.refresh(), 'AT-NEW')
+        tails = [c['url'].rsplit('/', 1)[-1] for c in sess.calls]
+        self.assertEqual(tails[:2], ['send_login_otp_v2',
+                                     'send_login_otp_v3'])
+
+    def test_both_otp_fail_raises_send_otp_failed(self):
+        sess = FakeFyersSession(fail_both_otp=True)
+        with self.assertRaises(fa.FyersAuthError) as cm:
+            fa.refresh_token(dict(CREDS), session=sess)
+        self.assertEqual(str(cm.exception), 'send_otp_failed')
+        # The detail is the LAST attempt's (v3's), not v2's.
+        self.assertEqual(cm.exception.detail,
+                         {'s': 'error', 'code': -111,
+                          'message': 'otp v3 unavailable'})
+        tails = [c['url'].rsplit('/', 1)[-1] for c in sess.calls]
+        self.assertEqual(tails, ['send_login_otp_v2',
+                                 'send_login_otp_v3'])
+
+    def test_last_error_detail_in_health(self):
+        mgr, sess, clock, sleep = make_manager(
+            session=FakeFyersSession(fail_both_otp=True))
+        self.assertIsNone(mgr.refresh())
+        st = mgr.status()
+        self.assertEqual(st['last_error_code'], 'send_otp_failed')
+        self.assertEqual(st['last_error_detail'],
+                         {'s': 'error', 'code': -111,
+                          'message': 'otp v3 unavailable'})
+        self.assertTrue(st['circuit_open'])
+        # The health payload never carries a secret.
+        blob = json.dumps(st)
+        for secret in ('1234', 'JBSWY3DPEHPK3PXP', 'CLIENT1', 'SECRET1'):
+            self.assertNotIn(secret, blob)
+
+    def test_last_error_detail_message_truncated_to_160(self):
+        long_msg = 'x' * 500
+        sess = FakeFyersSession(fail_both_otp=True)
+        orig_post = sess.post
+
+        def post(url, json=None, timeout=None, **kw):
+            if url.endswith('send_login_otp_v3'):
+                sess.calls.append({'url': url, 'json': json})
+                return FakeResp({'s': 'error', 'code': -111,
+                                 'message': long_msg}, 400)
+            return orig_post(url, json=json, timeout=timeout, **kw)
+
+        sess.post = post
+        with self.assertRaises(fa.FyersAuthError) as cm:
+            fa.refresh_token(dict(CREDS), session=sess)
+        self.assertEqual(cm.exception.detail['message'], 'x' * 160)
+        self.assertEqual(len(cm.exception.detail['message']), 160)
+
+    def test_last_error_detail_redacts_secrets(self):
+        sess = FakeFyersSession(fail_both_otp=True)
+        orig_post = sess.post
+
+        def post(url, json=None, timeout=None, **kw):
+            if url.endswith('send_login_otp_v3'):
+                sess.calls.append({'url': url, 'json': json})
+                return FakeResp({'s': 'error', 'code': -111,
+                                 'message': 'bad pin 1234 totp '
+                                            'JBSWY3DPEHPK3PXP'}, 400)
+            return orig_post(url, json=json, timeout=timeout, **kw)
+
+        sess.post = post
+        with self.assertRaises(fa.FyersAuthError) as cm:
+            fa.refresh_token(dict(CREDS), session=sess)
+        detail = cm.exception.detail
+        self.assertNotIn('1234', detail['message'])
+        self.assertNotIn('JBSWY3DPEHPK3PXP', detail['message'])
+        self.assertIn('<redacted>', detail['message'])
+
+    def test_last_error_detail_cleared_on_success(self):
+        sess = FakeFyersSession(fail_both_otp=True)
+        mgr, sess, clock, sleep = make_manager(session=sess)
+        self.assertIsNone(mgr.refresh())
+        self.assertEqual(mgr.status()['last_error_code'],
+                         'send_otp_failed')
+        self.assertIsNotNone(mgr.status()['last_error_detail'])
+        # 31 minutes on: the circuit has closed. The fake now
+        # answers v2 fine, so the retry succeeds.
+        clock.advance(minutes=31)
+        sess.fail_both_otp = False
+        self.assertEqual(mgr.refresh(), 'AT-NEW')
+        self.assertIsNone(mgr.status()['last_error_code'])
+        self.assertIsNone(mgr.status()['last_error_detail'])
+        self.assertTrue(mgr.status()['valid'])
 
 
 class CircuitAndBoundsTests(unittest.TestCase):
@@ -400,6 +552,7 @@ class RedactionAndHealthTests(unittest.TestCase):
         st = mgr.status()
         self.assertEqual(set(st), {'source', 'valid', 'obtained_at_ist',
                                    'next_refresh_ist', 'last_error_code',
+                                   'last_error_detail',
                                    'circuit_open', 'attempts_today'})
         self.assertNotIn('AT-FAKE-XYZ', json.dumps(st))
         snap = rh.build_snapshot(
@@ -421,6 +574,7 @@ class RedactionAndHealthTests(unittest.TestCase):
         self.assertEqual(snap['fyers_auth'], {
             'source': None, 'valid': False, 'obtained_at_ist': None,
             'next_refresh_ist': None, 'last_error_code': None,
+            'last_error_detail': None,
             'circuit_open': None, 'attempts_today': 0})
 
     def test_next_refresh_ist(self):
