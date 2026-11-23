@@ -601,7 +601,8 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
                    reasons=None, peak_job_rss_mb=None,
                    last_job_peak_rss_mb=None, job_rss_cap_mb=None,
                    quote_probe=None, store_reads_total=None,
-                   support_monitor=None, fyers_auth=None, schedule=None):
+                   support_monitor=None, support_agent=None,
+                   fyers_auth=None, schedule=None):
     """Build the /health payload (brief 01 Task 6.3).
 
     The first nine arguments are the original snapshot inputs and keep
@@ -718,6 +719,16 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
                            else {'enabled': False, 'last_run_at': None,
                                  'last_findings_count': 0, 'reads_total': 0,
                                  'last_error': None},
+        # Full Support Agent (brief Nov 2026): the agent runner
+        # replaces this dict wholesale after each cycle; when the
+        # agent never ran (or is disabled) the fields are the
+        # disabled default, never a made-up value.
+        'support_agent': support_agent if support_agent is not None
+                         else {'enabled': False, 'last_run_at': None,
+                               'last_findings_count': 0,
+                               'findings_created_total': 0, 'runs_total': 0,
+                               'last_error': None,
+                               'last_session_day': None},
         # Full daily schedule (brief 23 Nov 2026): per-job last
         # status, last run time, next run time and last error code,
         # plus lease_holder and namespace. When the refresher has
