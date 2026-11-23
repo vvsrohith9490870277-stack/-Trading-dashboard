@@ -87,7 +87,7 @@ class HygieneTests(unittest.TestCase):
         # The return code is NOT asserted: test_health_reports_runtime_deps fails on this
         # VM for an environment reason (runtime_deps ok False) and that failure must not
         # hide a leak — the file invariants below are the assertion. The run is only
-        # trusted if all 13 tests actually ran (guards against a vacuous pass from a
+        # trusted if all 18 tests actually ran (guards against a vacuous pass from a
         # renamed test or an import error).
         ids = [
             'test_engine.PaperTests.test_buy_duplicate_exit_and_pnl',
@@ -103,6 +103,11 @@ class HygieneTests(unittest.TestCase):
             'test_worker_supervision.WorkerSupervisionTests.test_config_keys_present_and_polling_budget_above_idle',
             'test_history_sync.HistorySyncTests.test_skips_symbols_already_at_target',
             'test_runtime_deps.RuntimeDepsTests.test_health_reports_runtime_deps',
+            'test_exit_selftest.ExitSelftestTests.test_uses_own_lock_not_engine_lock',
+            'test_exit_slippage_fallback.FallbackNodeTests.test_sell_without_adv_fills_at_base_bps',
+            'test_hardcode_audit.SellQuantityTests.test_exit_audits_full_position_quantity_not_one_share',
+            'test_namespace_cutover.CutoverTests.test_repo_config_namespace_is_paper_v2',
+            'test_reference_feeds.ReferenceFeedTests.test_classify_never_invents_extraordinary_threshold',
         ]
         src = Path(e.ROOT)
         tmp = Path(tempfile.mkdtemp(prefix='hygiene-copy-'))
@@ -116,7 +121,7 @@ class HygieneTests(unittest.TestCase):
         r = subprocess.run([PY, '-m', 'unittest'] + ids,
                            cwd=str(dst / 'tests'), env=env, capture_output=True, text=True, timeout=600)
         out = r.stdout + r.stderr
-        self.assertIn('Ran 13 tests', out, out[-2000:])
+        self.assertIn('Ran 18 tests', out, out[-2000:])
         left = sorted(p.name for p in (dst / 'tests').glob('test_*.sqlite*'))
         self.assertEqual(left, [], out[-2000:])
         outdir = dst / 'out'
