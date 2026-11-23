@@ -33,3 +33,21 @@ CREATE TABLE IF NOT EXISTS paper_runtime_kv(
   updated_at TEXT NOT NULL,
   PRIMARY KEY(scope, key)
 );
+-- Full-schedule job record (brief 23 Nov 2026): one row per
+-- (namespace, job, trade_date) for the jobs the scheduler runs.
+-- The scheduler writes start/finish here; the catch-up and
+-- /health.schedule read it. paper_job_runs (above) is still written
+-- by run_job and still drives the breakers and /health jobs. The
+-- namespace column is needed because the Turso DB is shared across
+-- namespaces; without it a trial row would block the paper_v2 job
+-- for the same day after cutover.
+CREATE TABLE IF NOT EXISTS render_job_runs(
+  namespace TEXT NOT NULL,
+  job TEXT NOT NULL,
+  trade_date TEXT NOT NULL,
+  status TEXT NOT NULL,
+  started_at TEXT,
+  finished_at TEXT,
+  error_code TEXT,
+  PRIMARY KEY(namespace, job, trade_date)
+);

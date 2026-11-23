@@ -24,7 +24,8 @@ from pathlib import Path
 import requests
 
 SCHEMA_PATH = Path(__file__).resolve().parent / 'render_schema.sql'
-SCHEMA_TABLES = ('paper_runner_lease', 'paper_job_runs', 'paper_runtime_kv')
+SCHEMA_TABLES = ('paper_runner_lease', 'paper_job_runs', 'paper_runtime_kv',
+                 'render_job_runs')
 
 
 class TursoHttpError(RuntimeError):
