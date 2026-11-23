@@ -1091,6 +1091,18 @@ def simulate_track_window(
                 continue
             open_px = float(bar['open'])
             qty = cap.integer_shares(open_px, TARGET_NOTIONAL_INR)
+            # C109 only: use the candidate's ATR-based qty, capped at the
+            # frozen Rs 50,000 per-trade maximum at the fill price (the
+            # signal-day value cap used the entry close; a gap-up open
+            # must not breach the maximum). Every other strategy keeps
+            # the frozen fixed sizing above.
+            if s == 109 and sig.get('qty') is not None:
+                try:
+                    sig_qty = int(sig['qty'])
+                except (TypeError, ValueError):
+                    sig_qty = 0
+                if sig_qty >= 1:
+                    qty = min(sig_qty, qty)
             if qty < 1:
                 skips.append({'day': day, 'symbol': sym, 'cause': CAPITAL_POLICY['zero_share_cause']})
                 continue
@@ -1198,7 +1210,20 @@ def simulate_track_window(
             if sym in positions and bool(last_row.get('exit_condition', False)):
                 pending_signals.append({'symbol': sym, 'side': 'SELL', 'signal_date': day, 'reason': 'daily_exit'})
             elif sym not in positions and sym in eligible_set and bool(last_row.get('entry_condition', False)):
-                pending_signals.append({'symbol': sym, 'side': 'BUY', 'signal_date': day, 'reason': 'daily_entry'})
+                sig = {'symbol': sym, 'side': 'BUY', 'signal_date': day, 'reason': 'daily_entry'}
+                # C109 only: ATR-based sizing. The candidate's signals frame
+                # carries a 'qty' column (shares for this entry bar, 0 = no
+                # entry). No other strategy or candidate produces that
+                # column, so this branch is inert for strategies 1-7 and
+                # candidates 101-108, which keep the frozen fixed sizing.
+                if s == 109:
+                    try:
+                        q = int(last_row.get('qty', 0))
+                    except (TypeError, ValueError):
+                        q = 0
+                    if q >= 1:
+                        sig['qty'] = q
+                pending_signals.append(sig)
 
     return {
         'strategy': s,

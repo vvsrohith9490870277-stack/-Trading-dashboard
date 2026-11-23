@@ -107,6 +107,35 @@ def _edge_dates(out, col):
     return [days[i] for i in range(1, len(cond)) if cond[i] and not cond[i - 1]]
 
 
+def _c109_closes():
+    # 200 flat bars (SMA200 = 100), a dip to 80, then a rise to 120 and a
+    # fall back to 80: EMA20 crosses above EMA50 on the rise (entry) and
+    # back below it on the fall (exit), exactly like frozen S4.
+    return ([100.0] * 200
+            + [98, 96, 94, 92, 90, 88, 86, 84, 82, 80,
+               80, 82, 84, 86, 88, 90, 92, 94, 96, 98,
+               100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120,
+               118, 116, 114, 112, 110, 108, 106, 104, 102, 100,
+               98, 96, 94, 92, 90, 88, 86, 84, 82, 80])
+
+
+def _c109_bars(closes, half_range, symbol='SYN-EQ'):
+    """Synthetic bars with a controlled true range: high = close +
+    half_range, low = close - half_range, so Wilder ATR(14) settles near
+    2 x half_range once the range has been constant for ~14 bars."""
+    from datetime import date
+    days = trading_days(len(closes), date(2024, 1, 1))
+    rows = []
+    for i, (d, c) in enumerate(zip(days, closes)):
+        o = closes[i - 1] if i else c
+        rows.append({'symbol': symbol, 'trade_date': d, 'open': o,
+                     'high': round(c + half_range, 2),
+                     'low': round(c - half_range, 2),
+                     'close': c, 'volume': 300000})
+    import pandas as pd
+    return pd.DataFrame(rows)
+
+
 def _c101_closes():
     px, cl = 1000.0, []
     for i in range(300):
@@ -397,6 +426,95 @@ class CandidateSignalTests(unittest.TestCase):
         out = ac.candidate_signals(106, star, universe=uni3)
         self.assertEqual(_edge_dates(out, 'entry_condition'), ['2025-01-01'])
 
+    def test_c109_size_smaller_when_atr_higher(self):
+        # Same closes, same entry bar (2024-11-08, close 108): a wider
+        # range (ATR ~20) sizes far fewer shares than a narrow range
+        # (ATR ~10) — a volatile stock gets a smaller position.
+        out_wide = ac.candidate_signals(109, _c109_bars(_c109_closes(), 10.0))
+        out_narrow = ac.candidate_signals(109, _c109_bars(_c109_closes(), 5.0))
+        self.assertEqual(_edge_dates(out_wide, 'entry_condition'), ['2024-11-08'])
+        self.assertEqual(_edge_dates(out_narrow, 'entry_condition'), ['2024-11-08'])
+        qty_wide = int(out_wide[out_wide['entry_condition']].iloc[0]['qty'])
+        qty_narrow = int(out_narrow[out_narrow['entry_condition']].iloc[0]['qty'])
+        self.assertEqual(qty_wide, 125)
+        self.assertEqual(qty_narrow, 250)
+        self.assertLess(qty_wide, qty_narrow)
+
+    def test_c109_size_larger_when_atr_lower(self):
+        # The mirror of the test above: the narrow-range (ATR ~5) entry
+        # sizes 462 shares — larger than the 250 shares at ATR ~10 — but
+        # still capped by the Rs 50,000 per-trade maximum (462 x 108).
+        out = ac.candidate_signals(109, _c109_bars(_c109_closes(), 2.5))
+        row = out[out['entry_condition']].iloc[0]
+        self.assertEqual(int(row['qty']), 462)
+        self.assertLessEqual(int(row['qty']) * float(row['close']), 50000)
+
+    def test_c109_size_never_exceeds_50000(self):
+        # Sweep half-ranges and price levels: every entry's position value
+        # stays within the Rs 50,000 per-trade maximum, and every entry
+        # sizes at least one share.
+        for half_range in (0.5, 1.0, 2.5, 5.0, 10.0, 20.0):
+            for level in (50.0, 100.0, 500.0, 1000.0):
+                closes = [c * level / 100.0 for c in _c109_closes()]
+                out = ac.candidate_signals(109, _c109_bars(closes, half_range * level / 100.0))
+                ent = out[out['entry_condition']]
+                self.assertGreater(len(ent), 0, (half_range, level))
+                for _, row in ent.iterrows():
+                    self.assertGreaterEqual(int(row['qty']), 1)
+                    self.assertLessEqual(int(row['qty']) * float(row['close']), 50000)
+
+    def test_c109_sleeve_cap_unchanged(self):
+        # The Rs 5 lakh per-strategy sleeve cap and the Rs 50,000
+        # per-trade maximum are untouched by C109: the candidate only
+        # changes how the per-trade amount is split into shares.
+        self.assertEqual(cap.POLICY['sleeve_capital_inr'], 500000)
+        self.assertEqual(ae.SLEEVE_CAPITAL_PAISE, 50_000_000)
+        self.assertEqual(ae.TARGET_NOTIONAL_INR, 50000)
+        self.assertEqual(ac.CANDIDATE_STRATEGIES[109]['params']['max_notional_inr'], 50000)
+        # C109 does not change the frozen capital policy file.
+        self.assertEqual(cap.POLICY['target_notional_inr'], 50000)
+
+    def test_c109_same_risk_across_atr(self):
+        # Risk per trade = qty x 2 x ATR(14) at entry. At ATR ~20 the
+        # trade sizes 125 shares (risk Rs 5,000); at ATR ~10 it sizes
+        # 250 shares (risk Rs 5,000) — the same risk, different size.
+        out_wide = ac.candidate_signals(109, _c109_bars(_c109_closes(), 10.0))
+        out_narrow = ac.candidate_signals(109, _c109_bars(_c109_closes(), 5.0))
+        risk_wide = int(out_wide[out_wide['entry_condition']].iloc[0]['qty']) * 2 * float(
+            out_wide[out_wide['entry_condition']].iloc[0]['atr14_at_entry'])
+        risk_narrow = int(out_narrow[out_narrow['entry_condition']].iloc[0]['qty']) * 2 * float(
+            out_narrow[out_narrow['entry_condition']].iloc[0]['atr14_at_entry'])
+        self.assertAlmostEqual(risk_wide, 5000.0, places=0)
+        self.assertAlmostEqual(risk_narrow, 5000.0, places=0)
+        self.assertAlmostEqual(risk_wide, risk_narrow, places=0)
+
+    def test_c109_mirrors_s4_entry_and_registry_shadow_only(self):
+        # Entry/exit edges match frozen S4 exactly (the 2024-10-07 S4
+        # exit predates any entry, so only post-entry edges compare).
+        df = _c109_bars(_c109_closes(), 5.0)
+        out = ac.candidate_signals(109, df)
+        s4 = ae.evaluate_parameterized_strategy(4, df, dict(ae.BASELINE_PARAMS[4]))
+        self.assertEqual(_edge_dates(out, 'entry_condition'),
+                         _edge_dates(s4, 'entry_condition'))
+        s4_exits = [d for d in _edge_dates(s4, 'exit_condition') if d >= '2024-11-08']
+        self.assertEqual(_edge_dates(out, 'exit_condition'), s4_exits)
+        # Registry: 109 is a candidate only, with the sizing params.
+        c109 = ac.CANDIDATE_STRATEGIES[109]
+        self.assertEqual(c109['params']['ema_fast'], 20)
+        self.assertEqual(c109['params']['ema_slow'], 50)
+        self.assertEqual(c109['params']['sma_trend'], 200)
+        self.assertEqual(c109['params']['atr_period'], 14)
+        self.assertEqual(c109['params']['risk_budget_inr'], 5000)
+        self.assertEqual(c109['warm_start_days'], 200)
+        self.assertIn('risk budget', c109['notes'])
+        self.assertIn('CHOICE', c109['notes'])
+        # Shadow-only: not in BASELINE_PARAMS, policy tiers, or rules.
+        self.assertNotIn(109, ae.BASELINE_PARAMS)
+        pol = json.loads((ROOT / 'adaptive_policy.json').read_text())
+        self.assertNotIn(109, pol['fast_swing_strategies'] + pol['trend_strategies'])
+        rules = json.loads((ROOT / 'strategy_rules.json').read_text())
+        self.assertNotIn('109', rules.keys())
+
     def test_c102_connors_rsi2_entry_exit(self):
         df = _bars(_c102_closes())
         out = ac.candidate_signals(102, df)
@@ -602,7 +720,7 @@ class ShadowRunnerTests(unittest.TestCase):
             blob = json.dumps(args, default=str)
             for ns in ('paper_v1', 'paper_v2', 'paper_demo_v1'):
                 self.assertNotIn(ns, blob)
-        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106})
+        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106, 109})
         for s, r in self.out.items():
             self.assertEqual(r['status'], 'SHADOW_SIMULATED')
             self.assertEqual(r['mode'], 'shadow')
@@ -630,7 +748,7 @@ class ShadowRunnerTests(unittest.TestCase):
         daily = self.db.query('SELECT * FROM adaptive_candidate_daily')
         self.assertGreater(len(daily), 0)
         self.assertTrue(all(r['mode'] == 'shadow' and r['simulated'] == 1 for r in daily))
-        self.assertEqual({r['strategy'] for r in daily}, {101, 102, 103, 104, 105, 106})
+        self.assertEqual({r['strategy'] for r in daily}, {101, 102, 103, 104, 105, 106, 109})
         trades = self.db.query('SELECT * FROM adaptive_candidate_trades')
         self.assertTrue(all(r['mode'] == 'shadow' and r['simulated'] == 1 for r in trades))
 

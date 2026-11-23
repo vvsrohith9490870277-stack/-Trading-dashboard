@@ -46,7 +46,7 @@ const monthly = (rows) => rows.map(([period, closed, winRate, mean]) => ({period
 describe('adaptive logic', () => {
   it('candidate rows have no live metrics: only the synthetic rows exist', () => {
     const rows = candidateRows(realCatalogue, realCompare);
-    expect(rows.map(r => r.id)).toEqual([101, 102, 103, 104, 105, 106]);
+    expect(rows.map(r => r.id)).toEqual([101, 102, 103, 104, 105, 106, 109]);
     for (const r of rows) {
       expect(r.winRate).toBeNull();
       expect(r.meanReturn).toBeNull();
@@ -58,6 +58,11 @@ describe('adaptive logic', () => {
     expect(rows.find(r => r.id === 106).synthetic).toBeNull();
     expect(rows.find(r => r.id === 106).runState).toBe('ran');
     expect(rows.find(r => r.id === 106).missingReason).toMatch(/0 closed trades/);
+    // C109 is in the catalogue but was not run in the synthetic fixture,
+    // so it has no synthetic row and no live metrics either.
+    expect(rows.find(r => r.id === 109).synthetic).toBeNull();
+    expect(rows.find(r => r.id === 109).runState).toBe('not_run');
+    expect(rows.find(r => r.id === 109).missingReason).toMatch(/not run/);
     expect(rows.find(r => r.id === 101).runState).toBe('not_run');
     expect(rows.find(r => r.id === 103).missingReason).toMatch(/not run/);
   });
@@ -132,7 +137,8 @@ describe('adaptive logic', () => {
     expect(a.forwardDays).toBe(0);
     expect(a.forwardTrades).toBe(0);
     expect(a.replayDays).toBe(130);
-    expect(a.missingCandidates).toEqual([101, 103, 104, 106]);
+    // C109 was not run in the synthetic fixture, so it is missing too.
+    expect(a.missingCandidates).toEqual([101, 103, 104, 106, 109]);
     expect(a.insufficientCandidates).toEqual([102, 105]);
     expect(a.checks.find(c => c.label === 'Forward shadow days observed').ok).toBe(false);
     const history = JSON.parse(readFileSync(process.cwd() + '/public/data/historical.json', 'utf8'));
@@ -170,7 +176,8 @@ describe('adaptive engine screen', () => {
     expect(screen.getAllByText('Synthetic fixture only (4 symbols, 130 days) — not real NSE results').length).toBe(3);
     expect(screen.getByText('-4.86%', {exact: false})).toBeInTheDocument();
     expect(screen.getByText('3.7%', {exact: false})).toBeInTheDocument();
-    expect(screen.getAllByText('not evaluable').length).toBe(6);
+    // 7 candidates now: 101-106 and 109, each with no live metrics.
+    expect(screen.getAllByText('not evaluable').length).toBe(7);
     expect(screen.queryByRole('button', {name: /promote|demote/i})).toBeNull();
   });
 

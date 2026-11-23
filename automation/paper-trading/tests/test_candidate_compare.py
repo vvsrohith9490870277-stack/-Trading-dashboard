@@ -114,6 +114,34 @@ class CompareMetricsTests(unittest.TestCase):
         self.assertIn('106', report['strategies'])
         self.assertIn('| 106 |', cc.render_markdown(report))
 
+    def test_c109_key_flows_through_compare(self):
+        # Candidate 109 needs no compare-code change: strategy_metrics and
+        # build_report iterate whatever strategy keys they are given. A 109
+        # row flows through with the same fields, R and overlap as 101/102.
+        # The trades are ATR-sized: qty 250 at ATR(14) Rs 10, so 1R =
+        # 250 x 2 x 1000 paise = Rs 5,000 (the risk budget).
+        trades = [{'symbol': 'AAA-EQ', 'entry_date': '2026-01-02', 'exit_date': '2026-01-03',
+                   'qty': 250, 'entry_price': 108.0, 'exit_price': 110.0,
+                   'net_pnl_paise': 250000, 'atr14_at_entry_paise': 1000},
+                  {'symbol': 'BBB-EQ', 'entry_date': '2026-01-04', 'exit_date': '2026-01-05',
+                   'qty': 250, 'entry_price': 108.0, 'exit_price': 107.0,
+                   'net_pnl_paise': -125000, 'atr14_at_entry_paise': 1000}]
+        rows = cc.strategy_metrics({'1': [], '109': trades}, cc.SEVEN, 20, 50_000_000)
+        r109 = rows['109']
+        self.assertEqual(r109['trades'], 2)
+        self.assertEqual(r109['win_rate'], 0.5)
+        self.assertEqual(r109['net_pnl_paise'], 125000)
+        self.assertAlmostEqual(r109['avg_r'], 0.125, places=4)
+        self.assertAlmostEqual(r109['avg_net_return_pct'], 2.3148, places=4)
+        self.assertEqual(r109['sample_label'], 'insufficient_sample')
+        self.assertTrue(ROW_FIELDS <= set(r109))
+        report = cc.build_report(
+            {'window_days': 20, 'starting_capital_paise': 50_000_000, 'strategies': {'109': trades}},
+            {'window_days': 5, 'starting_capital_paise': 50_000_000, 'strategies': {}},
+            '2026-01-15')
+        self.assertIn('109', report['strategies'])
+        self.assertIn('| 109 |', cc.render_markdown(report))
+
     def test_insufficient_sample_label(self):
         # Every fixture row has <30 trades.
         for panel in ('historical_replay', 'forward_shadow'):
