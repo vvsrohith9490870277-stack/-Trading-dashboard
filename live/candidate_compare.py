@@ -25,7 +25,7 @@ Honesty rules (brief §4 B4):
 
 Inputs: --offline-fixture DIR (trades_historical.json + trades_forward.json,
 as written by the committed fixture) or --db PATH (sidecar adaptive.sqlite:
-adaptive_candidate_trades for 101-106 and adaptive_sim_trades track='A' for
+adaptive_candidate_trades for 101-107 and adaptive_sim_trades track='A' for
 the seven). In --db mode ATR(14) at entry is not stored in either table, so
 avg_r is null with reason atr14_at_entry_not_stored.
 """

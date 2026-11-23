@@ -1,4 +1,4 @@
-"""Candidate-strategy registry (B3): shadow challengers 101-106.
+"""Candidate-strategy registry (B3): shadow challengers 101-107.
 
 Shadow / observation mode ONLY. Candidates never enter BASELINE_PARAMS,
 adaptive_policy.json tiers, strategy_rules.json, or the adaptive_daily.py
@@ -10,7 +10,7 @@ signal_evaluator hook, and their results are written only to the sidecar
 adaptive.sqlite tables adaptive_candidate_*.
 
 Rule text: docs/research/adaptive-support-plan.md §4 (exact rule text with
-citations). All five are long-only, daily-close, rule-based swing strategies,
+citations). All are long-only, daily-close, rule-based swing strategies,
 different from the frozen seven (01 Donchian/Turtle, 02 Supertrend, 03 RSI14
 pullback in uptrend, 04 EMA20/50 cross with SMA200, 05 Bollinger reversion,
 06 MACD trend, 07 52-week-high momentum). All rule numbers are strategy
@@ -50,10 +50,19 @@ Per-candidate notes / fallbacks (brief §6):
   nothing. Monthly rebalance; exit at the next rebalance when the stock
   drops out of the top 30. No 63-session expiry: the published
   sector-adjusted rule has none.
-- No candidate has a fixed stop (exits are indicator-based, like the frozen
-  seven). initial_stop is therefore None with a note; the B4 compare report
-  uses the 2x ATR(14)-based 1R reporting convention (plan §4.4, Grok Q3:
-  1R = qty x 2 x ATR(14)).
+- C107 is the first candidate with a fixed stop: a protective stop at entry
+  price − 2 x ATR(14) at entry (risk plan MUSE-PLAN-adaptive-risk-fixes.md
+  §1), on top of S4's indicator exit. The other candidates have no fixed
+  stop (exits are indicator-based, like the frozen seven); their
+  initial_stop is therefore None with a note. The B4 compare report uses
+  the 2x ATR(14)-based 1R reporting convention (plan §4.4, Grok Q3:
+  1R = qty x 2 x ATR(14)) — for C107 that 1R IS the stop distance.
+- C107 mirrors frozen S4 (strategy_4: EMA20/50 cross, entry only above
+  SMA200, exit on the cross-down) and adds only the protective stop.
+  Entry, exit and stop are computed by a state-aware walk: the stop level
+  is set at the entry bar from that bar's ATR(14) and frozen for the trade
+  (not trailing), and is evaluated on the daily close, the same convention
+  as the frozen exits.
 """
 import numpy as np
 import pandas as pd
@@ -502,6 +511,93 @@ def _c106_exits(df, universe=None, sector_map=None):
 
 
 # ---------------------------------------------------------------------------
+# C107 — Dual MA crossover (S4) + 2x ATR(14) protective stop (risk plan §1)
+# ---------------------------------------------------------------------------
+
+def _s4_signals(df):
+    """S4 (frozen strategy_4) indicators, mirrored exactly: EMA20/EMA50
+    cross, entry only above SMA200, exit on the cross-down. The frozen file
+    is never edited; the formulas below are the same ones."""
+    g = df.copy()
+    c = g['close'].astype(float)
+    g['ema20'] = c.ewm(span=20, adjust=False).mean()
+    g['ema50'] = c.ewm(span=50, adjust=False).mean()
+    g['prior_ema20'] = g['ema20'].shift()
+    g['prior_ema50'] = g['ema50'].shift()
+    g['sma200'] = c.rolling(200).mean()
+    g['cross_up'] = (g['ema20'] > g['ema50']) & (g['prior_ema20'] <= g['prior_ema50'])
+    g['cross_down'] = (g['ema20'] < g['ema50']) & (g['prior_ema20'] >= g['prior_ema50'])
+    return g
+
+
+def _c107_walk(df):
+    """State-aware walk for C107: S4 entries; exit on the protective stop
+    OR the S4 cross-down, whichever comes first.
+
+    Stop = entry close − 2 × ATR(14) at the entry bar (the 1R convention:
+    1R = qty × 2 × ATR(14) at entry). The ATR is taken at entry and frozen
+    for the trade (not trailing). The stop is evaluated on the daily close,
+    the same convention as the frozen exits (signals at the close, fills at
+    the next open). Returns (entry, exit_cond, stop_level, entry_price,
+    atr_entry) Series; stop_level / entry_price / atr_entry hold the stop
+    in force on each bar while holding (NaN otherwise). No lookahead: every
+    value at a bar uses only bars up to that bar. Exits are applied before
+    entries on the same bar, so a stop/cross-down exit and a fresh entry
+    never coincide on one bar."""
+    g = _s4_signals(df)
+    n = len(g)
+    entry = pd.Series(False, index=df.index)
+    exit_cond = pd.Series(False, index=df.index)
+    stop_level = pd.Series(np.nan, index=df.index, dtype=float)
+    entry_price = pd.Series(np.nan, index=df.index, dtype=float)
+    atr_entry = pd.Series(np.nan, index=df.index, dtype=float)
+    atr = _atr_wilder(g['high'], g['low'], g['close'], 14)
+    entry_cond = (g['cross_up'] & (g['close'].astype(float) > g['sma200'])).fillna(False)
+    cross_down = g['cross_down'].fillna(False)
+    close = g['close'].astype(float)
+    holding = False
+    stop = None
+    entry_px = None
+    atr_e = None
+    for i in range(n):
+        if holding:
+            stop_level.iloc[i] = stop
+            entry_price.iloc[i] = entry_px
+            atr_entry.iloc[i] = atr_e
+            if bool(cross_down.iloc[i]) or close.iloc[i] <= stop:
+                exit_cond.iloc[i] = True
+                holding = False
+                stop = None
+        if not holding and bool(entry_cond.iloc[i]):
+            entry.iloc[i] = True
+            holding = True
+            entry_px = float(close.iloc[i])
+            atr_e = float(atr.iloc[i])
+            stop = entry_px - 2.0 * atr_e
+            stop_level.iloc[i] = stop
+            entry_price.iloc[i] = entry_px
+            atr_entry.iloc[i] = atr_e
+    return entry, exit_cond, stop_level, entry_price, atr_entry
+
+
+def _c107_entries(df):
+    g = _s4_signals(df)
+    entry, _, _, _, _ = _c107_walk(df)
+    g['entry_condition'] = entry
+    return g
+
+
+def _c107_exits(df):
+    g = _s4_signals(df)
+    _, exit_cond, stop_level, entry_price, atr_entry = _c107_walk(df)
+    g['exit_condition'] = exit_cond
+    g['stop_level'] = stop_level
+    g['entry_price'] = entry_price
+    g['atr14_at_entry'] = atr_entry
+    return g
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -584,6 +680,25 @@ CANDIDATE_STRATEGIES = {
                  'a sector/industry column on the universe frame); with no usable '
                  'map it enters nothing.',
     },
+    107: {
+        'id': 107, 'name': 'Dual MA crossover (S4) + 2x ATR(14) protective stop',
+        'source': 'MUSE-PLAN-adaptive-risk-fixes.md §1 (risk plan, 2026-11-22); '
+                  'S4 = frozen strategy_4 (EMA20/50 cross with SMA200)',
+        'tier': 'trend', 'warm_start_days': 200,
+        'params': {'ema_fast': 20, 'ema_slow': 50, 'sma_trend': 200,
+                   'atr_period': 14, 'stop_atr_mult': 2.0},
+        'entries': _c107_entries, 'exits': _c107_exits,
+        'initial_stop': {'type': 'protective_stop',
+                         'definition': 'Exit at entry price − 2 × ATR(14) at entry, '
+                                       'or on the S4 cross-down, whichever comes first. '
+                                       '1R = qty × 2 × ATR(14) at entry.'},
+        'notes': 'Mirrors S4 exactly (EMA20/50 cross-up above SMA200 for entry, '
+                 'cross-down for exit) plus a protective stop: entry close − 2 × '
+                 'ATR(14) at the entry bar. The ATR is taken at entry and frozen '
+                 'for the trade (not trailing); the stop is evaluated on the daily '
+                 'close, the same convention as the frozen exits. First candidate '
+                 'with a fixed stop; the other candidates have no fixed stop.',
+    },
 }
 
 
@@ -596,7 +711,9 @@ def candidate_signals(strategy, df, universe=None, entry_dates=None, sector_map=
     (sector-adjusted rank); entry_dates (entry fill dates for this symbol)
     enables the 105 hold-expiry exit; sector_map (symbol -> sector) is
     required for 106, or a 'sector'/'industry' column on the universe
-    frame. Signals use only completed bars (no lookahead).
+    frame. 107 is single-symbol: its exit walk tracks the entry price and
+    the ATR(14) at entry from the symbol's own bars. Signals use only
+    completed bars (no lookahead).
     """
     s = int(strategy)
     if s not in CANDIDATE_STRATEGIES:
