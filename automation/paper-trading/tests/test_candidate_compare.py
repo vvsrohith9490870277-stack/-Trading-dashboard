@@ -114,6 +114,35 @@ class CompareMetricsTests(unittest.TestCase):
         self.assertIn('106', report['strategies'])
         self.assertIn('| 106 |', cc.render_markdown(report))
 
+    def test_c108_key_flows_through_compare(self):
+        # Candidate 108 needs no compare-code change: strategy_metrics and
+        # build_report iterate whatever strategy keys they are given. A 108
+        # row flows through with the same fields, R and overlap as 101/102.
+        # The losing trade (-0.25R) is a time-stop exit: entry 100, exit 99
+        # after 20 sessions, not profitable.
+        trades = [{'symbol': 'AAA-EQ', 'entry_date': '2026-01-02', 'exit_date': '2026-01-03',
+                   'qty': 10, 'entry_price': 100.0, 'exit_price': 102.0,
+                   'net_pnl_paise': 2000, 'atr14_at_entry_paise': 200},
+                  {'symbol': 'BBB-EQ', 'entry_date': '2026-01-04', 'exit_date': '2026-01-05',
+                   'qty': 10, 'entry_price': 100.0, 'exit_price': 99.0,
+                   'net_pnl_paise': -1000, 'atr14_at_entry_paise': 200}]
+        rows = cc.strategy_metrics({'1': [], '108': trades}, cc.SEVEN, 20, 50_000_000)
+        r108 = rows['108']
+        self.assertEqual(r108['trades'], 2)
+        self.assertEqual(r108['win_rate'], 0.5)
+        # R uses the 1R convention (1R = qty x 2 x ATR(14) at entry):
+        # +2000/4000 = +0.5R and -1000/4000 = -0.25R, average +0.125R.
+        self.assertAlmostEqual(r108['avg_r'], 0.125, places=4)
+        self.assertEqual(r108['net_pnl_paise'], 1000)
+        self.assertEqual(r108['sample_label'], 'insufficient_sample')
+        self.assertTrue(ROW_FIELDS <= set(r108))
+        report = cc.build_report(
+            {'window_days': 20, 'starting_capital_paise': 50_000_000, 'strategies': {'108': trades}},
+            {'window_days': 5, 'starting_capital_paise': 50_000_000, 'strategies': {}},
+            '2026-01-15')
+        self.assertIn('108', report['strategies'])
+        self.assertIn('| 108 |', cc.render_markdown(report))
+
     def test_insufficient_sample_label(self):
         # Every fixture row has <30 trades.
         for panel in ('historical_replay', 'forward_shadow'):
