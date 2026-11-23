@@ -281,6 +281,18 @@ class AgentCycleTests(unittest.TestCase):
         detectors = self._detectors()
         self.assertIn(('scan_missed', 'SEV2', 'OPEN'), detectors)
 
+    def test_monitor_staleness_when_checks_sparse(self):
+        # Only two monitor checks, 75 minutes apart (threshold 90 s):
+        # the gap flags monitor_staleness SEV2.
+        _event(self.store, 'mon-0', 'monitor_completed',
+               '2026-11-23T09:15:00+05:30')
+        _event(self.store, 'mon-1', 'monitor_completed',
+               '2026-11-23T10:30:00+05:30')
+        agent = self._agent()
+        agent.cycle(MONDAY_1030)
+        detectors = self._detectors()
+        self.assertIn(('monitor_staleness', 'SEV2', 'OPEN'), detectors)
+
     def test_second_cycle_adds_no_duplicate_findings(self):
         _seed_clean_day(self.store)
         agent = self._agent()
