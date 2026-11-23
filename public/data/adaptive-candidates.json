@@ -1,7 +1,7 @@
 {
   "_provenance": {
-    "generated_from": "automation/paper-trading/adaptive_candidates.py CANDIDATE_STRATEGIES (ids 101-106)",
-    "generated_by": "python3 -c import of the registry, run 2026-11-21; no metrics are in this file, only registry facts (name, source, tier, warm-up, params, notes)",
+    "generated_from": "automation/paper-trading/adaptive_candidates.py CANDIDATE_STRATEGIES (ids 101-108)",
+    "generated_by": "python3 -c import of the registry, run 2026-11-23; no metrics are in this file, only registry facts (name, source, tier, warm-up, params, notes)",
     "status": "shadow_only: candidates never enter BASELINE_PARAMS, adaptive_policy.json tiers, strategy_rules.json or the spawn loop; they are evaluated only in shadow",
     "note": "S9 PEAD is parked (no free point-in-time EPS feed) and is NOT a candidate; S8 Connors RSI(2) is candidate C102"
   },
@@ -103,6 +103,22 @@
       },
       "adapted": false,
       "notes": "Sector-adjusted variant of 12-1 momentum: rank by the 12-1 return MINUS the stock's sector average 12-1 return; buy the top 30 at each monthly rebalance, exit at the next rebalance when the stock drops out of the top 30. No 63-session expiry (the published sector-adjusted rule has none). Different ranking from C105 (whole-market rank), so not a duplicate of C105. Needs the full universe panel AND a symbol->sector map (explicit sector_map, or a sector/industry column on the universe frame); with no usable map it enters nothing.",
+      "status": "shadow_only"
+    },
+    {
+      "id": 108,
+      "name": "Dual MA crossover (S4) + 20-session time stop (not profitable)",
+      "source": "MUSE-PLAN-adaptive-risk-fixes.md §2 (risk plan, 2026-11-22); S4 = frozen strategy_4 (EMA20/50 cross with SMA200)",
+      "tier": "trend",
+      "warm_start_days": 200,
+      "params": {
+        "ema_fast": 20,
+        "ema_slow": 50,
+        "sma_trend": 200,
+        "time_stop_sessions": 20
+      },
+      "adapted": false,
+      "notes": "Mirrors S4 exactly (EMA20/50 cross-up above SMA200 for entry, cross-down for exit) plus a time stop: exit after 20 sessions if the trade is not profitable (close <= entry price), or on the S4 cross-down, whichever comes first. The 20-session value is the plan's suggested value, not a policy value. No protective price stop in C108 (a later candidate may combine the stop and the time stop). \"Not profitable\" is judged on the daily close only; charges/slippage are applied by the simulator at fill, not in this signal-level check.",
       "status": "shadow_only"
     }
   ]

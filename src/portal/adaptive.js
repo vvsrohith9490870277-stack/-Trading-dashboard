@@ -5,7 +5,7 @@
 // A missing value is null and the screen shows "not available", never 0.
 export const NOT_AVAILABLE = 'not available';
 export const MAIN_IDS = [1, 2, 3, 4, 5, 6, 7];
-export const CANDIDATE_IDS = [101, 102, 103, 104, 105, 106];
+export const CANDIDATE_IDS = [101, 102, 103, 104, 105, 106, 108];
 // The compare's own floor: below this a sample is labelled insufficient_sample.
 export const MIN_TRADES_FOR_SAMPLE = 30;
 
@@ -27,7 +27,7 @@ export function candidateRunState(compare, id) {
 }
 
 // Candidate table rows for the MAIN table (live metrics only). There is no live
-// compare output for 101-106 in the repo, so every live metric is null here.
+// compare output for 101-108 in the repo, so every live metric is null here.
 // The synthetic fixture numbers live in a separate panel, never in this table.
 export function candidateRows(catalogue, compare) {
   const list = catalogue?.candidates ?? [];
