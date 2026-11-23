@@ -68,13 +68,53 @@ class CandidateShadowTests(unittest.TestCase):
         tests_dir = str(HERE.parent / 'automation' / 'paper-trading' / 'tests')
         self.assertNotIn(tests_dir, _SYS_PATH_AFTER_IMPORT)
 
-    def test_shadow_runs_all_six_offline(self):
-        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106})
+    def test_shadow_runs_all_seven_offline(self):
+        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106, 109})
         for s, r in self.out.items():
             self.assertEqual(r['status'], 'SHADOW_SIMULATED')
             self.assertEqual(r['mode'], 'shadow')
             self.assertTrue(r['simulated'])
             self.assertGreater(r['eval_days'], 0)
+
+    def test_c109_sim_uses_atr_qty_not_fixed_qty(self):
+        # End-to-end proof the simulator honours C109's ATR sizing: a
+        # volatile single-symbol market (range +/-10 around a ~100 close,
+        # ATR ~20) trades 125 shares — qty = 5000 / (2 x 20) — not the
+        # frozen fixed size of 462 shares (50000 / 108). The position
+        # value stays within the Rs 50,000 per-trade maximum.
+        import pandas as pd
+        closes = ([100.0] * 200
+                  + [98, 96, 94, 92, 90, 88, 86, 84, 82, 80,
+                     80, 82, 84, 86, 88, 90, 92, 94, 96, 98,
+                     100, 102, 104, 106, 108, 110, 112, 114, 116, 118, 120,
+                     118, 116, 114, 112, 110, 108, 106, 104, 102, 100,
+                     98, 96, 94, 92, 90, 88, 86, 84, 82, 80]
+                  + [80.0] * (280 - 251))
+        rows = []
+        for i, (d, c) in enumerate(zip(self.days, closes)):
+            o = closes[i - 1] if i else c
+            rows.append({'symbol': 'VOL-EQ', 'trade_date': d, 'open': o,
+                         'high': round(c + 10, 2), 'low': round(c - 10, 2),
+                         'close': c, 'volume': 3000000})
+        vol = pd.DataFrame(rows)
+        db = fresh_db(HERE.parent / 'automation' / 'paper-trading')
+        # Seed the PIT universe under the namespace run_shadow actually
+        # simulates in ('adaptive_v1'); seeding only 'shadow' would make
+        # the simulator archive the prefilter on the fly instead.
+        seed_pit(db, 'adaptive_v1', self.days, ['VOL-EQ'], series='EQ')
+        out = cs.run_shadow(db, 'adaptive_v1', vol, self.idx,
+                            self.days[:260], self.days[260:], strategies=[109])
+        self.assertEqual(out[109]['status'], 'SHADOW_SIMULATED')
+        trades = db.query('SELECT qty, entry_price FROM adaptive_candidate_trades '
+                          'WHERE strategy=109 AND symbol=?', ('VOL-EQ',))
+        self.assertEqual(len(trades), 1)
+        self.assertEqual(trades[0]['qty'], 125)
+        self.assertLess(trades[0]['qty'] * trades[0]['entry_price'], 50000)
+        import sys as _sys
+        _sys.path.insert(0, str(HERE.parent / 'automation' / 'paper-trading'))
+        import capital as _cap
+        self.assertLess(trades[0]['qty'],
+                        _cap.integer_shares(trades[0]['entry_price'], 50000))
 
     def test_shadow_tables_only(self):
         # Every write targets adaptive_candidate_* (or the simulator's own PIT
