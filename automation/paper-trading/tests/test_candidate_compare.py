@@ -114,6 +114,32 @@ class CompareMetricsTests(unittest.TestCase):
         self.assertIn('106', report['strategies'])
         self.assertIn('| 106 |', cc.render_markdown(report))
 
+    def test_c107_key_flows_through_compare(self):
+        # Candidate 107 needs no compare-code change: strategy_metrics and
+        # build_report iterate whatever strategy keys they are given. A 107
+        # row flows through with the same fields, R and overlap as 101/102.
+        # The losing trade (-1R) is a stop exit: entry 100, ATR(14) at entry
+        # 2, stop 96, exit 96.
+        trades = [{'symbol': 'AAA-EQ', 'entry_date': '2026-01-02', 'exit_date': '2026-01-03',
+                   'qty': 10, 'entry_price': 100.0, 'exit_price': 102.0,
+                   'net_pnl_paise': 2000, 'atr14_at_entry_paise': 200},
+                  {'symbol': 'BBB-EQ', 'entry_date': '2026-01-04', 'exit_date': '2026-01-05',
+                   'qty': 10, 'entry_price': 100.0, 'exit_price': 96.0,
+                   'net_pnl_paise': -1000, 'atr14_at_entry_paise': 200}]
+        rows = cc.strategy_metrics({'1': [], '107': trades}, cc.SEVEN, 20, 50_000_000)
+        r107 = rows['107']
+        self.assertEqual(r107['trades'], 2)
+        self.assertEqual(r107['win_rate'], 0.5)
+        self.assertEqual(r107['net_pnl_paise'], 1000)
+        self.assertEqual(r107['sample_label'], 'insufficient_sample')
+        self.assertTrue(ROW_FIELDS <= set(r107))
+        report = cc.build_report(
+            {'window_days': 20, 'starting_capital_paise': 50_000_000, 'strategies': {'107': trades}},
+            {'window_days': 5, 'starting_capital_paise': 50_000_000, 'strategies': {}},
+            '2026-01-15')
+        self.assertIn('107', report['strategies'])
+        self.assertIn('| 107 |', cc.render_markdown(report))
+
     def test_insufficient_sample_label(self):
         # Every fixture row has <30 trades.
         for panel in ('historical_replay', 'forward_shadow'):
