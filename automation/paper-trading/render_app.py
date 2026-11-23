@@ -29,8 +29,8 @@ import render_lease as rl
 import render_schedule as rsch
 import render_state as rs
 import render_trial as rt
+import render_fyers_auth as rfa
 import runtime_mode as rm
-import support_monitor as sm
 
 IST = ZoneInfo('Asia/Kolkata')
 WORKER_BACKOFF_SECONDS = (5, 10, 20, 40, 60)
@@ -288,13 +288,12 @@ class Supervisor:
         # the store. Replaced wholesale on each refresh (never
         # mutated), so the HTTP thread can read it without a lock.
         self._health_cache = rh.new_health_cache()
-        # Read-only support monitor (brief 23 Nov 2026): the monitor
-        # runner replaces this dict wholesale after each cycle (see
-        # _monitor_state below); snapshot() serves it from memory.
-        # getattr fallbacks in snapshot() keep Supervisors constructed
-        # without __init__ (tests) working.
-        self.support_monitor_state = sm.default_state(
-            enabled=sm.monitor_enabled())
+        # Fyers token auto-refresh (brief 23 Nov 2026): one manager
+        # per supervisor process. It keeps the token in memory only
+        # and never writes it anywhere; see render_fyers_auth.
+        self._fyers_auth = rfa.FyersTokenManager(
+            env=dict(os.environ), mode=self.mode,
+            stored_refresh_token=self._stored_refresh_token)
 
     # -- worker ---------------------------------------------------------
     def _worker_cmd(self):
@@ -302,11 +301,37 @@ class Supervisor:
             return [sys.executable, '-c', 'import time; time.sleep(3600)']
         return [sys.executable, 'engine.py', 'worker']
 
+    def _stored_refresh_token(self):
+        """Refresh token from the encrypted token store, or None.
+
+        Read-only and fails closed: any store problem returns None,
+        and the manager then falls back to the full TOTP login. The
+        manager never writes to the store."""
+        try:
+            import token_store as ts
+            tok = ts.TokenStore(self.store).get_token()
+            return (tok or {}).get('refresh_token')
+        except Exception:
+            return None
+
     def _child_env(self):
         env = dict(os.environ)
         env['PAPER_RUNTIME'] = 'render'
         env['RENDER_MODE'] = self.mode
         env['RENDER_OWNER_ID'] = self.owner_id
+        # Every child (worker, job, probe) gets the token through the
+        # manager: the cached token, the env token, or a fresh one
+        # from the refresh-token / TOTP login. When the manager has
+        # no token, the env is left as-is and the child falls back to
+        # the token store, exactly as today.
+        mgr = getattr(self, '_fyers_auth', None)
+        if mgr is not None:
+            try:
+                token = mgr.get_access_token()
+            except Exception:
+                token = None
+            if token:
+                env['FYERS_ACCESS_TOKEN'] = token
         return env
 
     def _worker_window_open(self, now=None):
@@ -569,6 +594,16 @@ class Supervisor:
         if getattr(self, '_boot_actions_done', False):
             return
         self._boot_actions_done = True
+        # Fyers token first, so the probe child (spawned below) gets
+        # the fresh token through _child_env. Never raises into the
+        # tick; a failure leaves the legacy token path untouched.
+        try:
+            mgr = getattr(self, '_fyers_auth', None)
+            if mgr is not None:
+                mgr.refresh(kind='scheduled')
+        except Exception as ex:
+            print('fyers token refresh error: %s' % type(ex).__name__,
+                  flush=True)
         try:
             self._maybe_run_quote_probe()
         except Exception as ex:
@@ -577,6 +612,34 @@ class Supervisor:
             self._maybe_run_once_job()
         except Exception as ex:
             print('run-once error: %s' % type(ex).__name__, flush=True)
+
+    def _maybe_refresh_token(self, now=None):
+        """Daily 08:30 IST token refresh (retry window until 09:05).
+
+        Only the active runner (lease held) refreshes, only on
+        trading days, only inside 08:30-09:05 IST, and only when no
+        token was obtained today yet. The supervisor tick runs every
+        60 s, so a failed attempt is retried on the next tick until
+        09:05, bounded by the manager (3 attempts per hour, 30-minute
+        circuit). `now` is injectable for tests. Never raises into
+        the tick."""
+        mgr = getattr(self, '_fyers_auth', None)
+        if mgr is None or not self.lease_held:
+            return
+        try:
+            now = now or datetime.now(IST)
+            # Cheap time check first: is_trading_day imports the
+            # engine (slow), so it must only run inside the window,
+            # never on every tick before the worker starts.
+            if not (dt_time(8, 30) <= now.time() < dt_time(9, 5)):
+                return
+            if not rsch.is_trading_day(now.date()):
+                return
+            if mgr.last_success_date() == now.date():
+                return
+            mgr.refresh(kind='scheduled')
+        except Exception:
+            pass
 
     # -- main tick ------------------------------------------------------
     def tick(self):
@@ -624,6 +687,11 @@ class Supervisor:
         # worker first (the primary process), then due jobs
         self._manage_worker()
         self._manage_jobs()
+        # Daily 08:30 token refresh (retry window until 09:05). Runs
+        # after the worker starts, so a slow calendar read here can
+        # never delay the worker or serve a healthy snapshot with
+        # the worker still stopped.
+        self._maybe_refresh_token()
         self.last_snapshot = self.snapshot(flag)
         return self.last_snapshot
 
@@ -709,6 +777,7 @@ class Supervisor:
             days_left = None
         caps = rt.trial_caps()
         refreshed_at = cache.get('refreshed_at')
+        mgr = getattr(self, '_fyers_auth', None)
         return rh.build_snapshot(
             mode=self.mode, namespace=self.namespace, active_runner=flag,
             lease_held=self.lease_held, lease=fields.get('lease'),
@@ -738,8 +807,7 @@ class Supervisor:
             job_rss_cap_mb=job_rss_cap_mb(),
             quote_probe=fields.get('quote_probe'),
             store_reads_total=fields.get('store_reads_total'),
-            support_monitor=getattr(
-                self, 'support_monitor_state', None),
+            fyers_auth=(mgr.status() if mgr is not None else None),
             fyers_budget={
                 'day_used': fields.get('fyers_budget_day_used'),
                 'per_day_limit': int(
@@ -838,23 +906,6 @@ def main(argv=None):
                     pass
 
     threading.Thread(target=_renew_loop, daemon=True).start()
-
-    # Read-only support monitor (brief 23 Nov 2026): its own daemon
-    # thread next to the worker. It reads the paper book from Turso
-    # (SELECT only) and the in-process /health snapshot, and records
-    # findings in support_monitor_findings. A monitor crash never
-    # stops the worker: each cycle is try/except and it backs off
-    # after errors (see support_monitor.Monitor). Disabled entirely
-    # when SUPPORT_MONITOR_ENABLED=0 (the /health field then reports
-    # enabled false). The thread is not started when disabled.
-    def _monitor_state(state):
-        sup.support_monitor_state = state
-
-    sm.start_monitor_thread(
-        store, namespace, sup.config,
-        lambda: sup.last_snapshot,
-        _monitor_state, lambda: sup.stopping)
-
     while not sup.stopping:
         try:
             sup.tick()

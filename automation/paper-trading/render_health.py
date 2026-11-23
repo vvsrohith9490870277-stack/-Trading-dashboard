@@ -574,7 +574,7 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
                    reasons=None, peak_job_rss_mb=None,
                    last_job_peak_rss_mb=None, job_rss_cap_mb=None,
                    quote_probe=None, store_reads_total=None,
-                   support_monitor=None):
+                   fyers_auth=None):
     """Build the /health payload (brief 01 Task 6.3).
 
     The first nine arguments are the original snapshot inputs and keep
@@ -683,14 +683,6 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
         'store_ok': store_ok,
         'store_age_s': store_age_s,
         'store_reads_total': store_reads_total,
-        # Read-only support monitor (brief 23 Nov 2026): the monitor
-        # runner replaces this dict wholesale after each cycle; when
-        # the monitor never ran (or is disabled) the fields are the
-        # disabled default, never a made-up value.
-        'support_monitor': support_monitor if support_monitor is not None
-                           else {'enabled': False, 'last_run_at': None,
-                                 'last_findings_count': 0, 'reads_total': 0,
-                                 'last_error': None},
         'reasons': reasons if reasons is not None else {},
         'peak_job_rss_mb': peak_job_rss_mb,
         'last_job_peak_rss_mb': last_job_peak_rss_mb,
@@ -702,6 +694,14 @@ def build_snapshot(mode, namespace, active_runner, lease_held, lease, worker,
         'fyers_budget': fyers_budget if fyers_budget is not None
                         else {'day_used': None, 'per_day_limit': None},
         'auth': auth if auth is not None else {'circuit_open': None},
+        # Fyers token auto-refresh (brief 23 Nov 2026): the token
+        # manager's status, never a token value. When the manager
+        # never ran (or is absent) the fields are the unknown
+        # default, never a made-up value.
+        'fyers_auth': fyers_auth if fyers_auth is not None else {
+            'source': None, 'valid': False, 'obtained_at_ist': None,
+            'next_refresh_ist': None, 'last_error_code': None,
+            'circuit_open': None, 'attempts_today': 0},
         'login_allowed': login_allowed,
         'git_sha': git_sha if git_sha is not None
                    else os.environ.get('RENDER_GIT_COMMIT'),
