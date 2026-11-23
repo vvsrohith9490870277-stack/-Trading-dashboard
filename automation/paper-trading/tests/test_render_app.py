@@ -91,6 +91,8 @@ class HealthFieldsTests(unittest.TestCase):
         'support_monitor',
         # Fyers token auto-refresh (brief 23 Nov 2026).
         'fyers_auth',
+        # Full daily schedule (brief 23 Nov 2026).
+        'schedule',
         # kept from the original snapshot:
         'status', 'active_runner', 'lease', 'jobs', 'uptime_seconds',
         'memory_mb',
