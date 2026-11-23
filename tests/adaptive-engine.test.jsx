@@ -137,7 +137,8 @@ describe('adaptive logic', () => {
     expect(a.forwardDays).toBe(0);
     expect(a.forwardTrades).toBe(0);
     expect(a.replayDays).toBe(130);
-    expect(a.missingCandidates).toEqual([101, 103, 104, 106]);
+    // C109 was not run in the synthetic fixture, so it is missing too.
+    expect(a.missingCandidates).toEqual([101, 103, 104, 106, 109]);
     expect(a.insufficientCandidates).toEqual([102, 105]);
     expect(a.checks.find(c => c.label === 'Forward shadow days observed').ok).toBe(false);
     const history = JSON.parse(readFileSync(process.cwd() + '/public/data/historical.json', 'utf8'));
@@ -175,7 +176,8 @@ describe('adaptive engine screen', () => {
     expect(screen.getAllByText('Synthetic fixture only (4 symbols, 130 days) — not real NSE results').length).toBe(3);
     expect(screen.getByText('-4.86%', {exact: false})).toBeInTheDocument();
     expect(screen.getByText('3.7%', {exact: false})).toBeInTheDocument();
-    expect(screen.getAllByText('not evaluable').length).toBe(6);
+    // 7 candidates now: 101-106 and 109, each with no live metrics.
+    expect(screen.getAllByText('not evaluable').length).toBe(7);
     expect(screen.queryByRole('button', {name: /promote|demote/i})).toBeNull();
   });
 
