@@ -137,6 +137,28 @@ class EntryGuardTests(unittest.TestCase):
    r=e.scan(self.db,None)
   q=self.db.query("SELECT side FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(q,[])
   ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='stale_held_position'",(e.NS,));self.assertEqual(ev,[])
+ def test_split_ex_date_does_not_cause_false_exit(self):
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
+  self.db.batch([('INSERT INTO paper_corporate_actions(symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at) VALUES(?,?,?,?,?,?,?,?)',('RELIANCE-EQ','2026-11-09','SPLIT',2,1,None,'TEST',fixtures.T.isoformat()))])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-06'))])
+  dates=pd.bdate_range(end='2026-11-09',periods=253).strftime('%Y-%m-%d')
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s.loc[s.index[-1],['open','high','low','close']]=[50.,51.,49.,50.];s['symbol']='RELIANCE-EQ';b=f(100.)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}):
+   r=e.scan(self.db,None)
+  q=self.db.query("SELECT side FROM paper_signals WHERE namespace=? AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(q,[])
+ def test_split_exit_fires_without_corporate_action_record(self):
+  # Control for the test above: with no corporate-action record the engine
+  # cannot know about the split, so the raw-price exit fires. This pins the
+  # pre-fix behaviour the back-adjustment corrects.
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-06'))])
+  dates=pd.bdate_range(end='2026-11-09',periods=253).strftime('%Y-%m-%d')
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s.loc[s.index[-1],['open','high','low','close']]=[50.,51.,49.,50.];s['symbol']='RELIANCE-EQ';b=f(100.)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}):
+   r=e.scan(self.db,None)
+  q=self.db.query("SELECT side,reason FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(len(q),1);self.assertTrue(q[0]['reason'].startswith('daily_exit'))
  def test_unfiltered_legacy_input_proof_cannot_fill(self):
   for sql,args in [('DELETE FROM paper_entry_input_proofs WHERE namespace=?',(e.NS,)),('UPDATE paper_entry_input_proofs SET policy_version=? WHERE namespace=?',('old_inputs',e.NS)),('UPDATE paper_entry_input_proofs SET observed_at=? WHERE namespace=?',('2000-01-01',e.NS)),('UPDATE paper_qualifier_states SET checklist_json=? WHERE namespace=?',('{}',e.NS))]:
    signal=self.signal();self.db.batch([(sql,args)]);self.assertFalse(e.fill(self.db,signal,self.quote(),fixtures.T)['filled'])

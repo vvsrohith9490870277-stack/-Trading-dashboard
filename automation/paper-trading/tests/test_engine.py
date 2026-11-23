@@ -592,6 +592,19 @@ class PaperTests(unittest.TestCase):
   funded=e.fill(self.db,blocked,{'symbol':'AXISBANK-EQ','price':100,'quote_at':at},T)
   self.assertTrue(funded['filled']);self.assertEqual(funded['qty'],500)
   self.assertTrue(self.db.call({'action':'verify_decisions','namespace':e.NS})['ok'])
+ def test_back_adjust_frame_halves_pre_split_bars_only(self):
+  import corporate_actions as ca
+  import pandas as pd
+  df=pd.DataFrame({'trade_date':['2026-11-05','2026-11-06','2026-11-09'],'open':[100.,100.,50.],'high':[101.,101.,51.],'low':[99.,99.,49.],'close':[100.,100.,50.],'volume':[100.,100.,100.]})
+  out=ca.back_adjust_frame(df,[{'symbol':'RELIANCE-EQ','ex_date':'2026-11-09','kind':'SPLIT','ratio_num':2,'ratio_den':1}])
+  self.assertEqual(out['close'].tolist(),[50.,50.,50.]);self.assertEqual(out['low'].tolist(),[49.5,49.5,49.]);self.assertEqual(out['volume'].tolist(),[200.,200.,100.])
+  self.assertEqual(df['close'].tolist(),[100.,100.,50.])
+ def test_back_adjust_frame_ignores_cash_dividends_and_future_actions(self):
+  import corporate_actions as ca
+  import pandas as pd
+  df=pd.DataFrame({'trade_date':['2026-11-05','2026-11-06','2026-11-09'],'open':[100.,100.,100.],'high':[101.,101.,101.],'low':[99.,99.,99.],'close':[100.,100.,100.],'volume':[100.,100.,100.]})
+  out=ca.back_adjust_frame(df,[{'symbol':'RELIANCE-EQ','ex_date':'2026-11-09','kind':'CASH_DIVIDEND','ratio_num':None,'ratio_den':None},{'symbol':'RELIANCE-EQ','ex_date':'2026-11-10','kind':'SPLIT','ratio_num':2,'ratio_den':1},{'symbol':'RELIANCE-EQ','ex_date':'2026-11-09','kind':'BONUS','ratio_num':None,'ratio_den':None}])
+  self.assertEqual(out['close'].tolist(),[100.,100.,100.]);self.assertEqual(out['volume'].tolist(),[100.,100.,100.])
  def test_pause_blocks_entries_keeps_exits_and_reinstates_the_system(self):
   import pauses as pz
   bought=e.fill(self.db,self.signal(),self.quote(),T);self.assertTrue(bought['filled'])
