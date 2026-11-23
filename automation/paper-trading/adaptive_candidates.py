@@ -1,4 +1,7 @@
-"""Candidate-strategy registry (B3): shadow challengers 101-106.
+"""Candidate-strategy registry (B3): shadow challengers 101-106 and 109.
+
+(107 and 108 live on separate unmerged branches and are not in this
+branch; 109 is the next candidate id after 106 here.)
 
 Shadow / observation mode ONLY. Candidates never enter BASELINE_PARAMS,
 adaptive_policy.json tiers, strategy_rules.json, or the adaptive_daily.py
@@ -54,6 +57,16 @@ Per-candidate notes / fallbacks (brief §6):
   seven). initial_stop is therefore None with a note; the B4 compare report
   uses the 2x ATR(14)-based 1R reporting convention (plan §4.4, Grok Q3:
   1R = qty x 2 x ATR(14)).
+- C109 (risk plan §3) is the first candidate with ATR-based sizing: it
+  mirrors S4 exactly for entry/exit and sizes each trade from the ATR(14)
+  at entry, qty = risk_budget / (2 x ATR(14)), capped so the position
+  value never exceeds the Rs 50,000 per-trade maximum. The risk budget is
+  Rs 5,000 = 1% of the Rs 5,00,000 per-strategy sleeve capital: a choice,
+  not a policy value, flagged for Senior/Grok to confirm (change the one
+  registry param risk_budget_inr to change it, no code change). With the
+  Rs 50,000 value cap binding, a very stable stock's risk per trade is
+  below the budget; when the ATR formula binds, risk per trade is the
+  budget (1R = Rs 5,000 at entry).
 """
 import numpy as np
 import pandas as pd
@@ -502,6 +515,123 @@ def _c106_exits(df, universe=None, sector_map=None):
 
 
 # ---------------------------------------------------------------------------
+# C109 — Dual MA crossover (S4) + ATR-based position sizing (risk plan §3)
+# ---------------------------------------------------------------------------
+
+# Risk budget per trade (INR): 1% of the Rs 5,00,000 per-strategy sleeve
+# capital. A CHOICE, not a policy value — flagged for Senior/Grok to
+# confirm. Change only this number (registry param risk_budget_inr) to
+# change it; no code change. The Rs 50,000 per-trade maximum is the
+# existing TARGET_NOTIONAL_INR (capital policy), reused as the value cap.
+RISK_BUDGET_INR = 5000
+MAX_NOTIONAL_INR = 50000
+
+
+def _s4_signals(df):
+    """S4 (frozen strategy_4) indicators, mirrored exactly: EMA20/EMA50
+    cross, entry only above SMA200, exit on the cross-down. The frozen file
+    is never edited; the formulas below are the same ones."""
+    g = df.copy()
+    c = g['close'].astype(float)
+    g['ema20'] = c.ewm(span=20, adjust=False).mean()
+    g['ema50'] = c.ewm(span=50, adjust=False).mean()
+    g['prior_ema20'] = g['ema20'].shift()
+    g['prior_ema50'] = g['ema50'].shift()
+    g['sma200'] = c.rolling(200).mean()
+    g['cross_up'] = (g['ema20'] > g['ema50']) & (g['prior_ema20'] <= g['prior_ema50'])
+    g['cross_down'] = (g['ema20'] < g['ema50']) & (g['prior_ema20'] >= g['prior_ema50'])
+    return g
+
+
+def _c109_qty(entry_close, atr14, risk_budget_inr=RISK_BUDGET_INR,
+              max_notional_inr=MAX_NOTIONAL_INR):
+    """ATR-based shares for one entry: qty = risk_budget / (2 x ATR(14)),
+    capped so qty x entry_close never exceeds the per-trade maximum.
+    Returns 0 (no entry) when ATR or price is missing, zero, or negative,
+    or when even one share would breach the maximum. Whole shares only
+    (floor); risk per trade is then qty x 2 x ATR(14) — the budget when
+    the ATR formula binds, less when the value cap binds."""
+    try:
+        atr = float(atr14)
+        px = float(entry_close)
+    except (TypeError, ValueError):
+        return 0
+    if not (atr > 0) or not (px > 0):
+        return 0
+    import math
+    qty_atr = math.floor(float(risk_budget_inr) / (2.0 * atr))
+    qty_cap = math.floor(float(max_notional_inr) / px)
+    qty = min(qty_atr, qty_cap)
+    return int(qty) if qty >= 1 else 0
+
+
+def _c109_walk(df):
+    """State-aware walk for C109: S4 entries/exits, ATR-based sizing.
+
+    Entry: S4 cross-up above SMA200, exactly as frozen strategy_4.
+    Exit: S4 cross-down, exactly as frozen strategy_4 (no stop added).
+    Sizing: at each entry bar, qty = _c109_qty(entry close, ATR(14) at
+    that bar) — the ATR is taken at entry and frozen for the trade.
+    The risk budget and per-trade maximum come from candidate 109's
+    registry params (single source of truth): the walk passes them to
+    _c109_qty explicitly, so changing the registry changes the sizing.
+    Exits are applied before entries on the same bar, so an exit and a
+    fresh entry never coincide on one bar. No lookahead: every value at
+    a bar uses only bars up to that bar. Returns (entry, exit_cond, qty,
+    atr_entry) Series; qty / atr_entry hold the sized shares and ATR in
+    force on each bar while holding (0 / NaN otherwise)."""
+    p109 = CANDIDATE_STRATEGIES[109]['params']
+    g = _s4_signals(df)
+    n = len(g)
+    entry = pd.Series(False, index=df.index)
+    exit_cond = pd.Series(False, index=df.index)
+    qty = pd.Series(0, index=df.index, dtype=int)
+    atr_entry = pd.Series(np.nan, index=df.index, dtype=float)
+    atr = _atr_wilder(g['high'], g['low'], g['close'], 14)
+    entry_cond = (g['cross_up'] & (g['close'].astype(float) > g['sma200'])).fillna(False)
+    cross_down = g['cross_down'].fillna(False)
+    close = g['close'].astype(float)
+    holding = False
+    qty_h = 0
+    atr_e = None
+    for i in range(n):
+        if holding:
+            qty.iloc[i] = qty_h
+            atr_entry.iloc[i] = atr_e
+            if bool(cross_down.iloc[i]):
+                exit_cond.iloc[i] = True
+                holding = False
+                qty_h = 0
+        if not holding and bool(entry_cond.iloc[i]):
+            q = _c109_qty(float(close.iloc[i]), float(atr.iloc[i]) if pd.notna(atr.iloc[i]) else float('nan'),
+                          risk_budget_inr=p109['risk_budget_inr'], max_notional_inr=p109['max_notional_inr'])
+            if q >= 1:
+                entry.iloc[i] = True
+                holding = True
+                qty_h = q
+                atr_e = float(atr.iloc[i])
+                qty.iloc[i] = q
+                atr_entry.iloc[i] = atr_e
+    return entry, exit_cond, qty, atr_entry
+
+
+def _c109_entries(df):
+    g = _s4_signals(df)
+    entry, _, qty, atr_e = _c109_walk(df)
+    g['entry_condition'] = entry
+    g['qty'] = qty
+    g['atr14_at_entry'] = atr_e
+    return g
+
+
+def _c109_exits(df):
+    g = _s4_signals(df)
+    _, exit_cond, _, _ = _c109_walk(df)
+    g['exit_condition'] = exit_cond
+    return g
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
@@ -584,6 +714,27 @@ CANDIDATE_STRATEGIES = {
                  'a sector/industry column on the universe frame); with no usable '
                  'map it enters nothing.',
     },
+    109: {
+        'id': 109, 'name': 'Dual MA crossover (S4) + ATR-based position sizing',
+        'source': 'MUSE-PLAN-adaptive-risk-fixes.md §3 (risk plan, 2026-11-22); '
+                  'S4 = frozen strategy_4 (EMA20/50 cross with SMA200)',
+        'tier': 'trend', 'warm_start_days': 200,
+        'params': {'ema_fast': 20, 'ema_slow': 50, 'sma_trend': 200,
+                   'atr_period': 14, 'risk_budget_inr': 5000,
+                   'max_notional_inr': 50000},
+        'entries': _c109_entries, 'exits': _c109_exits, 'initial_stop': _NO_STOP,
+        'notes': 'Mirrors S4 exactly (EMA20/50 cross-up above SMA200 for entry, '
+                 'cross-down for exit) plus ATR-based sizing: qty = risk budget '
+                 '/ (2 x ATR(14) at entry), capped so qty x entry price never '
+                 'exceeds Rs 50,000 per trade. Risk budget Rs 5,000 = 1% of the '
+                 'Rs 5,00,000 sleeve capital — a CHOICE, not a policy value, '
+                 'flagged for Senior/Grok to confirm. The Rs 50,000 per-trade '
+                 'maximum and the Rs 5 lakh per-strategy cap do not change. '
+                 'Risk per trade is the budget when the ATR formula binds, '
+                 'less when the value cap binds (very stable stocks). First '
+                 'candidate with ATR-based sizing; the other candidates use '
+                 'the frozen Rs 50,000 fixed sizing.',
+    },
 }
 
 
@@ -619,6 +770,12 @@ def candidate_signals(strategy, df, universe=None, entry_dates=None, sector_map=
     out['exit_condition'] = ex['exit_condition'].fillna(False).astype(bool)
     if 'derived_rs_rank' in en.columns:
         out['derived_rs_rank'] = en['derived_rs_rank']
+    if 'qty' in en.columns:
+        # C109 ATR-based sizing: shares for the entry bar (0 = no entry).
+        # The shadow simulator reads this column for strategy 109 only.
+        out['qty'] = en['qty'].fillna(0).astype(int)
+    if 'atr14_at_entry' in en.columns:
+        out['atr14_at_entry'] = en['atr14_at_entry']
     return out
 
 
