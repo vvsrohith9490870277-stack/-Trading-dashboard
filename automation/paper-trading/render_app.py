@@ -33,6 +33,7 @@ import render_fyers_auth as rfa
 import render_full_schedule as rfs
 import runtime_mode as rm
 import support_monitor as sm
+import support_agent_render as sar
 
 IST = ZoneInfo('Asia/Kolkata')
 WORKER_BACKOFF_SECONDS = (5, 10, 20, 40, 60)
@@ -304,6 +305,11 @@ class Supervisor:
         # without __init__ (tests) working.
         self.support_monitor_state = sm.default_state(
             enabled=sm.monitor_enabled())
+        # Full Support Agent (brief Nov 2026): the agent runner
+        # replaces this dict wholesale after each cycle (see
+        # _agent_state below); snapshot() serves it from memory.
+        self.support_agent_state = sar.default_state(
+            enabled=sar.agent_enabled())
         # Fyers token auto-refresh (brief 23 Nov 2026): one manager
         # per supervisor process. It keeps the token in memory only
         # and never writes it anywhere; see render_fyers_auth.
@@ -893,6 +899,8 @@ class Supervisor:
             store_reads_total=fields.get('store_reads_total'),
             support_monitor=getattr(
                 self, 'support_monitor_state', None),
+            support_agent=getattr(
+                self, 'support_agent_state', None),
             fyers_auth=(mgr.status() if mgr is not None else None),
             schedule=fields.get('schedule'),
             fyers_budget={
@@ -1009,6 +1017,21 @@ def main(argv=None):
         store, namespace, sup.config,
         lambda: sup.last_snapshot,
         _monitor_state, lambda: sup.stopping)
+
+    # Full Support Agent (brief Nov 2026): its own daemon thread
+    # next to the worker and the monitor. It runs the box Support
+    # Agent's v3 detector suite on Turso (SELECT only) and records
+    # hash-chained findings in support_findings. An agent crash never
+    # stops the worker: each cycle is try/except and it backs off
+    # after errors (see support_agent_render.Agent). Disabled
+    # entirely when SUPPORT_AGENT_ENABLED=0 (the /health field then
+    # reports enabled false). The thread is not started when disabled.
+    def _agent_state(state):
+        sup.support_agent_state = state
+
+    sar.start_agent_thread(
+        store, namespace, sup.config,
+        _agent_state, lambda: sup.stopping)
 
     while not sup.stopping:
         try:

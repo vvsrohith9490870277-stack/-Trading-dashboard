@@ -89,6 +89,8 @@ class HealthFieldsTests(unittest.TestCase):
         'job_rss_cap_mb',
         # Read-only support monitor (brief 23 Nov 2026).
         'support_monitor',
+        # Full Support Agent on Render (brief Nov 2026).
+        'support_agent',
         # Fyers token auto-refresh (brief 23 Nov 2026).
         'fyers_auth',
         # Full daily schedule (brief 23 Nov 2026).
