@@ -31,7 +31,7 @@ existing job runner (render_jobs.run_job, paper_job_runs).
 
 No engine import here: the trading-day check reads config.json only,
 so this module stays fast and importable in bare test environments.
-No orders, no secrets, no Fyers calls.
+No orders, no credentials, no Fyers calls.
 """
 import json
 import time
