@@ -1,4 +1,4 @@
-"""Candidate shadow runner (B3): evaluate registry challengers 101-106 in
+"""Candidate shadow runner (B3): evaluate registry challengers 101-108 in
 shadow / observation mode only.
 
 - Uses adaptive_engine.simulate_track_window with the signal_evaluator hook,
@@ -135,7 +135,7 @@ def run_shadow(db, namespace, stock_df, index_df, warm_start_dates, eval_dates,
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(description='Shadow-evaluate candidate strategies 101-106 (observation only).')
+    ap = argparse.ArgumentParser(description='Shadow-evaluate candidate strategies 101-108 (observation only).')
     ap.add_argument('--db', required=True, help='sidecar adaptive.sqlite path')
     ap.add_argument('--session', required=True, help='session day YYYY-MM-DD')
     ap.add_argument('--namespace', default='adaptive_v1')
