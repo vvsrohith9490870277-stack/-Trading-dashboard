@@ -293,6 +293,34 @@ def _c107_closes(kind):
     return cl
 
 
+def _c108_closes(kind):
+    """Single-symbol closes for C108 (S4 + 20-session time stop). All
+    series share the same S4 entry: 200 sessions of -0.1%/day, then a
+    +2%/day rise; the EMA20/50 cross-up fires at idx 205 (2024-10-14,
+    close 921.93) once the close clears SMA200. Entry + 20 sessions is
+    idx 225 (2024-11-11).
+      'flat'       — rise for 10 sessions, then -2%/day for 5 sessions
+                     (price back below the entry, close 902.05), then flat:
+                     the trade is not profitable at idx 225, so the time
+                     stop fires there (2024-11-11), with no cross-down yet.
+      'profitable' — rise for 10 sessions, then +0.5%/day: the trade is
+                     profitable at idx 225 and holds; no exit at all in
+                     the window (no cross-down either).
+      'cross'      — rise for 30 sessions, then -0.5%/day: the slow fall
+                     crosses EMA20 below EMA50 at idx 271 (2025-01-14,
+                     close 1201.36), far above the entry, so the time stop
+                     never fires and the exit is the S4 cross-down."""
+    phases = {'flat': [(200, -0.001), (10, 0.02), (5, -0.02), (55, 0.0)],
+              'profitable': [(200, -0.001), (10, 0.02), (60, 0.005)],
+              'cross': [(200, -0.001), (30, 0.02), (80, -0.005)]}[kind]
+    px, cl = 1000.0, []
+    for n, r in phases:
+        for _ in range(n):
+            px *= (1 + r)
+            cl.append(round(px, 2))
+    return cl
+
+
 def _c101_universe():
     """5-symbol universe for C101: SYN-EQ (the _c101_closes series) has the
     best 252-session return, so its derived_rs_rank is 100 at idx 252; the
@@ -546,6 +574,81 @@ class CandidateSignalTests(unittest.TestCase):
         self.assertNotIn(107, set(pol['fast_swing_strategies'] + pol['trend_strategies']))
         rules = json.loads((ROOT / 'strategy_rules.json').read_text())
         self.assertNotIn('107', set(rules.keys()))
+    def test_c108_time_stop_triggers_after_20_sessions_when_not_profitable(self):
+        df = _bars(_c108_closes('flat'))
+        out = ac.candidate_signals(108, df)
+        ex = ac.CANDIDATE_STRATEGIES[108]['exits'](df)
+        # Entry 2024-10-14 (close 921.93); at idx 225, exactly 20 sessions
+        # later (2024-11-11), close 902.05 <= entry, so the time stop fires.
+        self.assertEqual(_edge_dates(out, 'entry_condition'), ['2024-10-14'])
+        self.assertEqual(_edge_dates(out, 'exit_condition'), ['2024-11-11'])
+        i = out.index[out['trade_date'] == '2024-11-11'][0]
+        self.assertEqual(int(ex['sessions_held'].iloc[i]), 20)
+        self.assertLessEqual(out['close'].iloc[i], ex['entry_price'].iloc[i])
+        # The time stop, not the S4 signal, causes this exit: no cross-down yet.
+        self.assertFalse(bool(ex['cross_down'].iloc[i]))
+
+    def test_c108_time_stop_does_not_trigger_before_20_sessions(self):
+        df = _bars(_c108_closes('flat'))
+        out = ac.candidate_signals(108, df)
+        ex = ac.CANDIDATE_STRATEGIES[108]['exits'](df)
+        # sessions_held ramps 0..19 in the 19 sessions after entry; no exit
+        # fires in that window, even though the price is already below the
+        # entry from the dip.
+        self.assertEqual(_edge_dates(out, 'exit_condition'), ['2024-11-11'])
+        self.assertEqual(int(ex['sessions_held'].iloc[224]), 19)
+        self.assertFalse(bool(out['exit_condition'].iloc[224]))
+        self.assertFalse(bool(out['exit_condition'].iloc[206:225].any()))
+
+    def test_c108_time_stop_does_not_trigger_when_profitable(self):
+        df = _bars(_c108_closes('profitable'))
+        out = ac.candidate_signals(108, df)
+        ex = ac.CANDIDATE_STRATEGIES[108]['exits'](df)
+        # At idx 225 (20 sessions after entry) the close is above the entry
+        # price, so the time stop does not fire; and there is no cross-down
+        # either, so there is no exit at all in the window.
+        self.assertEqual(_edge_dates(out, 'entry_condition'), ['2024-10-14'])
+        self.assertEqual(int(out['exit_condition'].sum()), 0)
+        self.assertEqual(int(ex['sessions_held'].iloc[225]), 20)
+        self.assertGreater(out['close'].iloc[225], ex['entry_price'].iloc[225])
+
+    def test_c108_exit_on_s4_cross_down_still_works(self):
+        df = _bars(_c108_closes('cross'))
+        out = ac.candidate_signals(108, df)
+        ex = ac.CANDIDATE_STRATEGIES[108]['exits'](df)
+        # Long rise, then a slow -0.5%/day fall: exit is the S4 cross-down
+        # (2025-01-14), at a close of 1201.36 — far above the 921.93 entry,
+        # so the time stop never fired (the trade stayed profitable).
+        self.assertEqual(_edge_dates(out, 'entry_condition'), ['2024-10-14'])
+        self.assertEqual(_edge_dates(out, 'exit_condition'), ['2025-01-14'])
+        i = out.index[out['trade_date'] == '2025-01-14'][0]
+        self.assertTrue(bool(ex['cross_down'].iloc[i]))
+        self.assertGreater(out['close'].iloc[i], ex['entry_price'].iloc[i])
+        self.assertEqual(int(ex['sessions_held'].iloc[i]), 66)
+
+    def test_c108_mirrors_s4_entry_and_registry_shadow_only(self):
+        import strategy_indicators as si
+        df = _bars(_c108_closes('flat'))
+        out = ac.candidate_signals(108, df)
+        s4 = si.strategy_4(df)
+        # Entry is exactly S4's entry: same edge, same SMA200 gate.
+        self.assertEqual(_edge_dates(out, 'entry_condition'),
+                         _edge_dates(s4, 'entry_condition'))
+        en = ac.CANDIDATE_STRATEGIES[108]['entries'](df)
+        # Series.equals treats NaN == NaN (the SMA200 warm-up rows).
+        self.assertTrue(en['ema20'].equals(s4['ema20']))
+        self.assertTrue(en['ema50'].equals(s4['ema50']))
+        self.assertTrue(en['sma200'].equals(s4['sma200']))
+        # Registry: shadow-only, S4 + 20-session time stop, warm start 200.
+        # No protective price stop: initial_stop is the shared _NO_STOP.
+        c108 = ac.CANDIDATE_STRATEGIES[108]
+        self.assertEqual(c108['params']['ema_fast'], 20)
+        self.assertEqual(c108['params']['ema_slow'], 50)
+        self.assertEqual(c108['params']['sma_trend'], 200)
+        self.assertEqual(c108['params']['time_stop_sessions'], 20)
+        self.assertEqual(c108['warm_start_days'], 200)
+        self.assertIs(c108['initial_stop'], ac._NO_STOP)
+
     def test_c109_size_smaller_when_atr_higher(self):
         # Same closes, same entry bar (2024-11-08, close 108): a wider
         # range (ATR ~20) sizes far fewer shares than a narrow range
@@ -763,6 +866,24 @@ class CandidateSignalTests(unittest.TestCase):
         self.assertTrue(np.array_equal(ex_full['stop_level'].iloc[:220].to_numpy(),
                                        ex_trunc['stop_level'].to_numpy(), equal_nan=True),
                         'candidate 107: stop_level changes when future bars are removed')
+        # C108's walk tracks the entry price and sessions held from past
+        # bars only; truncating future bars must not change past signals or
+        # the sessions held in force.
+        df108 = _bars(_c108_closes('flat'))
+        full = ac.candidate_signals(108, df108)
+        trunc = ac.candidate_signals(108, df108.iloc[:220])
+        for col in ('entry_condition', 'exit_condition'):
+            self.assertTrue((full[col].iloc[:220].to_numpy() == trunc[col].to_numpy()).all(),
+                            f'candidate 108: {col} changes when future bars are removed')
+        ex_full = ac.CANDIDATE_STRATEGIES[108]['exits'](df108)
+        ex_trunc = ac.CANDIDATE_STRATEGIES[108]['exits'](df108.iloc[:220])
+        import numpy as np
+        self.assertTrue(np.array_equal(ex_full['sessions_held'].iloc[:220].to_numpy(),
+                                       ex_trunc['sessions_held'].to_numpy()),
+                        'candidate 108: sessions_held changes when future bars are removed')
+        self.assertTrue(np.array_equal(ex_full['entry_price'].iloc[:220].to_numpy(),
+                                       ex_trunc['entry_price'].to_numpy(), equal_nan=True),
+                        'candidate 108: entry_price changes when future bars are removed')
 
     def test_registry_not_in_baseline_params(self):
         ids = set(ac.CANDIDATE_STRATEGIES)
@@ -855,7 +976,7 @@ class ShadowRunnerTests(unittest.TestCase):
             blob = json.dumps(args, default=str)
             for ns in ('paper_v1', 'paper_v2', 'paper_demo_v1'):
                 self.assertNotIn(ns, blob)
-        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106, 107, 109})
+        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106, 107, 108, 109})
         for s, r in self.out.items():
             self.assertEqual(r['status'], 'SHADOW_SIMULATED')
             self.assertEqual(r['mode'], 'shadow')
@@ -883,7 +1004,7 @@ class ShadowRunnerTests(unittest.TestCase):
         daily = self.db.query('SELECT * FROM adaptive_candidate_daily')
         self.assertGreater(len(daily), 0)
         self.assertTrue(all(r['mode'] == 'shadow' and r['simulated'] == 1 for r in daily))
-        self.assertEqual({r['strategy'] for r in daily}, {101, 102, 103, 104, 105, 106, 107, 109})
+        self.assertEqual({r['strategy'] for r in daily}, {101, 102, 103, 104, 105, 106, 107, 108, 109})
         trades = self.db.query('SELECT * FROM adaptive_candidate_trades')
         self.assertTrue(all(r['mode'] == 'shadow' and r['simulated'] == 1 for r in trades))
 

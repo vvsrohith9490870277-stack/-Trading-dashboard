@@ -108,8 +108,8 @@ class CandidateShadowTests(unittest.TestCase):
         tests_dir = str(HERE.parent / 'automation' / 'paper-trading' / 'tests')
         self.assertNotIn(tests_dir, _SYS_PATH_AFTER_IMPORT)
 
-    def test_shadow_runs_all_seven_offline(self):
-        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106, 107, 109})
+    def test_shadow_runs_all_nine_offline(self):
+        self.assertEqual(set(self.out), {101, 102, 103, 104, 105, 106, 107, 108, 109})
         for s, r in self.out.items():
             self.assertEqual(r['status'], 'SHADOW_SIMULATED')
             self.assertEqual(r['mode'], 'shadow')
