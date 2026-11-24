@@ -1,6 +1,4 @@
-"""Candidate-strategy registry (B3): shadow challengers 101-107 and 109.
-
-(108 lives on a separate unmerged branch and is not in this branch.)
+"""Candidate-strategy registry (B3): shadow challengers 101-108 and 109.
 
 Shadow / observation mode ONLY. Candidates never enter BASELINE_PARAMS,
 adaptive_policy.json tiers, strategy_rules.json, or the adaptive_daily.py
@@ -65,6 +63,16 @@ Per-candidate notes / fallbacks (brief §6):
   is set at the entry bar from that bar's ATR(14) and frozen for the trade
   (not trailing), and is evaluated on the daily close, the same convention
   as the frozen exits.
+- C108 is the TIME-STOP variant of S4 (risk plan §2): it mirrors S4
+  (EMA20/50 cross, entry only above SMA200) and exits after 20 sessions
+  if the trade is not profitable (close at or below the entry price),
+  or on the S4 cross-down, whichever comes first. The 20-session value
+  is the plan's suggested value, not a policy value: it is written down
+  here and in the registry params as time_stop_sessions = 20. There is
+  NO protective price stop in C108 (a later candidate may combine the
+  stop and the time stop). "Not profitable" is judged on the daily close
+  only (close <= entry price); charges/slippage are applied by the
+  simulator at fill, not in this signal-level check.
 - C109 (risk plan §3) is the first candidate with ATR-based sizing: it
   mirrors S4 exactly for entry/exit and sizes each trade from the ATR(14)
   at entry, qty = risk_budget / (2 x ATR(14)), capped so the position
@@ -74,8 +82,7 @@ Per-candidate notes / fallbacks (brief §6):
   registry param risk_budget_inr to change it, no code change). With the
   Rs 50,000 value cap binding, a very stable stock's risk per trade is
   below the budget; when the ATR formula binds, risk per trade is the
-  budget (1R = Rs 5,000 at entry).
-"""
+  budget (1R = Rs 5,000 at entry)."""
 import numpy as np
 import pandas as pd
 
@@ -522,6 +529,76 @@ def _c106_exits(df, universe=None, sector_map=None):
     return g
 
 
+# C108 — Dual MA crossover (S4) + 20-session time stop (risk plan §2)
+# ---------------------------------------------------------------------------
+
+
+
+def _c108_walk(df):
+    """State-aware walk for C108: S4 entries; exit on the time stop OR the
+    S4 cross-down, whichever comes first.
+
+    Time stop: once a trade has been held 20 sessions (sessions_held =
+    current bar index - entry bar index >= 20), exit at the close if the
+    trade is not profitable, i.e. close <= entry price. A profitable trade
+    (close > entry price) is NOT time-stopped and holds until the S4
+    cross-down. There is no protective price stop here. The exit is
+    evaluated on the daily close, the same convention as the frozen exits
+    (signals at the close, fills at the next open). Returns (entry,
+    exit_cond, sessions_held, entry_price) Series; sessions_held /
+    entry_price hold the values in force on each bar while holding (0 /
+    NaN otherwise). No lookahead: every value at a bar uses only bars up
+    to that bar. Exits are applied before entries on the same bar, so a
+    time-stop / cross-down exit and a fresh entry never coincide on one
+    bar."""
+    g = _s4_signals(df)
+    n = len(g)
+    entry = pd.Series(False, index=df.index)
+    exit_cond = pd.Series(False, index=df.index)
+    sessions_held = pd.Series(0, index=df.index, dtype=int)
+    entry_price = pd.Series(np.nan, index=df.index, dtype=float)
+    entry_cond = (g['cross_up'] & (g['close'].astype(float) > g['sma200'])).fillna(False)
+    cross_down = g['cross_down'].fillna(False)
+    close = g['close'].astype(float)
+    holding = False
+    entry_i = None
+    entry_px = None
+    for i in range(n):
+        if holding:
+            held = i - entry_i
+            sessions_held.iloc[i] = held
+            entry_price.iloc[i] = entry_px
+            if bool(cross_down.iloc[i]) or (held >= 20 and close.iloc[i] <= entry_px):
+                exit_cond.iloc[i] = True
+                holding = False
+                entry_i = None
+                entry_px = None
+        if not holding and bool(entry_cond.iloc[i]):
+            entry.iloc[i] = True
+            holding = True
+            entry_i = i
+            entry_px = float(close.iloc[i])
+            sessions_held.iloc[i] = 0
+            entry_price.iloc[i] = entry_px
+    return entry, exit_cond, sessions_held, entry_price
+
+
+def _c108_entries(df):
+    g = _s4_signals(df)
+    entry, _, _, _ = _c108_walk(df)
+    g['entry_condition'] = entry
+    return g
+
+
+def _c108_exits(df):
+    g = _s4_signals(df)
+    _, exit_cond, sessions_held, entry_price = _c108_walk(df)
+    g['exit_condition'] = exit_cond
+    g['sessions_held'] = sessions_held
+    g['entry_price'] = entry_price
+    return g
+
+
 # ---------------------------------------------------------------------------
 # C107 — Dual MA crossover (S4) + 2x ATR(14) protective stop (risk plan §1)
 # ---------------------------------------------------------------------------
@@ -811,6 +888,25 @@ CANDIDATE_STRATEGIES = {
                  'close, the same convention as the frozen exits. First candidate '
                  'with a fixed stop; the other candidates have no fixed stop.',
     },
+    108: {
+        'id': 108, 'name': 'Dual MA crossover (S4) + 20-session time stop (not profitable)',
+        'source': 'MUSE-PLAN-adaptive-risk-fixes.md §2 (risk plan, 2026-11-22); '
+                  'S4 = frozen strategy_4 (EMA20/50 cross with SMA200)',
+        'tier': 'trend', 'warm_start_days': 200,
+        'params': {'ema_fast': 20, 'ema_slow': 50, 'sma_trend': 200,
+                   'time_stop_sessions': 20},
+        'entries': _c108_entries, 'exits': _c108_exits,
+        'initial_stop': _NO_STOP,
+        'notes': 'Mirrors S4 exactly (EMA20/50 cross-up above SMA200 for entry, '
+                 'cross-down for exit) plus a time stop: exit after 20 sessions '
+                 'if the trade is not profitable (close <= entry price), or on '
+                 'the S4 cross-down, whichever comes first. The 20-session value '
+                 'is the plan\'s suggested value, not a policy value. No '
+                 'protective price stop in C108 (a later candidate may combine '
+                 'the stop and the time stop). "Not profitable" is judged on the '
+                 'daily close only; charges/slippage are applied by the '
+                 'simulator at fill, not in this signal-level check.',
+    },
     109: {
         'id': 109, 'name': 'Dual MA crossover (S4) + ATR-based position sizing',
         'source': 'MUSE-PLAN-adaptive-risk-fixes.md §3 (risk plan, 2026-11-22); '
@@ -830,8 +926,7 @@ CANDIDATE_STRATEGIES = {
                  'Risk per trade is the budget when the ATR formula binds, '
                  'less when the value cap binds (very stable stocks). First '
                  'candidate with ATR-based sizing; the other candidates use '
-                 'the frozen Rs 50,000 fixed sizing.',
-    },
+                 'the frozen Rs 50,000 fixed sizing.',    },
 }
 
 
