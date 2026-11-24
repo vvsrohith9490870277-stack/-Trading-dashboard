@@ -592,6 +592,19 @@ class PaperTests(unittest.TestCase):
   funded=e.fill(self.db,blocked,{'symbol':'AXISBANK-EQ','price':100,'quote_at':at},T)
   self.assertTrue(funded['filled']);self.assertEqual(funded['qty'],500)
   self.assertTrue(self.db.call({'action':'verify_decisions','namespace':e.NS})['ok'])
+ def test_back_adjust_frame_halves_pre_split_bars_only(self):
+  import corporate_actions as ca
+  import pandas as pd
+  df=pd.DataFrame({'trade_date':['2026-11-05','2026-11-06','2026-11-09'],'open':[100.,100.,50.],'high':[101.,101.,51.],'low':[99.,99.,49.],'close':[100.,100.,50.],'volume':[100.,100.,100.]})
+  out=ca.back_adjust_frame(df,[{'symbol':'RELIANCE-EQ','ex_date':'2026-11-09','kind':'SPLIT','ratio_num':2,'ratio_den':1}])
+  self.assertEqual(out['close'].tolist(),[50.,50.,50.]);self.assertEqual(out['low'].tolist(),[49.5,49.5,49.]);self.assertEqual(out['volume'].tolist(),[200.,200.,100.])
+  self.assertEqual(df['close'].tolist(),[100.,100.,50.])
+ def test_back_adjust_frame_ignores_cash_dividends_and_future_actions(self):
+  import corporate_actions as ca
+  import pandas as pd
+  df=pd.DataFrame({'trade_date':['2026-11-05','2026-11-06','2026-11-09'],'open':[100.,100.,100.],'high':[101.,101.,101.],'low':[99.,99.,99.],'close':[100.,100.,100.],'volume':[100.,100.,100.]})
+  out=ca.back_adjust_frame(df,[{'symbol':'RELIANCE-EQ','ex_date':'2026-11-09','kind':'CASH_DIVIDEND','ratio_num':None,'ratio_den':None},{'symbol':'RELIANCE-EQ','ex_date':'2026-11-10','kind':'SPLIT','ratio_num':2,'ratio_den':1},{'symbol':'RELIANCE-EQ','ex_date':'2026-11-09','kind':'BONUS','ratio_num':None,'ratio_den':None}])
+  self.assertEqual(out['close'].tolist(),[100.,100.,100.]);self.assertEqual(out['volume'].tolist(),[100.,100.,100.])
  def test_pause_blocks_entries_keeps_exits_and_reinstates_the_system(self):
   import pauses as pz
   bought=e.fill(self.db,self.signal(),self.quote(),T);self.assertTrue(bought['filled'])
@@ -677,6 +690,28 @@ class PaperTests(unittest.TestCase):
   self.assertEqual(p['headline_net_pnl_paise'],p['estimated_finance']['net_total_accrued_paise'])
   self.assertFalse(p['capped_master_ledger']['shadow_diagnostic']['headline'])
   self.assertTrue(p['public_labels']['historical_figures_gross']);self.assertTrue(p['public_labels']['survivorship_biased']);self.assertTrue(p['public_labels']['not_jointly_tested'])
+
+ def test_funnel_reports_per_strategy_signals_blocks_fills_exits(self):
+  bar='2026-11-08';at=T.isoformat()
+  self.seed_adv('RELIANCE-EQ',200000000);self.seed_adv('TCS-EQ',50000000)
+  chk=e.js({'input_policy':{'version':e.si.POLICY['version']}})
+  def sig(sid,strategy,symbol,side,bar_date):return ('INSERT INTO paper_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(e.NS,sid,strategy,symbol,bar_date,side,'pending','fixture',at,bar_date))
+  def fill(sid,strategy,symbol,side,filled_at):return ('INSERT INTO paper_fills(namespace,signal_id,strategy,symbol,side,qty,price,quote_at,filled_at,reason,realized_pnl,cashflow) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',(e.NS,sid,strategy,symbol,side,500,100,at,filled_at,'fixture',0,-50000))
+  stm=[('INSERT OR REPLACE INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?)',(e.NS,bar,at,'ok','{}')),
+       ('INSERT OR REPLACE INTO paper_prefilter_states(namespace,bar_date,symbol,policy_version,status,metrics_json,observed_at) VALUES(?,?,?,?,?,?,?)',(e.NS,bar,'RELIANCE-EQ',e.pf.POLICY['version'],'PASS','{}',at)),
+       ('INSERT OR REPLACE INTO paper_prefilter_states(namespace,bar_date,symbol,policy_version,status,metrics_json,observed_at) VALUES(?,?,?,?,?,?,?)',(e.NS,bar,'TCS-EQ',e.pf.POLICY['version'],'FAIL','{}',at)),
+       ('INSERT OR REPLACE INTO paper_qualifier_states(namespace,bar_date,strategy,symbol,qualified,checklist_json,plan_json,scanned_at) VALUES(?,?,?,?,?,?,?,?)',(e.NS,bar,1,'RELIANCE-EQ',1,chk,'{}',at)),
+       ('INSERT OR REPLACE INTO paper_qualifier_states(namespace,bar_date,strategy,symbol,qualified,checklist_json,plan_json,scanned_at) VALUES(?,?,?,?,?,?,?,?)',(e.NS,bar,2,'RELIANCE-EQ',1,chk,'{}',at)),
+       sig('sig1',1,'RELIANCE-EQ','BUY',bar),sig('sig2',1,'RELIANCE-EQ','SELL',bar),sig('sig3',2,'RELIANCE-EQ','BUY',bar),sig('sig4',3,'TCS-EQ','BUY','2026-11-07'),
+       fill('sig1',1,'RELIANCE-EQ','BUY',bar+'T10:00:00+05:30'),fill('sig2',1,'RELIANCE-EQ','SELL',bar+'T15:00:00+05:30'),fill('sig5',2,'RELIANCE-EQ','BUY','2026-11-07T10:00:00+05:30')]
+  self.db.batch(stm)
+  fn=e.au.funnel(e,self.db,bar);by=fn['by_strategy']
+  self.assertEqual(by['1']['prefilter_blocked'],1)
+  self.assertEqual((by['1']['signals_queued'],by['1']['signals_buy'],by['1']['signals_sell']),(2,1,1))
+  self.assertEqual((by['1']['fills'],by['1']['exits']),(2,1))
+  self.assertEqual((by['2']['signals_queued'],by['2']['fills'],by['2']['exits']),(1,0,0))
+  self.assertEqual(by['3']['signals_queued'],0)
+  self.assertEqual((fn['stages']['signals_queued'],fn['stages']['fills'],fn['stages']['exits'],fn['stages']['prefilter_blocked']),(3,2,1,1))
 
  def test_monitor_uses_the_quote_batch_clock_for_every_fill(self):
   # UNIONBANK was skipped stale after siblings filled because fill() re-read now() and the shared quote aged past 60s mid-cycle.

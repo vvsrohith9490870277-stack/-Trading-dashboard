@@ -50,6 +50,19 @@ class CalculationTests(unittest.TestCase):
     if 'open,high' in sql:rows[0]['trade_date']='2026-11-04'
     return rows
   with self.assertRaisesRegex(RuntimeError,'missing_verified_exchange_session'):p.benchmark(e,GapDB(),date(2026,11,6))
+ def test_benchmark_session_check_uses_policy_symbol(self):
+  # The expected-session query must read the policy benchmark symbol
+  # (NIFTY50-INDEX), not a hardcoded 'NIFTY500'. A row stored under the
+  # wrong symbol must not fail the check: with the hardcoded value the
+  # stray Saturday row below raises spuriously; with the policy value the
+  # same check passes.
+  class SymbolDB:
+   def query(self,sql,args):
+    if 'open,high' in sql:return [{'trade_date':'2026-11-05','open':100,'high':101,'low':99,'close':100,'volume':0},{'trade_date':'2026-11-06','open':101,'high':102,'low':100,'close':101,'volume':0}]
+    if args[0]=='NIFTY500':return [{'trade_date':'2026-11-07'}]
+    return [{'trade_date':'2026-11-05'},{'trade_date':'2026-11-06'}]
+  from datetime import date
+  out=p.benchmark(e,SymbolDB(),date(2026,11,6));self.assertEqual(len(out),2)
  def test_strict_trend_not_equal(self):
   s,b=frames();s[['open','close']]=100;s.high=101;s.low=99;r=p.evaluate(s,b,'2026-11-06');self.assertFalse(r['checks']['close_above_sma50']);self.assertFalse(r['checks']['sma50_above_sma200']);self.assertFalse(r['checks']['return20_positive'])
 
@@ -102,6 +115,50 @@ class EntryGuardTests(unittest.TestCase):
   def indicator(i,g):return g.assign(entry_condition=True,exit_condition=True)
   with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'FAIL'}),patch.object(e,'indicator',side_effect=indicator):
    r=e.scan(self.db,None);self.assertEqual(r['signals_queued'],1);q=self.db.query("SELECT side FROM paper_signals WHERE namespace=? AND status='pending'",(e.NS,));self.assertEqual([x['side'] for x in q],['SELL']);self.assertEqual(r['latest_qualifiers'],0)
+ def test_stale_held_position_exits_and_alerts_after_252_sessions(self):
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
+  self.db.batch([('UPDATE paper_positions SET entry_at=? WHERE namespace=? AND strategy=1 AND symbol=?',('2025-09-01T09:15:00+05:30',e.NS,'RELIANCE-EQ'))])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-06'))])
+  dates=pd.bdate_range(end='2026-11-09',periods=300).strftime('%Y-%m-%d')
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s['symbol']='RELIANCE-EQ';b=f(100.)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}):
+   r=e.scan(self.db,None)
+  q=self.db.query("SELECT side,reason FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(len(q),1);self.assertTrue(q[0]['reason'].startswith('stale_held_exit'))
+  import json as _json;ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='stale_held_position'",(e.NS,));self.assertEqual(len(ev),1);self.assertGreaterEqual(_json.loads(ev[0]['data_json'])['held_sessions'],252)
+ def test_recently_held_position_does_not_exit_as_stale(self):
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
+  self.db.batch([('UPDATE paper_positions SET entry_at=? WHERE namespace=? AND strategy=1 AND symbol=?',('2026-11-06T09:15:00+05:30',e.NS,'RELIANCE-EQ'))])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-06'))])
+  dates=pd.bdate_range(end='2026-11-09',periods=300).strftime('%Y-%m-%d')
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s['symbol']='RELIANCE-EQ';b=f(100.)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}):
+   r=e.scan(self.db,None)
+  q=self.db.query("SELECT side FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(q,[])
+  ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='stale_held_position'",(e.NS,));self.assertEqual(ev,[])
+ def test_split_ex_date_does_not_cause_false_exit(self):
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
+  self.db.batch([('INSERT INTO paper_corporate_actions(symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at) VALUES(?,?,?,?,?,?,?,?)',('RELIANCE-EQ','2026-11-09','SPLIT',2,1,None,'TEST',fixtures.T.isoformat()))])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-06'))])
+  dates=pd.bdate_range(end='2026-11-09',periods=253).strftime('%Y-%m-%d')
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s.loc[s.index[-1],['open','high','low','close']]=[50.,51.,49.,50.];s['symbol']='RELIANCE-EQ';b=f(100.)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}):
+   r=e.scan(self.db,None)
+  q=self.db.query("SELECT side FROM paper_signals WHERE namespace=? AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(q,[])
+ def test_split_exit_fires_without_corporate_action_record(self):
+  # Control for the test above: with no corporate-action record the engine
+  # cannot know about the split, so the raw-price exit fires. This pins the
+  # pre-fix behaviour the back-adjustment corrects.
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-06'))])
+  dates=pd.bdate_range(end='2026-11-09',periods=253).strftime('%Y-%m-%d')
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s.loc[s.index[-1],['open','high','low','close']]=[50.,51.,49.,50.];s['symbol']='RELIANCE-EQ';b=f(100.)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}):
+   r=e.scan(self.db,None)
+  q=self.db.query("SELECT side,reason FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(len(q),1);self.assertTrue(q[0]['reason'].startswith('daily_exit'))
  def test_unfiltered_legacy_input_proof_cannot_fill(self):
   for sql,args in [('DELETE FROM paper_entry_input_proofs WHERE namespace=?',(e.NS,)),('UPDATE paper_entry_input_proofs SET policy_version=? WHERE namespace=?',('old_inputs',e.NS)),('UPDATE paper_entry_input_proofs SET observed_at=? WHERE namespace=?',('2000-01-01',e.NS)),('UPDATE paper_qualifier_states SET checklist_json=? WHERE namespace=?',('{}',e.NS))]:
    signal=self.signal();self.db.batch([(sql,args)]);self.assertFalse(e.fill(self.db,signal,self.quote(),fixtures.T)['filled'])

@@ -16,6 +16,50 @@ def scale_paise(price_paise, num, den):
     """Divide a price by r = num/den and round half-up to paise."""
     return (int(price_paise) * int(den) + int(num) // 2) // int(num)
 
+def back_adjust_frame(df, actions):
+    """Back-adjust pre-ex-date OHLC prices for splits/bonuses, so a corporate
+    action does not cause a false indicator exit.
+
+    Only SCALED kinds (SPLIT, BONUS, EXTRAORDINARY_DIVIDEND) with a valid
+    integer ratio are applied. For an action with ex_date <= the frame's last
+    bar, bars with trade_date < ex_date have open/high/low/close divided by
+    r = ratio_num / ratio_den and volume multiplied by r. Actions with
+    ex_date after the last bar are never applied (zero look-ahead). Returns
+    the frame unchanged when no action applies.
+    """
+    if df is None or len(df) == 0 or not actions:
+        return df
+    out = df.copy().sort_values('trade_date').reset_index(drop=True)
+    as_of = str(out.iloc[-1]['trade_date'])
+    applicable = []
+    for a in actions:
+        if a.get('kind') not in SCALED:
+            continue
+        ex_date = str(a.get('ex_date') or '')
+        if not ex_date or ex_date > as_of:
+            continue
+        ratio = _ratio(a)
+        if ratio is None:
+            continue
+        applicable.append((ex_date, ratio[0] / ratio[1]))
+    if not applicable:
+        return df
+    applicable.sort(key=lambda x: x[0])
+    for col in ('open', 'high', 'low', 'close'):
+        if col in out.columns:
+            out[col] = out[col].astype(float)
+    if 'volume' in out.columns:
+        out['volume'] = out['volume'].astype(float)
+    for ex_date, r in applicable:
+        mask = out['trade_date'].astype(str) < ex_date
+        if mask.any():
+            for col in ('open', 'high', 'low', 'close'):
+                if col in out.columns:
+                    out.loc[mask, col] = out.loc[mask, col] / r
+            if 'volume' in out.columns:
+                out.loc[mask, 'volume'] = out.loc[mask, 'volume'] * r
+    return out
+
 def inr(paise):
     return paise / 100
 

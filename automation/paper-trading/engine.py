@@ -555,6 +555,11 @@ def read_history(db,symbols,target):
  for i in range(0,len(symbols),25):
   sy=symbols[i:i+25];rows+=db.query('SELECT symbol,trade_date,open,high,low,close,volume FROM daily_ohlcv WHERE symbol IN ('+','.join('?'*len(sy))+') AND trade_date<=? ORDER BY symbol,trade_date',sy+[str(target)])
  return pd.DataFrame(rows)
+# Stale-held exit (F18): a position held this many completed sessions with no
+# exit signal is exited and alerted. CHOICE, not a policy value: 252 sessions
+# is the longest horizon already in the repo (prefilter beta_intervals), so it
+# is the most conservative threshold. VVS and the senior must confirm it.
+STALE_HELD_SESSIONS=252
 def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  t=now()
  if not bootstrap and not snapshot_only and (t.weekday()>=5 or not session(t.date())):return {'status':'not_verified_weekday_scan','signals_queued':0}
@@ -600,12 +605,20 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
   if not snapshot_only and s['side']=='BUY' and s['eligible_date']<=str(target):stm.append(("UPDATE paper_signals SET status='expired' WHERE namespace=? AND id=?",(NS,s['id'])))
   else:pending.add((s['strategy'],s['symbol'],s['side']))
  strategy_audit={};qual=[];created=0;funnel={str(i):{'current_symbols':0,'individual_pass_counts':{},'sequential_pass_counts':{},'qualified':0} for i in range(1,8)};skipped=[sym for sym in syms if sym not in set(raw.symbol)]
+ # Corporate actions recorded for this bar or earlier, grouped by symbol.
+ # Indicator inputs are back-adjusted for them (F07) so a split or bonus
+ # does not cause a false exit; the prefilter still sees raw prices and
+ # fails closed on the unadjusted jump.
+ corp_actions_by_symbol={}
+ for _a in db.query("SELECT symbol,ex_date,kind,ratio_num,ratio_den FROM paper_corporate_actions WHERE ex_date<=?",(str(target),)):
+  corp_actions_by_symbol.setdefault(_a['symbol'],[]).append(dict(_a))
  for sym,g in raw.groupby('symbol'):
   g=g.sort_values('trade_date').reset_index(drop=True)
   if str(g.iloc[-1].trade_date)!=str(target):skipped.append(sym);continue
+  ga=ca.back_adjust_frame(g,corp_actions_by_symbol.get(sym,[]))
   for strategy in range(1,8):
    key=(strategy,sym);p=pos.get(key);gate=gates[sym];gatepass=gate['status']=='PASS'
-   if gatepass or p:f=indicator(strategy,g)
+   if gatepass or p:f=indicator(strategy,ga)
    else:f=g.assign(entry_condition=False,exit_condition=False)
    x=f.iloc[-1];bar=str(x.trade_date)
    if p:audit_events.append(al.event(sys.modules[__name__],'held_exit_evaluation',strategy=strategy,symbol=sym,bar_date=bar,trigger=bool(x.exit_condition),reason='completed_daily_exit',target_defined=False))
@@ -630,16 +643,25 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
     try:log('missed_stop_touch',**miss)
     except Exception:pass
    missed_exit=bool(newbars.exit_condition.any()) if len(newbars) else False
-   side='SELL' if p and missed_exit else ('BUY' if gatepass and not p and bool(x.entry_condition) else None)
+   stale_exit=False;held_sessions=0
+   if p and p.get('entry_at') and not missed_exit:
+    entry_day=datetime.fromisoformat(p['entry_at']).date().isoformat()
+    held_sessions=int(((g.trade_date>=entry_day)&(g.trade_date<=bar)).sum())
+    stale_exit=held_sessions>=STALE_HELD_SESSIONS
+   side='SELL' if p and (missed_exit or stale_exit) else ('BUY' if gatepass and not p and bool(x.entry_condition) else None)
    if side and (strategy,sym,side) not in pending:
-    sid=stable_id(strategy,sym,bar,side);eligible=str(next_session(target));stm.append(('INSERT OR IGNORE INTO paper_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(NS,sid,strategy,sym,bar,side,'pending','daily_exit:'+p['entry_at'] if side=='SELL' else 'daily_entry:'+pf.POLICY['version'],t.isoformat(),eligible)));created+=1
-    audit_events.append(al.event(sys.modules[__name__],'paper_order_queued',strategy=strategy,symbol=sym,signal_id=sid,bar_date=bar,side=side,reason='completed_daily_exit' if side=='SELL' else 'qualified'))
+    sid=stable_id(strategy,sym,bar,side);eligible=str(next_session(target));stm.append(('INSERT OR IGNORE INTO paper_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(NS,sid,strategy,sym,bar,side,'pending','stale_held_exit:'+p['entry_at'] if stale_exit else ('daily_exit:'+p['entry_at'] if side=='SELL' else 'daily_entry:'+pf.POLICY['version']),t.isoformat(),eligible)));created+=1
+    audit_events.append(al.event(sys.modules[__name__],'paper_order_queued',strategy=strategy,symbol=sym,signal_id=sid,bar_date=bar,side=side,reason='stale_held_exit' if stale_exit else ('completed_daily_exit' if side=='SELL' else 'qualified')))
+    if stale_exit:
+     audit_events.append(al.event(sys.modules[__name__],'stale_held_position',outcome='stale',severity='WARNING',strategy=strategy,symbol=sym,bar_date=bar,signal_id=sid,held_sessions=held_sessions,entry_at=p['entry_at'],threshold_sessions=STALE_HELD_SESSIONS))
     if side=='BUY':
      stm.append(('INSERT OR IGNORE INTO paper_entry_gate_proofs VALUES(?,?,?,?,?)',(NS,sid,bar,sym,pf.POLICY['version'])))
      stm.append(('INSERT OR IGNORE INTO paper_entry_input_proofs VALUES(?,?,?,?,?)',(NS,sid,si.POLICY['version'],bar,t.isoformat())))
    if p and strategy==7:
     # Only completed closes on/after the actual paper entry can raise the stop.
-    since=g[(g.trade_date>=datetime.fromisoformat(p['entry_at']).date().isoformat())&(g.trade_date<=bar)]
+    # Adjusted closes, consistent with the indicator frame and with the
+    # position state scaled by corporate_actions.apply on the ex-date.
+    since=ga[(ga.trade_date>=datetime.fromisoformat(p['entry_at']).date().isoformat())&(ga.trade_date<=bar)]
     H=max(p['high_water'],float(since.close.max())) if len(since) else p['high_water'];stm.append(('UPDATE paper_positions SET high_water=MAX(high_water,?),updated_at=? WHERE namespace=? AND strategy=7 AND symbol=? AND qty>0',(H,t.isoformat(),NS,sym)))
    stm.append(('UPDATE paper_watermarks SET bar_date=? WHERE namespace=? AND strategy=? AND symbol=?',(bar,NS,strategy,sym)))
  for sym in sorted(set(skipped)):

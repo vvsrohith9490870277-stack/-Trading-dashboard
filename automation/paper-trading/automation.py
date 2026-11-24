@@ -185,6 +185,30 @@ def funnel(e,db,bar_date=None):
   if slot_used.get(s,0)>=e.cap.POLICY['max_positions_per_sleeve']:st['sleeve_slot_skipped']+=1;continue
   slot_used[s]=slot_used.get(s,0)+1;st['sleeve_slot_pass']+=1
  totals={k:sum(per_strat[str(i)][k] for i in range(1,8)) for k in ('strategy_qualified','adv_floor_pass','adv_floor_skipped','isin_cap_pass','isin_cap_skipped','sleeve_slot_pass','sleeve_slot_skipped')}
+ # F03: per-strategy funnel stages — signals -> prefilter blocks -> fills -> exits.
+ # Reporting only; nothing here changes the prefilter or any fill/exit.
+ # The prefilter gate is symbol-level, so the blocked count is the same for
+ # every strategy; it is reported per strategy so the funnel reads end to end.
+ # Signals are counted by bar_date, fills/exits by the filled_at date.
+ blocked=0
+ if bar:
+  blocked=len(db.query("SELECT DISTINCT symbol FROM paper_prefilter_states WHERE namespace=? AND bar_date=? AND status!='PASS'",(e.NS,bar)))
+ for i in range(1,8):
+  st=per_strat[str(i)];st['prefilter_blocked']=blocked;st['signals_queued']=0;st['signals_buy']=0;st['signals_sell']=0;st['fills']=0;st['exits']=0
+ if bar:
+  for r in db.query("SELECT strategy,side,COUNT(*) AS n FROM paper_signals WHERE namespace=? AND bar_date=? GROUP BY strategy,side",(e.NS,bar)):
+   st=per_strat.get(str(int(r['strategy'])))
+   if not st:continue
+   st['signals_queued']+=int(r['n'])
+   if r['side']=='BUY':st['signals_buy']+=int(r['n'])
+   elif r['side']=='SELL':st['signals_sell']+=int(r['n'])
+  for r in db.query("SELECT strategy,side,COUNT(*) AS n FROM paper_fills WHERE namespace=? AND substr(filled_at,1,10)=? GROUP BY strategy,side",(e.NS,bar)):
+   st=per_strat.get(str(int(r['strategy'])))
+   if not st:continue
+   st['fills']+=int(r['n'])
+   if r['side']=='SELL':st['exits']+=int(r['n'])
+ totals.update({k:sum(per_strat[str(i)][k] for i in range(1,8)) for k in ('signals_queued','signals_buy','signals_sell','fills','exits')})
+ totals['prefilter_blocked']=blocked
  decisions={}
  for r in db.query('SELECT cause,COUNT(*) AS n FROM paper_decisions WHERE namespace=? GROUP BY cause',(e.NS,)):
   decisions[str(r['cause'])]=int(r['n'])
