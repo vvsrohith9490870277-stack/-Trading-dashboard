@@ -130,6 +130,9 @@ class CompareMetricsTests(unittest.TestCase):
         r107 = rows['107']
         self.assertEqual(r107['trades'], 2)
         self.assertEqual(r107['win_rate'], 0.5)
+        # R uses the 1R convention (1R = qty x 2 x ATR(14) at entry):
+        # +2000/4000 = +0.5R and -1000/4000 = -0.25R, average +0.125R.
+        self.assertAlmostEqual(r107['avg_r'], 0.125, places=4)
         self.assertEqual(r107['net_pnl_paise'], 1000)
         self.assertEqual(r107['sample_label'], 'insufficient_sample')
         self.assertTrue(ROW_FIELDS <= set(r107))
