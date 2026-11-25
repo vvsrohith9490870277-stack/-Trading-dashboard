@@ -4,7 +4,9 @@ Runs the shadow challengers offline on a synthetic market (make_market) with
 an in-memory sidecar DB. No Turso, no network, no orders.
 """
 import json
+import sqlite3
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -287,6 +289,176 @@ class UniverseSectorMapTests(unittest.TestCase):
                              strategies=[106])
         self.assertEqual(out2[106]['open_positions'], 0)
         self.assertEqual(out2[106]['closed_trades'], 0)
+
+
+class RecordingDB:
+    """Duck-typed db sink that records batches (Turso mirror stand-in)."""
+
+    def __init__(self, fail_on=None, fail_on_insert=False):
+        self.batches = []
+        self.fail_on = fail_on
+        self.fail_on_insert = fail_on_insert
+
+    def batch(self, stm):
+        if self.fail_on is not None:
+            raise RuntimeError(self.fail_on)
+        stm = list(stm)
+        if self.fail_on_insert and any('INSERT' in sql for sql, _ in stm):
+            raise RuntimeError('turso_write_failed')
+        self.batches.append(stm)
+
+    def query(self, sql, args=()):
+        return []
+
+
+class TursoMirrorTests(unittest.TestCase):
+    """Shadow -> Turso mirror: run_shadow writes identical rows to a second
+    sink (turso_db) when one is given, and nothing extra when it is not."""
+
+    def _market(self, n_days=280):
+        days, df, idx = make_market(n_days=n_days, seed=7, volume=300_000)
+        db = fresh_db(HERE.parent / 'automation' / 'paper-trading')
+        seed_pit(db, 'shadow', days, sorted(df.symbol.unique()), series='EQ')
+        return days, df, idx, db
+
+    def test_mirror_writes_identical_rows(self):
+        days, df, idx, db = self._market()
+        mirror = RecordingDB()
+        out = cs.run_shadow(db, 'adaptive_v1', df, idx, days[:260], days[260:],
+                            strategies=[102], turso_db=mirror)
+        self.assertEqual(out[102]['status'], 'SHADOW_SIMULATED')
+        # Every mirrored statement targets an adaptive_candidate_* table and
+        # no paper namespace appears anywhere in the mirror.
+        flat = [(sql, a) for stmts in mirror.batches for sql, a in stmts]
+        self.assertTrue(any('CREATE TABLE IF NOT EXISTS adaptive_candidate_daily' in s for s, _ in flat))
+        self.assertTrue(any('CREATE TABLE IF NOT EXISTS adaptive_candidate_trades' in s for s, _ in flat))
+        for sql, args in flat:
+            if sql.strip().upper().startswith(('INSERT', 'REPLACE')):
+                self.assertIn('adaptive_candidate_', sql)
+            blob = json.dumps(args, default=str)
+            for ns in ('paper_v1', 'paper_v2', 'paper_demo_v1'):
+                self.assertNotIn(ns, blob)
+        # Mirrored daily rows equal the sidecar daily rows (same statements).
+        sidecar_daily = db.query('SELECT namespace,strategy,trade_date,equity_paise,mode,simulated '
+                                 'FROM adaptive_candidate_daily WHERE strategy=102 ORDER BY trade_date')
+        mirrored_daily = [a for sql, a in flat if 'adaptive_candidate_daily' in sql
+                          and sql.strip().upper().startswith('INSERT')]
+        self.assertEqual(len(mirrored_daily), len(sidecar_daily))
+        self.assertGreater(len(mirrored_daily), 0)
+        for args, row in zip(mirrored_daily, sidecar_daily):
+            self.assertEqual(list(args[:6]),
+                             [row['namespace'], row['strategy'], row['trade_date'],
+                              row['equity_paise'], row['mode'], row['simulated']])
+        # Mirrored trade rows equal the sidecar trade rows (compared as
+        # sets keyed by (symbol, entry_date): the sim appends closed trades
+        # in exit order, the sidecar query sorts by symbol/entry_date).
+        sidecar_trades = db.query('SELECT namespace,strategy,symbol,entry_date,exit_date,qty,entry_price,'
+                                  'exit_price,net_pnl_paise,mode,simulated FROM adaptive_candidate_trades '
+                                  'WHERE strategy=102 ORDER BY symbol,entry_date')
+        mirrored_trades = [a for sql, a in flat if 'adaptive_candidate_trades' in sql
+                           and sql.strip().upper().startswith('INSERT')]
+        mirrored_trades.sort(key=lambda a: (a[2], a[3]))
+        self.assertEqual(len(mirrored_trades), len(sidecar_trades))
+        for args, row in zip(mirrored_trades, sidecar_trades):
+            self.assertEqual(list(args[:11]),
+                             [row['namespace'], row['strategy'], row['symbol'], row['entry_date'],
+                              row['exit_date'], row['qty'], row['entry_price'], row['exit_price'],
+                              row['net_pnl_paise'], row['mode'], row['simulated']])
+
+    def test_mirror_refused_for_protected_namespace(self):
+        days, df, idx, db = self._market()
+        for ns in ('paper_v1', 'paper_demo_v1', 'paper_v2'):
+            mirror = RecordingDB()
+            with self.assertRaises(ValueError):
+                cs.run_shadow(db, ns, df, idx, days[:260], days[260:],
+                              strategies=[102], turso_db=mirror)
+            # The namespace guard runs before ANY write to either sink.
+            self.assertEqual(mirror.batches, [])
+
+    def test_mirror_failure_raises_but_sidecar_written(self):
+        days, df, idx, db = self._market()
+        # Fail only on the mirrored INSERTs (the CREATE TABLE init succeeds,
+        # as it does against a reachable Turso): the sidecar write happens
+        # first, so its rows are there for a later re-run to repair Turso
+        # from (idempotent INSERT OR REPLACE).
+        mirror = RecordingDB(fail_on_insert=True)
+        with self.assertRaises(RuntimeError):
+            cs.run_shadow(db, 'adaptive_v1', df, idx, days[:260], days[260:],
+                          strategies=[102], turso_db=mirror)
+        daily = db.query('SELECT COUNT(*) n FROM adaptive_candidate_daily WHERE strategy=102')
+        self.assertGreater(daily[0]['n'], 0)
+
+    def test_load_market_sqlite_caps_at_session(self):
+        days, df, idx = make_market(n_days=10, seed=7, volume=300_000)
+        with tempfile.TemporaryDirectory() as t:
+            path = Path(t) / 'market.sqlite'
+            c = sqlite3.connect(str(path))
+            c.execute('CREATE TABLE daily_ohlcv(symbol TEXT,trade_date TEXT,open REAL,high REAL,low REAL,close REAL,volume INTEGER)')
+            rows = [(r['symbol'], r['trade_date'], r['open'], r['high'], r['low'], r['close'], r['volume'])
+                    for r in df.to_dict('records')]
+            rows += [(r['symbol'], r['trade_date'], r['open'], r['high'], r['low'], r['close'], r['volume'])
+                     for r in idx.to_dict('records')]
+            c.executemany('INSERT INTO daily_ohlcv VALUES(?,?,?,?,?,?,?)', rows)
+            c.commit()
+            c.close()
+            stock, index = cs.load_market_sqlite(path, days[5])
+        self.assertEqual(sorted(stock['trade_date'].astype(str).unique()), days[:6])
+        self.assertTrue((index['symbol'] == 'NIFTY500').all())
+        self.assertEqual(len(index), 6)
+
+    def test_cli_market_sqlite_and_turso(self):
+        days, df, idx, _ = self._market()
+        with tempfile.TemporaryDirectory() as t:
+            market_path = Path(t) / 'market.sqlite'
+            c = sqlite3.connect(str(market_path))
+            c.execute('CREATE TABLE daily_ohlcv(symbol TEXT,trade_date TEXT,open REAL,high REAL,low REAL,close REAL,volume INTEGER)')
+            rows = [(r['symbol'], r['trade_date'], r['open'], r['high'], r['low'], r['close'], r['volume'])
+                    for r in df.to_dict('records')]
+            rows += [(r['symbol'], r['trade_date'], r['open'], r['high'], r['low'], r['close'], r['volume'])
+                     for r in idx.to_dict('records')]
+            c.executemany('INSERT INTO daily_ohlcv VALUES(?,?,?,?,?,?,?)', rows)
+            c.commit()
+            c.close()
+            sidecar_path = Path(t) / 'adaptive.sqlite'
+            # The CLI assumes a sidecar initialised by adaptive_daily.py
+            # (full schema incl. the PIT prefilter tables); seed it the
+            # same way production does before invoking the CLI.
+            import os
+            import adaptive_daily as ad
+            old_live_db = os.environ.get('ADAPTIVE_LIVE_DB')
+            os.environ['ADAPTIVE_LIVE_DB'] = str(sidecar_path)
+            try:
+                seeded = ad.open_adaptive_db()
+                seeded.c.close()
+            finally:
+                if old_live_db is None:
+                    os.environ.pop('ADAPTIVE_LIVE_DB', None)
+                else:
+                    os.environ['ADAPTIVE_LIVE_DB'] = old_live_db
+            mirror = RecordingDB()
+            import contextlib
+            import io
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                out = cs.main(['--db', str(sidecar_path), '--session', days[-1],
+                               '--market-sqlite', str(market_path), '--turso'],
+                              turso_writer=mirror)
+            self.assertEqual(set(out), {101, 102, 103, 104, 105, 106, 107, 108, 109})
+            for s, r in out.items():
+                self.assertEqual(r['status'], 'SHADOW_SIMULATED')
+            printed = json.loads(buf.getvalue())
+            self.assertTrue(printed['turso_mirrored'])
+            self.assertEqual(printed['session_day'], days[-1])
+            # The mirror received rows for every strategy; the sidecar file
+            # holds the same daily rows.
+            mirrored_daily = [a for stmts in mirror.batches for sql, a in stmts
+                              if 'adaptive_candidate_daily' in sql and sql.strip().upper().startswith('INSERT')]
+            self.assertGreater(len(mirrored_daily), 0)
+            self.assertEqual({a[1] for a in mirrored_daily}, {101, 102, 103, 104, 105, 106, 107, 108, 109})
+            c = sqlite3.connect(str(sidecar_path))
+            n = c.execute('SELECT COUNT(*) FROM adaptive_candidate_daily').fetchone()[0]
+            c.close()
+            self.assertEqual(n, len(mirrored_daily))
 
 
 if __name__ == '__main__':
