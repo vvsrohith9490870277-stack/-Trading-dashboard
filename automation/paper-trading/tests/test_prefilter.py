@@ -126,6 +126,39 @@ class EntryGuardTests(unittest.TestCase):
    r=e.scan(self.db,None)
   q=self.db.query("SELECT side,reason FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(len(q),1);self.assertTrue(q[0]['reason'].startswith('stale_held_exit'))
   import json as _json;ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='stale_held_position'",(e.NS,));self.assertEqual(len(ev),1);self.assertGreaterEqual(_json.loads(ev[0]['data_json'])['held_sessions'],252)
+ def test_stale_held_boundary_exactly_252_sessions_exits(self):
+  # F18 boundary: held exactly 252 sessions MUST exit. The frame has 300
+  # business days ending 2026-11-09, but session_inputs.filter_history
+  # removes 15 NSE holidays, leaving 285 rows the engine counts. Entry on
+  # 2025-10-31 (the 34th filtered session) puts exactly 252 bars in
+  # [entry_day, bar]. held_sessions is asserted == 252, not >=, so this
+  # test pins the exact threshold: it fails if the threshold moves to 253.
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
+  dates=pd.bdate_range(end='2026-11-09',periods=300).strftime('%Y-%m-%d')
+  self.db.batch([('UPDATE paper_positions SET entry_at=? WHERE namespace=? AND strategy=1 AND symbol=?',('2025-10-31T09:15:00+05:30',e.NS,'RELIANCE-EQ'))])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-06'))])
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s['symbol']='RELIANCE-EQ';b=f(100.)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}):
+   r=e.scan(self.db,None)
+  q=self.db.query("SELECT side,reason FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(len(q),1);self.assertTrue(q[0]['reason'].startswith('stale_held_exit'))
+  import json as _json;ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='stale_held_position'",(e.NS,));self.assertEqual(len(ev),1);self.assertEqual(_json.loads(ev[0]['data_json'])['held_sessions'],252)
+ def test_stale_held_boundary_exactly_251_sessions_does_not_exit(self):
+  # F18 boundary: held exactly 251 sessions must NOT exit. Entry on
+  # 2025-11-03 (the 35th filtered session, one session after the 252
+  # entry) puts exactly 251 bars in [entry_day, bar]. This test pins the
+  # exact threshold: it fails if the threshold moves to 251 (the 251-held
+  # position would then exit).
+  self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
+  dates=pd.bdate_range(end='2026-11-09',periods=300).strftime('%Y-%m-%d')
+  self.db.batch([('UPDATE paper_positions SET entry_at=? WHERE namespace=? AND strategy=1 AND symbol=?',('2025-11-03T09:15:00+05:30',e.NS,'RELIANCE-EQ'))])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,1,'RELIANCE-EQ','2026-11-06'))])
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s['symbol']='RELIANCE-EQ';b=f(100.)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}):
+   r=e.scan(self.db,None)
+  q=self.db.query("SELECT side FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(q,[])
+  ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='stale_held_position'",(e.NS,));self.assertEqual(ev,[])
  def test_recently_held_position_does_not_exit_as_stale(self):
   self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
   self.db.batch([('UPDATE paper_positions SET entry_at=? WHERE namespace=? AND strategy=1 AND symbol=?',('2026-11-06T09:15:00+05:30',e.NS,'RELIANCE-EQ'))])
