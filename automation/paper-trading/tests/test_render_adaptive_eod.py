@@ -66,14 +66,18 @@ class AdaptiveEodCommandTests(unittest.TestCase):
                          str(engine.ROOT.parent / 'live' / 'adaptive_runner.py'))
         self.assertEqual(argv[2:], ['eod', '--session', '2026-11-25'])
 
-    def test_cli_defaults_session_to_today_ist(self):
-        with mock.patch.object(engine.subprocess, 'run') as run:
+    def test_cli_defaults_session_to_now_ist(self):
+        # The session defaults to the engine clock's current IST date.
+        # Patch engine.now (other suites replace it with a fixed fixture
+        # clock, so the real wall-clock date is not a stable expectation).
+        fixed = datetime(2026, 11, 25, 10, 0, tzinfo=IST)
+        with mock.patch.object(engine.subprocess, 'run') as run, \
+                mock.patch.object(engine, 'now', return_value=fixed):
             run.return_value = FakeCompleted(
                 0, json.dumps({'phase': 'eod', 'status': 'OK'}), '')
             engine.adaptive_eod_cli()
         argv = run.call_args.args[0]
-        today = datetime.now(IST).date().isoformat()
-        self.assertEqual(argv[2:], ['eod', '--session', today])
+        self.assertEqual(argv[2:], ['eod', '--session', '2026-11-25'])
 
     def test_cli_failed_report_exits_1(self):
         report = {'phase': 'eod', 'session_day': '2026-11-25',
