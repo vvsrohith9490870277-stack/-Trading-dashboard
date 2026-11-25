@@ -4,7 +4,9 @@
   forbidden-import scan, harness hash, Turso read-only reachability. No heavy work, no writes outside the sidecar.
 - eod (post-close, heavy): wait for Track A paper_eod(<day>) with ledger_reconciled (deadline from adaptive_policy),
   refresh the local market snapshot (read-only Turso), take protected-namespace row counts, run adaptive_daily.py in a
-  scrubbed env with a memory cap, re-count, and fail loudly if any protected count changed.
+  scrubbed env with a memory cap, re-count, and fail loudly if any protected count changed. Then, only when the daily
+  step actually simulated, run candidate_shadow.py (registry candidates 101-109) with the Turso mirror, so the daily
+  shadow check can read the results.
 - backfill (P1, minimal UDiFF era): guarded NSE Bhavcopy fetch into the LOCAL archive; refuses before the 11 Nov EOD.
 """
 import argparse, fcntl, json, os, resource, subprocess, sys, time
@@ -152,6 +154,57 @@ def wait_for_eod(ro, day, no_wait):
         time.sleep(CFG['eod_wait_poll_seconds'])
 
 
+def shadow_child_env():
+    """Child env for candidate_shadow.py: the scrubbed env (no credential-like
+    keys) plus the PAPER_ENV_FILE path, so node db.mjs reads the same .env
+    file the Track A engine already uses. Only a file PATH crosses the
+    boundary — no credential value does."""
+    env = ag.scrubbed_env()
+    env['PYTHONPATH'] = str(LIB)
+    if 'PAPER_ENV_FILE' in os.environ:
+        env['PAPER_ENV_FILE'] = os.environ['PAPER_ENV_FILE']
+    return env
+
+
+def shadow_step(day, daily_report=None):
+    """Run the registry-candidate shadow evaluation (101-109) for one session
+    day and mirror the results to Turso.
+
+    Runs only when the daily step actually simulated (simulation_status ==
+    'SIMULATED'): on a BLOCKED day the market snapshot is stale, so the
+    shadow sim would be stale too. The shadow step runs candidate_shadow.py
+    as a subprocess with the same memory cap / niceness as the daily child,
+    reading the refreshed state/market.sqlite and writing the sidecar plus
+    the Turso mirror (--turso). A shadow failure is recorded in the report
+    but never flips the eod status, which follows adaptive_daily's exit
+    code only (see eod_run_status).
+    """
+    daily_report = daily_report or {}
+    if daily_report.get('simulation_status') != 'SIMULATED':
+        return {'status': 'SKIPPED',
+                'reason': 'daily_not_simulated',
+                'simulation_status': daily_report.get('simulation_status')}
+    def limits():
+        mb = int(AP['runner_memory_max_mb']) * 1024 * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (mb, mb)); os.nice(10); apply_ionice_idle()
+    p = subprocess.run([PY, str(HERE / 'candidate_shadow.py'),
+                        '--db', str(HERE.parent / CFG['adaptive_db']),
+                        '--session', day,
+                        '--market-sqlite', str(STATE / 'market.sqlite'),
+                        '--turso'],
+                       env=shadow_child_env(), capture_output=True, text=True, preexec_fn=limits)
+    if p.returncode:
+        return {'status': 'FAILED', 'exit_code': p.returncode,
+                'stderr_tail': p.stderr.strip().splitlines()[-5:]}
+    try:
+        summary = json.loads(p.stdout.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        return {'status': 'FAILED', 'exit_code': p.returncode, 'reason': 'shadow_stdout_not_json'}
+    return {'status': 'OK',
+            'turso_mirrored': bool(summary.get('turso_mirrored')),
+            'strategies': {str(k): v.get('status') for k, v in (summary.get('results') or {}).items()}}
+
+
 def eod_run_status(returncode, protected_changed=None):
     """Sidecar eod status follows adaptive_daily's exit code only.\n\n    Live Track A paper_v1 event counts can grow during a long shadow run; that is not a sidecar failure.\n    protected_changed is still recorded on the report for audit.\n    """
     return 'OK' if int(returncode or 0) == 0 else 'FAILED'
@@ -203,6 +256,8 @@ def eod(day, no_wait=False, ro=None):
         out['daily_stderr_tail'] = p.stderr.strip().splitlines()[-5:]
     else:
         out['daily'] = json.loads(p.stdout.strip().splitlines()[-1])
+    with _timed(timings, 'shadow'):
+        out['shadow'] = shadow_step(day, out.get('daily'))
     with _timed(timings, 'protected_counts_after'):
         after = protected_counts(ro)
     out['timings_seconds'] = timings

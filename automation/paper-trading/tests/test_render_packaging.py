@@ -57,6 +57,13 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn('.env', text)
         self.assertNotIn('TOKEN', text)
 
+    def test_dockerfile_copies_live_for_adaptive_eod(self):
+        # The 17:00 adaptive job runs live/adaptive_runner.py, so live/
+        # must be in the image (the adaptive code lives outside
+        # automation/paper-trading/).
+        text = (DEPLOY / 'Dockerfile').read_text()
+        self.assertIn('COPY live/', text)
+
     def test_dockerignore_excludes_venvs_and_git(self):
         text = (ROOT / '.dockerignore').read_text()
         for pat in ('.git', 'node_modules', '.venv', '__pycache__',

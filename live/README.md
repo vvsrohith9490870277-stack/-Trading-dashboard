@@ -17,7 +17,7 @@ override with `ADAPTIVE_REPORT_DIR`; Support Agent reports default to
 | 08:15 | `run_adaptive.sh preflight` | kill switch, frozen-file hashes (worktree + installed), forbidden imports, harness hash, Turso read-only reachability |
 | 09:00–15:35 | nothing | heavy work is refused in market hours |
 | 16:45 | `run_support.sh --session <day>` | read-only findings for the day (after the 16:10 EOD) |
-| 16:50 | `run_adaptive.sh eod --session <day>` | waits for reconciled Track A EOD (deadline 19:00), snapshot, spawns, freshness + PIT gates, sims, row-count guard |
+| 16:50 | `run_adaptive.sh eod --session <day>` | waits for reconciled Track A EOD (deadline 19:00), snapshot, spawns, freshness + PIT gates, sims, row-count guard; then, only when the daily step simulated, runs the registry-candidate shadow step (`live/candidate_shadow.py --turso`, candidates 101–109) and mirrors the shadow results to Turso |
 | 18:05 | `run_adaptive.sh backfill --session <day> --from 2026-06-02 --to <day>` | NSE Bhavcopy -> local archive; idempotent; refused before the Track A EOD for `not_before_session` is reconciled |
 | 18:30 | `run_adaptive.sh eod --session <day> --no-wait` | re-run so simulations run with the archive (deterministic, idempotent) |
 | any time after a gap | `run_adaptive.sh eod --catch-up [--from <day>] [--session <day>] [--force]` | processes missed sessions in date order; a day runs only if Track A's `paper_eod` exists and `ledger_reconciled` is true, otherwise it is recorded `SKIPPED_NO_RECONCILED_TRACK_A_EOD` and nothing is synthesised; already-marked days are skipped unless `--force` |
@@ -48,11 +48,20 @@ Reset adaptive state: delete `state/adaptive.sqlite` (local only).
 | `SUPPORT_REPORT_DIR` | `/workspace/reports/support-agent` | Support Agent report dir |
 | `ADAPTIVE_LIVE_DB` | `state/adaptive.sqlite` | local adaptive SQLite file (tests point it at a throwaway copy) |
 
-No `.env` files are read or created by the sidecar, and no credentials are
-ever printed, logged or committed. Turso access is SELECT-only inside a
-libsql read transaction (`live/turso_ro.mjs`); transient read failures are
+The sidecar never creates a `.env` file, and no credentials are ever
+printed, logged or committed. No sidecar Python code reads a credential:
+Turso access is SELECT-only inside a libsql read transaction
+(`live/turso_ro.mjs`) for the daily step; transient read failures are
 retried (2 retries, 3s/6s backoff) and local read-only-guard refusals
-(`ro_*`) are never retried.
+(`ro_*`) are never retried. The ONE write exception is the shadow mirror:
+after a simulated daily step, the runner runs `live/candidate_shadow.py
+--turso`, which mirrors the shadow results to the Turso
+`adaptive_candidate_daily` / `adaptive_candidate_trades` tables via
+`live/turso_write.py` (node `automation/paper-trading/db.mjs`, the same
+write path as the Track A engine). The mirror never sees a credential
+value — db.mjs reads the `.env` file itself, and the child process is only
+passed the `PAPER_ENV_FILE` path. The daily step itself stays
+credential-free and local-only.
 
 ## Tests (offline)
 
@@ -116,7 +125,7 @@ warm-start end) are compared with the live ledger; warm-start-inherited
 trades are not discordance by themselves.
 
 Phase timings are in `timings_seconds` on the runner report (`snapshot`,
-`protected_counts_before`, `daily`, `protected_counts_after`, `total`) and
+`protected_counts_before`, `daily`, `shadow`, `protected_counts_after`, `total`) and
 on `adaptive-daily.json` (`spawn`, `coverage_gate`, `simulate_<strategy>`,
 `persist`, `hash_chain`, `after`). They are diagnostic only; they do not
 change simulation logic, results or the memory cap.
@@ -124,8 +133,13 @@ change simulation logic, results or the memory cap.
 ## Isolation guarantees (observation-only)
 
 - Paper-only: nothing places real orders and adaptive never calls Fyers.
-- Turso is read-only for adaptive: SELECT inside a read transaction via
-  `live/turso_ro.mjs` only; `batch()` raises `PermissionError`.
+- Turso is read-only for adaptive, with ONE exception — the shadow mirror:
+  the runner's shadow step (after a simulated daily step) writes ONLY the
+  `adaptive_candidate_daily` / `adaptive_candidate_trades` tables, namespace
+  `adaptive_v1`, every row `mode='shadow'` and `simulated=1`, via
+  `live/turso_write.py`. All other adaptive Turso access is SELECT inside a
+  read transaction via `live/turso_ro.mjs`; `TursoRO.batch()` raises
+  `PermissionError`.
 - Adaptive never writes `paper_v1`, `paper_v2` or `paper_demo_v1` (any table, any form);
   the protected-namespace row-count guard runs before and after every `eod`.
 - `adaptive_observation_only` stays `true`: no promotion, no Track C, no

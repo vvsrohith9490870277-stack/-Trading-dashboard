@@ -1106,7 +1106,7 @@ def migrate(db):
  pos=db.query('PRAGMA table_info(paper_positions)')
  if pos and not any(c.get('name')=='pending_exit' for c in pos):
   db.batch([('ALTER TABLE paper_positions ADD COLUMN pending_exit INTEGER NOT NULL DEFAULT 0',()),('ALTER TABLE paper_positions ADD COLUMN pending_exit_since TEXT',())])
-SUPERVISION_COMMANDS = ('worker', 'ensure-monitor', 'health', 'preflight', 'ensure-session', 'guardian', 'replay-audit', 'export-logs', 'support', 'sessiond', 'ensure-sessiond', 'record-outages')
+SUPERVISION_COMMANDS = ('worker', 'ensure-monitor', 'health', 'preflight', 'ensure-session', 'guardian', 'replay-audit', 'export-logs', 'support', 'sessiond', 'ensure-sessiond', 'record-outages', 'adaptive-eod')
 READ_ONLY_COMMANDS = ('trades-today', 'status', 'positions', 'pnl', 'charges', 'finance', 'overlap', 'funnel')
 
 def _ensure_session(e,db):
@@ -1132,7 +1132,7 @@ def _db():
 MUTATING_COMMANDS = ('worker', 'scan', 'bootstrap', 'eod', 'revalue-eod',
                      'sync-history', 'monitor-once', 'repair-history',
                      'weekly', 'sessiond', 'guardian', 'ensure-monitor',
-                     'ensure-session', 'ensure-sessiond')
+                     'ensure-session', 'ensure-sessiond', 'adaptive-eod')
 
 def runner_guard(command):
  """Refuse a mutating command when another runner is active (Task 4).
@@ -1172,9 +1172,45 @@ def runner_guard(command):
    pass
  return None
 
+def adaptive_eod_cli(session_day=None):
+    """Run the adaptive EOD (live/adaptive_runner.py eod) as a subprocess.
+
+    The adaptive runner is not imported: it runs as its own process so its
+    run lock, market-hours refusal and memory caps apply, and a runner
+    crash cannot take down the engine. The session defaults to today
+    (IST). Returns (report_dict, exit_code): the runner's report, and 1
+    when the runner failed (non-zero exit or report status FAILED) so the
+    supervisor records the failure via exit_code. A SKIPPED report (Track
+    A EOD not reconciled by the deadline) is not a failure: exit 0.
+    """
+    day = session_day or now().date().isoformat()
+    runner = ROOT.parent / 'live' / 'adaptive_runner.py'
+    try:
+        p = subprocess.run([sys.executable, str(runner), 'eod',
+                            '--session', day],
+                           capture_output=True, text=True, timeout=1700)
+    except subprocess.TimeoutExpired:
+        return ({'phase': 'eod', 'session_day': day, 'status': 'FAILED',
+                 'error': 'adaptive_eod_timeout'}, 1)
+    try:
+        report = json.loads(p.stdout)
+    except ValueError:
+        try:
+            report = json.loads(p.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            report = {'phase': 'eod', 'session_day': day, 'status': 'FAILED',
+                      'error': 'adaptive_runner_stdout_not_json',
+                      'exit_code': p.returncode,
+                      'stderr_tail': p.stderr.strip().splitlines()[-5:]}
+    status = str(report.get('status') or '')
+    code = 0 if (p.returncode == 0 and
+                 (status == 'OK' or status.startswith('SKIPPED'))) else 1
+    return (report, code)
+
+
 def main():
  parser=argparse.ArgumentParser(description='Paper-only Fyers-data/Turso-ledger engine; never broker orders.')
- parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history','exit-selftest','sessiond','ensure-sessiond','record-outages','revalue-eod']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);parser.add_argument('--cleanup-only',action='store_true');parser.add_argument('--keep',action='store_true');parser.add_argument('--max-seconds',type=int,default=1200);parser.add_argument('--max-quotes',type=int,default=40);args=parser.parse_args()
+ parser.add_argument('command',choices=['init','probe','bootstrap','scan','monitor-once','positions','trades-today','pnl','status','worker','ensure-monitor','health','preflight','screen-only','finance','charges','overlap','funnel','eod','weekly','repair-history','ensure-session','guardian','replay-audit','export-logs','support','reference-feeds','sync-history','exit-selftest','sessiond','ensure-sessiond','record-outages','revalue-eod','adaptive-eod']);parser.add_argument('--sync',action='store_true');parser.add_argument('--max-history-requests',type=int,default=20);parser.add_argument('--max-history-seconds',type=int,default=240);parser.add_argument('--session',default=None);parser.add_argument('--format',choices=['jsonl','csv'],default='jsonl');parser.add_argument('--max-events',type=int,default=200000);parser.add_argument('--max-files',type=int,default=20);parser.add_argument('--cleanup-only',action='store_true');parser.add_argument('--keep',action='store_true');parser.add_argument('--max-seconds',type=int,default=1200);parser.add_argument('--max-quotes',type=int,default=40);args=parser.parse_args()
  if not 1<=args.max_history_requests<=1100 or not 1<=args.max_history_seconds<=1080:parser.error('historical repair budget outside safe bounds')
  guard = runner_guard(args.command)
  if guard is not None:
@@ -1191,6 +1227,11 @@ def main():
     print(js(al.replay(e,db,args.max_files)))
    elif args.command=='support':
     print(js(sa.run_cli(e,db,args.session)))
+   elif args.command=='adaptive-eod':
+    report, code = adaptive_eod_cli(args.session)
+    print(js(report))
+    if code:
+     sys.exit(1)
    else:
     if rm.is_render() and args.command in ('guardian', 'sessiond',
                                            'ensure-session', 'ensure-sessiond'):
