@@ -99,6 +99,10 @@ class SessionDaemon(Base):
   late=sd.due(e,self.db,at(18,5));self.assertIn('eod',late);self.assertIn('sync',late);self.assertNotIn('guardian',late)
   self.assertEqual(sd.due(e,self.db,datetime(2026,11,8,10,0,tzinfo=e.IST)),[])
  def test_missed_scan_alerts_once_and_reruns_with_bounded_retries(self):
+  # I23: retries run until EOD (sessiond_max_attempts 32), not 3. Drive two
+  # ticks past the bound and assert the scan starts exactly max_attempts
+  # times (once per 15-minute retry slot from 08:45 to 16:15) and then
+  # stops, while the scan_missed alert is still written only once.
   e.CFG['sessiond_exit_selftest']=False;t=datetime(2026,11,9,9,0,tzinfo=e.IST);e.now=lambda:t;started=[]
   class P:
    def poll(self):return 0
@@ -106,7 +110,7 @@ class SessionDaemon(Base):
   saved=gd.ensure;gd.ensure=lambda e_,db:{'started':False}
   try:
    state=sd.State()
-   for i in range(6):sd.tick(e,self.db,state,t,mono=i*float(e.CFG['sessiond_retry_seconds']),run=run)
+   for i in range(int(e.CFG['sessiond_max_attempts'])+2):sd.tick(e,self.db,state,t,mono=i*float(e.CFG['sessiond_retry_seconds']),run=run)
   finally:gd.ensure=saved
   self.assertEqual([a for a in started if a[0]=='scan'],[['scan','--sync']]*int(e.CFG['sessiond_max_attempts']))
   alerts=self.db.query("SELECT 1 FROM paper_events WHERE namespace=? AND event_type='scan_missed'",(e.NS,));self.assertEqual(len(alerts),1)
