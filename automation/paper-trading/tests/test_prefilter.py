@@ -170,6 +170,41 @@ class EntryGuardTests(unittest.TestCase):
    r=e.scan(self.db,None)
   q=self.db.query("SELECT side FROM paper_signals WHERE namespace=? AND strategy=1 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(q,[])
   ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='stale_held_position'",(e.NS,));self.assertEqual(ev,[])
+ def test_missed_s7_trail_touch_queues_sell_and_keeps_alert(self):
+  # I19: a completed bar touched the S7 trail (low 89.0 below the 90.0
+  # trail on high_water 100.0) while the position stayed open, i.e. the
+  # monitor missed it. The scan must queue a SELL for the next session
+  # AND still write the old missed_stop_touch alert. The indicator is
+  # pinned to no-exit so the only exit source is the missed touch.
+  self.assertTrue(e.fill(self.db,self.signal(strategy=7),self.quote(),fixtures.T)['filled'])
+  self.db.batch([('UPDATE paper_positions SET entry_at=?,high_water=? WHERE namespace=? AND strategy=7 AND symbol=?',('2026-11-06T09:15:00+05:30',100.0,e.NS,'RELIANCE-EQ'))])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,7,'RELIANCE-EQ','2026-11-06'))])
+  dates=pd.bdate_range(end='2026-11-09',periods=300).strftime('%Y-%m-%d')
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s['symbol']='RELIANCE-EQ';s.loc[s.index[-1],'low']=89.0
+  b=f(100.)
+  def indicator(i,g):return g.assign(entry_condition=False,exit_condition=False)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}),patch.object(e,'indicator',side_effect=indicator):
+   r=e.scan(self.db,None)
+  self.assertEqual(r['signals_queued'],1)
+  q=self.db.query("SELECT side,reason,bar_date,eligible_date FROM paper_signals WHERE namespace=? AND strategy=7 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(len(q),1);self.assertEqual(q[0]['reason'],'missed_trail_touch');self.assertEqual(q[0]['bar_date'],'2026-11-09');self.assertEqual(q[0]['eligible_date'],'2026-11-11')
+  import json as _json;ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='missed_stop_touch'",(e.NS,));self.assertEqual(len(ev),1);d=_json.loads(ev[0]['data_json']);self.assertEqual(d['bar_date'],'2026-11-09');self.assertEqual(d['threshold'],90.0);self.assertEqual(d['price'],89.0)
+ def test_missed_s7_trail_touch_not_queued_when_untouched(self):
+  # I19 guard: with the trail untouched (last-bar low 99.0, above the
+  # 90.0 trail), the same scan must queue NO SELL and write NO alert.
+  self.assertTrue(e.fill(self.db,self.signal(strategy=7),self.quote(),fixtures.T)['filled'])
+  self.db.batch([('UPDATE paper_positions SET entry_at=?,high_water=? WHERE namespace=? AND strategy=7 AND symbol=?',('2026-11-06T09:15:00+05:30',100.0,e.NS,'RELIANCE-EQ'))])
+  self.db.batch([('INSERT INTO paper_watermarks VALUES(?,?,?,?)',(e.NS,7,'RELIANCE-EQ','2026-11-06'))])
+  dates=pd.bdate_range(end='2026-11-09',periods=300).strftime('%Y-%m-%d')
+  def f(c):return pd.DataFrame({'trade_date':dates,'open':c,'high':c+1,'low':c-1,'close':c,'volume':100.})
+  s=f(100.);s['symbol']='RELIANCE-EQ'
+  b=f(100.)
+  def indicator(i,g):return g.assign(entry_condition=False,exit_condition=False)
+  with patch.object(e,'now',return_value=fixtures.T.replace(hour=16)),patch.object(e,'universe',return_value=['RELIANCE-EQ']),patch.object(e,'read_history',return_value=s),patch.object(e.pf,'benchmark',return_value=b),patch.object(e.pf,'evaluate',return_value={'status':'PASS'}),patch.object(e,'indicator',side_effect=indicator):
+   r=e.scan(self.db,None)
+  self.assertEqual(r['signals_queued'],0)
+  q=self.db.query("SELECT side FROM paper_signals WHERE namespace=? AND strategy=7 AND symbol='RELIANCE-EQ' AND side='SELL' AND status='pending'",(e.NS,));self.assertEqual(q,[])
+  ev=self.db.query("SELECT data_json FROM paper_events WHERE namespace=? AND event_type='missed_stop_touch'",(e.NS,));self.assertEqual(ev,[])
  def test_split_ex_date_does_not_cause_false_exit(self):
   self.assertTrue(e.fill(self.db,self.signal(),self.quote(),fixtures.T)['filled'])
   self.db.batch([('INSERT INTO paper_corporate_actions(symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at) VALUES(?,?,?,?,?,?,?,?)',('RELIANCE-EQ','2026-11-09','SPLIT',2,1,None,'TEST',fixtures.T.isoformat()))])
