@@ -30,7 +30,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(by_name['scan']['time'], '08:45')
         self.assertEqual(by_name['eod']['time'], '16:10')
         self.assertEqual(by_name['support']['time'], '16:45')
-        self.assertEqual(by_name['adaptive_eod']['time'], '17:00')
+        self.assertEqual(by_name['adaptive_eod']['time'], '17:45')
         self.assertEqual(by_name['adaptive_eod']['command'], 'adaptive-eod')
         self.assertEqual(by_name['sync_history']['time'], '17:30')
         self.assertEqual(by_name['revalue']['time'], '18:00')
@@ -40,7 +40,7 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(times[-1], '19:00')
         self.assertEqual(len(times), 23)  # every 30 min, 08:00-19:00
         # exit_selftest is disabled by default; the adaptive job is the
-        # 17:00 live-only job (named adaptive_eod, not 'adaptive').
+        # 17:45 live-only job (named adaptive_eod, not 'adaptive').
         names = {j['name'] for j in sched['jobs']}
         self.assertNotIn('exit_selftest', names)
         self.assertNotIn('adaptive', names)
@@ -99,21 +99,22 @@ class ScheduleTests(unittest.TestCase):
         self.assertFalse(rsch.is_trading_day(SUN.date()))
         self.assertTrue(rsch.is_trading_day(FRI.date()))
 
-    def test_adaptive_eod_due_at_1700(self):
+    def test_adaptive_eod_due_at_1745(self):
         sched = rsch.load_schedule()
-        # 17:00 slot: adaptive_eod and the 17:00 record_outages slot;
-        # support (16:45) is still inside its 30 min catch-up window.
-        now = datetime(2026, 11, 20, 17, 0, tzinfo=IST)
+        # 17:45 slot: adaptive_eod, sync_history (17:30, inside its
+        # 30 min catch-up window) and the 17:30 record_outages slot;
+        # support (16:45) is past its window by then.
+        now = datetime(2026, 11, 20, 17, 45, tzinfo=IST)
         self.assertEqual([j['name'] for j in rsch.due_jobs(sched, now)],
-                         ['support', 'adaptive_eod', 'record_outages'])
-        # 17:20: still inside the 30 min catch-up window (support is
-        # past its window by then).
-        now = datetime(2026, 11, 20, 17, 20, tzinfo=IST)
+                         ['adaptive_eod', 'sync_history', 'record_outages'])
+        # 18:05: still inside the 30 min catch-up window (sync_history
+        # is past its window by then); revalue (18:00) is due.
+        now = datetime(2026, 11, 20, 18, 5, tzinfo=IST)
         self.assertEqual([j['name'] for j in rsch.due_jobs(sched, now)],
-                         ['adaptive_eod', 'record_outages'])
-        # 17:35: past the catch-up window; the 17:30 record_outages slot
+                         ['adaptive_eod', 'revalue', 'record_outages'])
+        # 18:20: past the catch-up window; the 18:00 record_outages slot
         # is due instead.
-        now = datetime(2026, 11, 20, 17, 35, tzinfo=IST)
+        now = datetime(2026, 11, 20, 18, 20, tzinfo=IST)
         names = [j['name'] for j in rsch.due_jobs(sched, now)]
         self.assertNotIn('adaptive_eod', names)
         self.assertIn('record_outages', names)
@@ -122,10 +123,11 @@ class ScheduleTests(unittest.TestCase):
         # Idempotency: a job that already ran for its slot is never due
         # again that day (same run-once rule as every other job).
         sched = rsch.load_schedule()
-        now = datetime(2026, 11, 20, 17, 5, tzinfo=IST)
-        last = {'adaptive_eod': datetime(2026, 11, 20, 17, 2, tzinfo=IST),
+        now = datetime(2026, 11, 20, 17, 50, tzinfo=IST)
+        last = {'adaptive_eod': datetime(2026, 11, 20, 17, 47, tzinfo=IST),
                 'support': datetime(2026, 11, 20, 16, 50, tzinfo=IST),
-                'record_outages': datetime(2026, 11, 20, 17, 0, tzinfo=IST)}
+                'sync_history': datetime(2026, 11, 20, 17, 32, tzinfo=IST),
+                'record_outages': datetime(2026, 11, 20, 17, 30, tzinfo=IST)}
         self.assertEqual(rsch.due_jobs(sched, now, last_run=last), [])
 
     def test_adaptive_eod_disabled_in_trial(self):

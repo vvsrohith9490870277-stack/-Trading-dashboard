@@ -1,6 +1,6 @@
 """Tests for the adaptive EOD Render job (engine.py adaptive-eod command).
 
-The 17:00 adaptive_eod schedule job runs `engine.py adaptive-eod`, which
+The 17:45 adaptive_eod schedule job runs `engine.py adaptive-eod`, which
 runs live/adaptive_runner.py eod as a subprocess (the runner's own lock,
 market-hours refusal and memory caps apply). These tests cover the command
 wiring and the subprocess invocation; the runner itself is tested in
