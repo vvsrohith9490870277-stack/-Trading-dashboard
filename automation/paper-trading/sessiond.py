@@ -45,7 +45,12 @@ def due(e,db,t):
  if _hm(c['sessiond_reference_from'])<=hm<ss[1]:
   if not e.surveillance_ready(db,str(d)).get('ready'):out.append('reference')
  if gd.armable(e,t):out.append('guardian')
- if _hm(c['sessiond_scan_due'])<=hm<ss[1]:
+ # I23: the scan stays due until EOD (16:20), not just until the session
+ # close (15:30). A scan that lands late — after the 08:45 due time but
+ # before EOD — still runs; the engine scans the last completed bar and
+ # creates signals eligible for the next session, so the day is not lost.
+ # After EOD the scan is no longer due, so no post-EOD scan can run.
+ if _hm(c['sessiond_scan_due'])<=hm<_hm(c['sessiond_eod_due']):
   if not db.query('SELECT 1 FROM paper_scan_batches WHERE namespace=? AND substr(scanned_at,1,10)=? LIMIT 1',(e.NS,str(d))):out.append('scan')
  if _hm(c['sessiond_exit_selftest_from'])<=hm<_hm(c['sessiond_exit_selftest_until']) and c.get('sessiond_exit_selftest'):
   if not db.query('SELECT 1 FROM paper_meta WHERE namespace=? AND key=? LIMIT 1',(e.NS,SELFTEST_KEY+str(d))):out.append('exit_selftest')
@@ -61,6 +66,11 @@ def due(e,db,t):
 def tick(e,db,state,t=None,mono=None,run=spawn):
  t=t or e.now();mono=time.monotonic() if mono is None else mono;state.roll(t.date());c=e.CFG;acted=[]
  every=float(c['sessiond_retry_seconds']);limit=int(c['sessiond_max_attempts'])
+ # I23: limit is the per-day retry bound for every due action (see
+ # sessiond_max_attempts_note in config.json: 32 covers every 15-minute
+ # retry slot from 08:45 to EOD 16:20). An action stops being due once it
+ # is done, so the bound only extends persistence for actions that keep
+ # failing; the scan-due window end stays the binding stop for the scan.
  for action in due(e,db,t):
   key=action
   if action=='guardian':
