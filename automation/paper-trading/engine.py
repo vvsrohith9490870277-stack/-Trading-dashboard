@@ -648,10 +648,14 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
     entry_day=datetime.fromisoformat(p['entry_at']).date().isoformat()
     held_sessions=int(((g.trade_date>=entry_day)&(g.trade_date<=bar)).sum())
     stale_exit=held_sessions>=STALE_HELD_SESSIONS
-   side='SELL' if p and (missed_exit or stale_exit) else ('BUY' if gatepass and not p and bool(x.entry_condition) else None)
+   # I19: a missed S7 trail touch must exit, not just alert. The monitor
+   # never polled between the touch and the close, so the live stop never
+   # fired; queue the SELL here (next session) instead of leaving the
+   # position open. The alert above is still written.
+   side='SELL' if p and (missed_exit or stale_exit or miss) else ('BUY' if gatepass and not p and bool(x.entry_condition) else None)
    if side and (strategy,sym,side) not in pending:
-    sid=stable_id(strategy,sym,bar,side);eligible=str(next_session(target));stm.append(('INSERT OR IGNORE INTO paper_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(NS,sid,strategy,sym,bar,side,'pending','stale_held_exit:'+p['entry_at'] if stale_exit else ('daily_exit:'+p['entry_at'] if side=='SELL' else 'daily_entry:'+pf.POLICY['version']),t.isoformat(),eligible)));created+=1
-    audit_events.append(al.event(sys.modules[__name__],'paper_order_queued',strategy=strategy,symbol=sym,signal_id=sid,bar_date=bar,side=side,reason='stale_held_exit' if stale_exit else ('completed_daily_exit' if side=='SELL' else 'qualified')))
+    sid=stable_id(strategy,sym,bar,side);eligible=str(next_session(target));stm.append(('INSERT OR IGNORE INTO paper_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?)',(NS,sid,strategy,sym,bar,side,'pending','stale_held_exit:'+p['entry_at'] if stale_exit else ('missed_trail_touch' if miss else ('daily_exit:'+p['entry_at'] if side=='SELL' else 'daily_entry:'+pf.POLICY['version'])),t.isoformat(),eligible)));created+=1
+    audit_events.append(al.event(sys.modules[__name__],'paper_order_queued',strategy=strategy,symbol=sym,signal_id=sid,bar_date=bar,side=side,reason='stale_held_exit' if stale_exit else ('missed_trail_touch' if miss else ('completed_daily_exit' if side=='SELL' else 'qualified'))))
     if stale_exit:
      audit_events.append(al.event(sys.modules[__name__],'stale_held_position',outcome='stale',severity='WARNING',strategy=strategy,symbol=sym,bar_date=bar,signal_id=sid,held_sessions=held_sessions,entry_at=p['entry_at'],threshold_sessions=STALE_HELD_SESSIONS))
     if side=='BUY':
