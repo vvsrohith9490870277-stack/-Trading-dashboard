@@ -16,6 +16,7 @@ import history_repair as hr
 import capital as cap
 import corporate_actions as ca
 import pauses as pz
+import protective_stops as ps
 import support_agent as sa
 import reference_feeds as rf
 import exit_selftest as xst
@@ -457,6 +458,44 @@ def fill(db,s,q,t):
   al.emit(e,db,'paper_order_result',outcome='filled' if r.get('filled') else 'blocked',strategy=s.get('strategy'),symbol=s.get('symbol'),signal_id=s.get('id'),reason=r.get('reason','ok'),fills=int(bool(r.get('filled'))),quantity=r.get('quantity'),**extra)
   return r
 
+def fill_shadow_stop(db,signal,q,t):
+ """Fill one pending C1 shadow stop SELL at the next open (shadow only).
+
+ Prices the exit with execution_reference(stop=True): a gap-down open below
+ the stop fills at the open (FEED_OPEN), a low touching the stop fills at
+ the stop level, otherwise the last-traded price. The close is recorded by
+ the db.mjs 'shadow_sell' action in the shadow book only (paper_shadow_costs
+ / paper_shadow_positions / paper_closed_trades book='shadow'); live
+ positions, signals and fills are never touched. Never raises: any failure
+ is returned as {'filled': False, 'reason': ...} so a shadow problem can
+ never break the live monitor.
+ """
+ if signal.get('eligible_date') and str(signal['eligible_date'])>t.date().isoformat():return {'filled':False,'reason':'not_yet_eligible'}
+ ok,why=valid_quote(q,t)
+ if not ok:return {'filled':False,'reason':why}
+ reference,path=execution_reference(q,stop=True,stop_level=signal.get('stop_level'),pending_exit=False,at=t,side='SELL')
+ if reference is None:return {'filled':False,'reason':'no_reference_price'}
+ try:r=db.call({'action':'shadow_sell','namespace':NS,'signal_id':signal['id'],'strategy':signal['strategy'],'symbol':signal['symbol'],'price':reference,'at':t.isoformat(),'execution_path':path})
+ except Exception as ex:return {'filled':False,'reason':'shadow_sell_failed','error':type(ex).__name__}
+ if not isinstance(r,dict) or not r.get('recorded'):return {'filled':False,'reason':(r.get('reason') if isinstance(r,dict) else None) or 'shadow_not_recorded'}
+ try:al.emit(sys.modules[__name__],db,'shadow_stop_filled',strategy=signal['strategy'],symbol=signal['symbol'],signal_id=signal['id'],bar_date=signal.get('bar_date'),price=reference,execution_path=path,quantity=r.get('qty'),reason='filled')
+ except Exception:pass
+ return {'filled':True,'reason':'shadow_exit','price':reference,'execution_path':path,'quantity':r.get('qty'),'net_pnl_paise':r.get('net_pnl_paise')}
+def fill_shadow_stops(db,quotes,t):
+ """Fill every due pending C1 shadow stop SELL with the current quotes.
+ Shadow only; returns {'fills': n, 'skipped': [(signal_id, reason)]}.
+ Never raises."""
+ try:due=db.query("SELECT * FROM paper_shadow_signals WHERE namespace=? AND status='pending' AND eligible_date<=?",(NS,t.date().isoformat()))
+ except Exception:return {'fills':0,'skipped':[('query','shadow_signals_unreadable')]}
+ fills=0;skipped=[]
+ for s in due:
+  q=quotes.get(s['symbol'])
+  if not q or not isinstance(q,dict):skipped.append((s['id'],'no_quote'));continue
+  r=fill_shadow_stop(db,s,q,t)
+  if r.get('filled'):fills+=1
+  else:skipped.append((s['id'],r.get('reason')))
+ return {'fills':fills,'skipped':skipped}
+
 # Explicit calendar exclusions (freeze plan A9) come from config.json, never a date literal in code.
 MUHURAT_INDICATOR_EXCLUDED=frozenset(CFG['indicator_excluded_sessions'])
 def indicator(strategy,g):
@@ -604,7 +643,9 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  for s in pending_rows:
   if not snapshot_only and s['side']=='BUY' and s['eligible_date']<=str(target):stm.append(("UPDATE paper_signals SET status='expired' WHERE namespace=? AND id=?",(NS,s['id'])))
   else:pending.add((s['strategy'],s['symbol'],s['side']))
- strategy_audit={};qual=[];created=0;funnel={str(i):{'current_symbols':0,'individual_pass_counts':{},'sequential_pass_counts':{},'qualified':0} for i in range(1,8)};skipped=[sym for sym in syms if sym not in set(raw.symbol)]
+ # C1 shadow stops: pending shadow SELLs (paper_shadow_signals) so a second scan never queues a duplicate for the same position.
+ shadow_pending={(r['strategy'],r['symbol'],'SELL') for r in db.query("SELECT strategy,symbol FROM paper_shadow_signals WHERE namespace=? AND status='pending'",(NS,))}
+ strategy_audit={};qual=[];created=0;shadow_created=0;funnel={str(i):{'current_symbols':0,'individual_pass_counts':{},'sequential_pass_counts':{},'qualified':0} for i in range(1,8)};skipped=[sym for sym in syms if sym not in set(raw.symbol)]
  # Corporate actions recorded for this bar or earlier, grouped by symbol.
  # Indicator inputs are back-adjusted for them (F07) so a split or bonus
  # does not cause a false exit; the prefilter still sees raw prices and
@@ -661,6 +702,23 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
     if side=='BUY':
      stm.append(('INSERT OR IGNORE INTO paper_entry_gate_proofs VALUES(?,?,?,?,?)',(NS,sid,bar,sym,pf.POLICY['version'])))
      stm.append(('INSERT OR IGNORE INTO paper_entry_input_proofs VALUES(?,?,?,?,?)',(NS,sid,si.POLICY['version'],bar,t.isoformat())))
+   # C1 protective stop for S1-S6, shadow only: when a held position's daily
+   # close touches the stop (entry - 2xATR(14), capped at entry*0.90) and no
+   # live exit was queued for it, record a SELL in paper_shadow_signals for
+   # the next session. Live signals, fills and positions are never touched:
+   # the live exit above takes precedence when the indicator already fired,
+   # and the stop is never evaluated for S7 (it has its own 10% trail).
+   if p and strategy in ps.STOP_STRATEGIES and side is None and (strategy,sym,'SELL') not in shadow_pending:
+    entry_day=datetime.fromisoformat(p['entry_at']).date().isoformat()
+    atr14=ps.atr14_at_entry(ga,entry_day)
+    stop=ps.stop_level(p['entry_price'],atr14)
+    if stop is not None and len(newbars) and bool((newbars.close<=stop).any()):
+     touch_bar=str(newbars.loc[newbars.close<=stop,'trade_date'].iloc[-1])
+     ssid=stable_id('protective_stop',strategy,sym,touch_bar)
+     seligible=str(next_session(target))
+     stm.append(('INSERT OR IGNORE INTO paper_shadow_signals(namespace,id,strategy,symbol,bar_date,side,status,reason,stop_level,entry_price,entry_at,created_at,eligible_date) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)',(NS,ssid,strategy,sym,touch_bar,'SELL','pending','protective_stop:'+p['entry_at'],stop,float(p['entry_price']),p['entry_at'],t.isoformat(),seligible)))
+     audit_events.append(al.event(sys.modules[__name__],'shadow_stop_queued',strategy=strategy,symbol=sym,signal_id=ssid,bar_date=touch_bar,side='SELL',reason='below_stop',threshold=stop,entry_at=p['entry_at'],price=float(p['entry_price'])))
+     shadow_pending.add((strategy,sym,'SELL'));shadow_created+=1
    if p and strategy==7:
     # Only completed closes on/after the actual paper entry can raise the stop.
     # Adjusted closes, consistent with the indicator frame and with the
@@ -676,7 +734,7 @@ def _scan(db,api,do_sync=False,bootstrap=False,snapshot_only=False):
  for sym in sorted(set(skipped)):audit_events.append(al.event(sys.modules[__name__],'strategy_decisions',outcome='not_evaluated',symbol=sym,bar_date=str(target),decisions=[{'strategy':i,'outcome':'not_evaluated','reason':'stale_stock_or_benchmark'} for i in range(1,8)]))
  stm+=al.statements(audit_events)
  if not NS.startswith('test_'):pd.DataFrame(qual).to_csv(ROOT/'out/latest_qualifiers.csv',index=False)
- report={'input_validation':input_audit,'target_completed_bar':str(target),'bootstrap':bootstrap,'funnel':funnel,'universe_symbols':len(syms),'frozen_universe_symbols':len(universe()),'excluded_audit_symbols':len(exclusions),'original_audit_universe':len(universe())+len(exclusions),'signals_queued':created,'latest_qualifiers':len(qual),'unavailable_current_symbols':skipped,'invalid_rows_excluded':int((~valid).sum()),'sync':sync_report,'no_backlog_fills':True,'screen_only':snapshot_only,'prefilter_policy':pf.POLICY,'prefilter_counts':{k:sum(r['status']==k for r in gates.values()) for k in ['PASS','FAIL','UNAVAILABLE']},'benchmark_sync_error':benchmark_error,'history_repair':repair_report,'reference_feeds':reference_report,'data_refresh_status':repair_report.get('status') if repair_report else 'not_requested'};stm.append(('INSERT INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace,bar_date) DO UPDATE SET scanned_at=excluded.scanned_at,status=excluded.status,report_json=excluded.report_json',(NS,str(target),t.isoformat(),'partial' if skipped else 'ok',js(report))));db.batch(stm);db.run('scan','partial' if skipped else 'ok',**report);return report
+ report={'input_validation':input_audit,'target_completed_bar':str(target),'bootstrap':bootstrap,'funnel':funnel,'universe_symbols':len(syms),'frozen_universe_symbols':len(universe()),'excluded_audit_symbols':len(exclusions),'original_audit_universe':len(universe())+len(exclusions),'signals_queued':created,'shadow_signals_queued':shadow_created,'latest_qualifiers':len(qual),'unavailable_current_symbols':skipped,'invalid_rows_excluded':int((~valid).sum()),'sync':sync_report,'no_backlog_fills':True,'screen_only':snapshot_only,'prefilter_policy':pf.POLICY,'prefilter_counts':{k:sum(r['status']==k for r in gates.values()) for k in ['PASS','FAIL','UNAVAILABLE']},'benchmark_sync_error':benchmark_error,'history_repair':repair_report,'reference_feeds':reference_report,'data_refresh_status':repair_report.get('status') if repair_report else 'not_requested'};stm.append(('INSERT INTO paper_scan_batches(namespace,bar_date,scanned_at,status,report_json) VALUES(?,?,?,?,?) ON CONFLICT(namespace,bar_date) DO UPDATE SET scanned_at=excluded.scanned_at,status=excluded.status,report_json=excluded.report_json',(NS,str(target),t.isoformat(),'partial' if skipped else 'ok',js(report))));db.batch(stm);db.run('scan','partial' if skipped else 'ok',**report);return report
 
 def missed_trail_touch(p,g,previous):
  """Alert only (never a fill, never backdated): a completed bar after `previous` touched the Strategy 07 trail level while the
@@ -737,7 +795,7 @@ def _confirm_circuit_band(api,sym,q):
 def _monitor(db,api):
  t=now()
  if not au.active(sys.modules[__name__],t):r={'status':'market_closed_or_calendar_unverified','at_IST':t.isoformat(),'fills':0};db.run('monitor','closed',**r);return r
- positions=db.positions();signals=db.query("SELECT * FROM paper_signals WHERE namespace=? AND status='pending'",(NS,));symbols=sorted({p['symbol'] for p in positions}|{s['symbol'] for s in signals})
+ positions=db.positions();signals=db.query("SELECT * FROM paper_signals WHERE namespace=? AND status='pending'",(NS,));symbols=sorted({p['symbol'] for p in positions}|{s['symbol'] for s in signals}|{r['symbol'] for r in db.query("SELECT DISTINCT symbol FROM paper_shadow_signals WHERE namespace=? AND status='pending' AND eligible_date<=?",(NS,t.date().isoformat()))})
  if not symbols:
   pz.evaluate(sys.modules[__name__],db,t.date().isoformat())
   al.emit(sys.modules[__name__],db,'monitor_idle',open_positions=0,pending_signals=0,poll_seconds=CFG['poll_seconds'])
@@ -784,6 +842,15 @@ def _monitor(db,api):
   if r['filled']:fills+=1;used.add(key)
   elif r.get('reason')=='SLEEVE_SLOT_FULL':full_sleeves.add(s.get('strategy'))
   else:_remember_skip(day,s,r)
+ # C1 shadow stops: fill due shadow SELLs at the next open, next to the live
+ # fills. Shadow only — fill_shadow_stops reads paper_shadow_signals and the
+ # shadow mirror and never touches live tables. A shadow failure is logged
+ # and skipped; it can never break the live monitor.
+ shadow_fills=0
+ try:shadow_fills=fill_shadow_stops(db,quotes,t).get('fills',0)
+ except Exception as ex:
+  try:log('shadow_stop_fill_failed',error=type(ex).__name__)
+  except Exception:pass
  # Entry-day stop cannot be hit by the exact same entry LTP; it is checked on subsequent fresh polls.
  # Positions change only through fill(); with no fill attempted this cycle the post-gate snapshot is current.
  # The price band feeds market_guard only for a carried exit's lower-circuit haircut, so it is read only then.
@@ -815,7 +882,7 @@ def _monitor(db,api):
   except Exception:pass
   try:al.emit(sys.modules[__name__],db,'position_marks_stale',outcome='failed',severity='ERROR',**payload)
   except Exception:pass
- report={'status':'ok','fresh_quotes':sum(valid_quote(q,t)[0] for q in quotes.values()),'quotes':len(quotes),'fills':fills,'at_IST':t.isoformat()}
+ report={'status':'ok','fresh_quotes':sum(valid_quote(q,t)[0] for q in quotes.values()),'quotes':len(quotes),'fills':fills,'shadow_fills':shadow_fills,'at_IST':t.isoformat()}
  if sticky:report['session_sticky_skips']=sticky
  db.run('monitor','ok',**report);return report
 
