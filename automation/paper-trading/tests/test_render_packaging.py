@@ -58,7 +58,7 @@ class PackagingTests(unittest.TestCase):
         self.assertNotIn('TOKEN', text)
 
     def test_dockerfile_copies_live_for_adaptive_eod(self):
-        # The 17:00 adaptive job runs live/adaptive_runner.py, so live/
+        # The 17:45 adaptive job runs live/adaptive_runner.py, so live/
         # must be in the image (the adaptive code lives outside
         # automation/paper-trading/).
         text = (DEPLOY / 'Dockerfile').read_text()
