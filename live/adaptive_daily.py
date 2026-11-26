@@ -18,6 +18,7 @@ import pandas as pd                    # noqa: E402
 import adaptive_engine as ae           # noqa: E402
 import adaptive_sim_trades as ast      # noqa: E402
 import adaptive_guard as ag            # noqa: E402
+import market_frame as mf              # noqa: E402 -- chunked bars loader (no read_sql fetchall arenas)
 import adaptive_logging as alog        # noqa: E402
 import adaptive_observation as aobs    # noqa: E402
 import adaptive_policy as apol         # noqa: E402
@@ -91,7 +92,9 @@ def candidate_params(strategy):
 
 def market_frames(as_of):
     c = sqlite3.connect(HERE.parent / 'state' / 'market.sqlite')
-    stock = pd.read_sql('SELECT symbol,trade_date,open,high,low,close,volume FROM daily_ohlcv WHERE trade_date<=? ORDER BY symbol,trade_date', c, params=(as_of,))
+    # Chunked loader, not pd.read_sql: read_sql's fetchall transient
+    # retains ~140 MB of allocator arenas on a 403k-row snapshot.
+    stock = mf.load_stock_frame(c, as_of)
     idx = pd.read_sql('SELECT symbol,trade_date,open,high,low,close,volume FROM index_ohlcv WHERE symbol=? AND trade_date<=? ORDER BY trade_date',
                       c, params=(pf.POLICY['benchmark_db_symbol'], as_of))
     cas = pd.read_sql('SELECT symbol,ex_date,kind,ratio_num,ratio_den,cash_paise,source,recorded_at FROM paper_corporate_actions WHERE ex_date<=?', c, params=(as_of,))
@@ -328,6 +331,12 @@ def main():
         r_idx = (closes / closes.shift(1) - 1.0).to_dict()   # benchmark daily return for Gate 4 / residualized d_t
         bands = cb.build_bands_by_date_symbol(db, stock, sessions, as_of=day)
         report['circuit_bands'] = cb.summarize_bands(bands)
+        # One shared _SimContext for all 28 sims in this run: the frame
+        # scans, lagged ADV, PIT lookups and indicator frames are computed
+        # once instead of once per sim (identical results; see
+        # test_sim_context). Without it each sim rescans the ~400k-row
+        # frame per (symbol, day) and the daily run takes 100+ minutes.
+        sim_ctx = ae._SimContext(stock, idx, cas)
         for s, info in spawns.items():
             if 'warm_start' not in info:
                 continue
@@ -336,7 +345,7 @@ def main():
             if not ev:
                 sims[s] = {'status': 'WARM_START_ONLY_NO_FORWARD_SESSION_YET'}; continue
             timer.start(f'simulate_{s}')
-            base = ae.simulate_track_window(db, NS, s, ae.BASELINE_PARAMS[s], stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands)
+            base = ae.simulate_track_window(db, NS, s, ae.BASELINE_PARAMS[s], stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands, sim_context=sim_ctx)
             timer.stop(f'simulate_{s}')
             out = []
             tape = {}
@@ -347,7 +356,7 @@ def main():
             for ch in info['track_b_challengers']:
                 params = {**ae.BASELINE_PARAMS[s], **ch['params_changed']}
                 timer.start(f'simulate_{s}')
-                var = ae.simulate_track_window(db, NS, s, params, stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands)
+                var = ae.simulate_track_window(db, NS, s, params, stock, idx, ws_all, ev, corp_actions=cas, bands_by_date_symbol=bands, sim_context=sim_ctx)
                 timer.stop(f'simulate_{s}')
                 rows = []
                 for rv, rb in zip(var['daily_records'], base['daily_records']):
@@ -375,12 +384,28 @@ def main():
             replica_day = [r for r in base['daily_records'] if r['trade_date'] == day]
             live_sleeve = sleeves.get(str(s)) or sleeves.get(s) or {}
             live_eq = live_sleeve.get('equity_paise')
+            # B2 (P2+E1 condition 5): equity is change-based, so pass the
+            # previous day's equities too. Replica prev comes from the
+            # previous daily record; live prev from the sidecar's copied
+            # Track A equity rows (latest trade_date before today). Either
+            # may be None (first evaluated day) — then the equity part of
+            # the parity row is not_evaluable, never a level comparison.
+            recs = base['daily_records']
+            today_i = next((i for i, r in enumerate(recs) if r['trade_date'] == day), None)
+            replica_prev = recs[today_i - 1]['equity_paise'] if today_i else None
+            live_prev = None
+            try:
+                prev_rows = db.query('SELECT equity_paise FROM adaptive_live_track_a_equity WHERE namespace=? AND strategy=? AND trade_date<? ORDER BY trade_date DESC LIMIT 1', (NS, s, day))
+                live_prev = int(prev_rows[0]['equity_paise']) if prev_rows else None
+            except Exception:
+                live_prev = None
             report['parity'][s] = pr.record_for_session(
                 db, NS, s, day, reconciled=rec, simulated=True, live_fills=live_fills,
                 replica_closed_trades=base['closed_trades'], replica_open_positions=base['open_positions'],
                 replica_entry_skips=base['entry_skips'], warm_start_end=info['warm_start'][1],
                 replica_equity_paise=(replica_day[-1]['equity_paise'] if replica_day else None),
-                live_equity_paise=(int(live_eq) if live_eq is not None else None))
+                live_equity_paise=(int(live_eq) if live_eq is not None else None),
+                replica_equity_prev_paise=replica_prev, live_equity_prev_paise=live_prev)
         report['simulation_status'] = 'SIMULATED'
     for s in sorted(ae.BASELINE_PARAMS):
         if s not in report['parity']:

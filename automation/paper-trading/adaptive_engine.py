@@ -14,7 +14,7 @@ Implements:
 - Microstructure locks: signals at close of t -> fills at open of t+1, circuit carry-forward,
   gap-aware stops, EQ-only new entries, 1.5x exit slippage on BE/BZ
 """
-import copy, hashlib, json, math
+import bisect, copy, hashlib, json, math
 from fractions import Fraction
 from datetime import datetime, timezone
 from pathlib import Path
@@ -416,6 +416,25 @@ def slippage_fill_paise(reference_paise, order_paise, adv_paise, side, stress=Fa
     return {'price_paise': int(out), 'base_bps': base, 'bps': float(bps), 'stress': bool(stress)}
 
 
+def base_only_slippage_paise(reference_paise, side):
+    """B1 fallback (option (a), user-decided): base bps only, mirroring fees.mjs baseOnlySlippage().
+
+    Base is slippage_base_bps_through_20cr from the frozen capital_policy.json, read from
+    the file, never typed in code. No participation term (it needs ADV, which is exactly
+    what is missing) and no 1.5x stress (also for BE/BZ without ADV).
+    Example: SELL at 110.00 -> 109.91.
+    """
+    ref = int(reference_paise)
+    if ref <= 0 or side not in ('BUY', 'SELL'):
+        raise ValueError('slippage_inputs')
+    base = int(CAPITAL_POLICY['slippage_base_bps_through_20cr'])
+    factor = Fraction(10_000 + base, 10_000) if side == 'BUY' else Fraction(10_000 - base, 10_000)
+    out = math.floor(ref * factor + Fraction(1, 2))
+    if out <= 0:
+        raise ValueError('slippage_bounds')
+    return {'price_paise': int(out), 'base_bps': base}
+
+
 def lagged_adv_paise(sym_hist, day):
     """Lagged median traded value (paise) exactly as Track A db.mjs laggedAdv(): sessions strictly before day,
     special sessions excluded, turnover else close*volume, last adv_lookback_sessions rows. None if history is short."""
@@ -452,8 +471,9 @@ def estimate_exit_haircut_paise(qty, mark_price, series='EQ', locked_lower_days=
     """Exit haircut in paise for an open position: frozen sell charges (incl. overnight DP) + tiered exit slippage
     (stress multiplier on BE/BZ or explicit stress) + lower-circuit carry-forward haircut.
 
-    When lagged ADV is unknown, Track A applies no exit slippage ('exit_slippage_unavailable'); the same is done here
-    and reported as slippage_applied=False so callers can see it.
+    B1 (option (a)): when lagged ADV is unknown or below the floor, Track A applies the base-only
+    fallback (base bps from capital_policy.json, no participation term, no stress) instead of
+    no slippage; the same is done here.
     """
     qty = int(qty)
     if qty <= 0:
@@ -461,10 +481,13 @@ def estimate_exit_haircut_paise(qty, mark_price, series='EQ', locked_lower_days=
     mark_paise = cap.price_paise(mark_price)
     gross_paise = qty * mark_paise
     circuit_loss_paise = circuit_haircut_paise(gross_paise, locked_lower_days)
-    slippage_paise = 0
-    if adv_paise:
+    adv_floor_paise = int(CAPITAL_POLICY['adv_floor_inr']) * 100
+    if adv_paise and int(adv_paise) >= adv_floor_paise:
         stressed = bool(stress or CAPITAL_POLICY.get('slippage_stress') is True or str(series).upper() in ('BE', 'BZ'))
         fill = slippage_fill_paise(mark_paise, gross_paise, adv_paise, 'SELL', stress=stressed)['price_paise']
+        slippage_paise = gross_paise - qty * fill
+    else:
+        fill = base_only_slippage_paise(mark_paise, 'SELL')['price_paise']
         slippage_paise = gross_paise - qty * fill
     fees_paise = fill_charges_paise(gross_paise, 'SELL', overnight_dp=True)['total']
     return circuit_loss_paise + slippage_paise + fees_paise
@@ -897,6 +920,306 @@ def evaluate_stopping_and_window(
     }
 
 
+# ---------------------------------------------------------------------------
+# Simulation fast path: precomputed frame data shared across sims in a run
+# ---------------------------------------------------------------------------
+# simulate_track_window used to rescan the whole ~400k-row bars frame for
+# every (symbol, day) -- full-frame boolean masks with .astype(str) on
+# object arrays -- and recompute every symbol's indicators from scratch on
+# every day. A profile of a single 61-day S3 sim: 190 s, ~77% of it in
+# pandas object-array comparisons / astype, only 4% in indicator math.
+#
+# _SimContext precomputes, once per process run, the read-only structures
+# every sim in the run shares, and caches the per-(symbol, day) lookups:
+#   * per-symbol histories: one pass over the sorted frame (contiguous row
+#     ranges), not 900 full-frame boolean scans
+#   * per-day bar maps: one date groupby, built lazily per day
+#   * signals: each symbol's indicator frame is computed ONCE per
+#     (strategy, params) over its full history and the per-day entry/exit
+#     is a row lookup -- indicators are causal (rolling/EMA/RSI-Wilder/
+#     Supertrend loops, all seeded from the symbol's first bar), so the row
+#     for day D in the full-history frame equals the last row of a frame
+#     truncated at D, exactly, provided no corporate action rescales the
+#     history; symbols with an applicable scaled action keep the old
+#     per-day path
+#   * lagged ADV, PIT series and the prefilter universe: cached per
+#     (symbol, day) / (namespace, day) -- the underlying tables do not
+#     change during a run, so the cached values are identical
+# The simulation logic itself (fills, locks, charges, slippage, equity) is
+# untouched; only the data access is precomputed. A before/after comparison
+# on the same snapshot must show identical trades and records.
+#
+# A context is bound to the exact frame objects it was built from:
+# simulate_track_window refuses a context built for a different frame or
+# corp-action list, so a caller that reuses a context across different
+# inputs fails loudly instead of silently returning stale data.
+
+
+def _adv_turnovers_paise(stock_df):
+    """Per-row 20-session ADV turnover in paise, as an int64 array.
+
+    Mirrors lagged_adv_paise's per-row value exactly: the turnover column
+    when present and not NaN, else close*volume when both are positive;
+    paise = int(round(value * 100)) (Python banker's rounding); -1 where
+    the row has no turnover. Rows are in stock_df order.
+    """
+    n = len(stock_df)
+    out = np.full(n, -1, dtype=np.int64)
+    if n == 0:
+        return out
+    close = stock_df['close'].to_numpy(dtype=float, copy=False)
+    vol = stock_df['volume'].to_numpy(dtype=float, copy=False)
+    base = np.where((vol > 0) & (close > 0), close * vol, np.nan)
+    if 'turnover' in stock_df.columns:
+        tcol = stock_df['turnover'].to_numpy(dtype=float, copy=False)
+        vals = np.where(~np.isnan(tcol), tcol, base)
+    else:
+        vals = base
+    finite = np.isfinite(vals)
+    if bool(finite.any()):
+        # int(round(x * 100)) per element, Python banker's rounding.
+        out[finite] = [int(round(float(v) * 100)) for v in vals[finite]]
+    return out
+
+
+def _scaled_action_applicable(act, sym, as_of):
+    """Whether a scaled corporate action applies at as_of, exactly as
+    back_adjust_ohlc_pit decides it (kind, ex_date, known date, symbol,
+    integer ratio > 0)."""
+    if act.get('kind') not in SCALED_CORP_ACTIONS:
+        return False
+    ex_date = str(act.get('ex_date') or '')
+    if not ex_date or ex_date > str(as_of):
+        return False
+    if corp_action_known_date(act) > str(as_of):
+        return False
+    if act.get('symbol') and str(act['symbol']) != str(sym):
+        return False
+    num = act.get('ratio_num')
+    den = act.get('ratio_den')
+    return isinstance(num, int) and isinstance(den, int) and num > 0 and den > 0
+
+
+class _SimContext:
+    """Precomputed, run-shared data for simulate_track_window calls.
+
+    One context serves every sim in a process run (adaptive_daily runs 28
+    sims on one frame; candidate_shadow runs 9). It holds a strong ref to
+    the frames so they cannot be swapped underneath it.
+    """
+
+    def __init__(self, stock_df, index_df, corp_actions=None):
+        # The frames as passed in (identity-checked by
+        # simulate_track_window); _build_frames may replace self.stock_df
+        # with a sorted copy, which is the canonical frame thereafter.
+        self._orig_stock_df = stock_df
+        self._orig_index_df = index_df
+        self.stock_df = stock_df
+        self.index_df = index_df
+        self.corp_actions = list(corp_actions or [])
+        self.series_cache = {}
+        self.universe_cache = {}
+        self.adv_cache = {}
+        self.signal_cache = {}
+        self._date_positions = None
+        self._build_frames()
+        # Scaled actions by symbol (SPLIT/BONUS/EXTRAORDINARY_DIVIDEND):
+        # only these can change the adjusted history, so only these
+        # symbols keep the per-day signal path.
+        self.scaled_actions_by_sym = {}
+        for act in self.corp_actions:
+            if act.get('kind') in SCALED_CORP_ACTIONS and act.get('symbol'):
+                self.scaled_actions_by_sym.setdefault(str(act['symbol']), []).append(act)
+
+    def _build_frames(self):
+        stock = self.stock_df
+        if stock is None or getattr(stock, 'empty', True):
+            self.symbols = []
+            self._sym_ranges = {}
+            self.sym_dates = {}
+            self._turnovers = np.zeros(0, dtype=np.int64)
+            return
+        # Per-symbol histories must be chronological and the frame sorted
+        # by symbol (so each symbol's rows are one contiguous range). The
+        # SQL paths return ORDER BY symbol, trade_date; sort only if a
+        # frame arrives unsorted.
+        syms = stock['symbol'].astype(str)
+        dates = stock['trade_date'].astype(str)
+        if not bool(syms.is_monotonic_increasing):
+            needs_sort = True
+        else:
+            same_sym = syms.eq(syms.shift())
+            # The shifted first row is NaN; fill it with the row's own date
+            # so the comparison is False there (no predecessor to be out
+            # of order).
+            prev_dates = dates.shift().fillna(dates)
+            needs_sort = bool((same_sym & dates.lt(prev_dates)).any())
+        if needs_sort:
+            stock = stock.sort_values(['symbol', 'trade_date'], kind='stable')
+            self.stock_df = stock
+            syms = stock['symbol'].astype(str)
+            dates = stock['trade_date'].astype(str)
+        self.symbols = sorted(syms.unique().tolist())
+        # Contiguous per-symbol row ranges (frame is sorted by symbol).
+        # Groupby keys are normalised to str: lookups use str(day)/str(sym)
+        # (the old code compared .astype(str) values), so a non-string
+        # trade_date/symbol dtype cannot silently miss.
+        sym_groups = {str(k): v for k, v in stock.groupby('symbol', sort=True, observed=True).indices.items()}
+        self._sym_ranges = {}
+        self.sym_dates = {}
+        for sym in self.symbols:
+            idx = sym_groups[str(sym)]
+            start, stop = int(idx[0]), int(idx[-1]) + 1
+            self._sym_ranges[str(sym)] = (start, stop)
+            self.sym_dates[str(sym)] = dates.iloc[start:stop].tolist()
+        self._turnovers = _adv_turnovers_paise(stock)
+        self._date_positions = {str(k): v for k, v in stock.groupby('trade_date', sort=True, observed=True).indices.items()}
+
+    def hist_view(self, sym, day=None):
+        """The symbol's bars as a view of the frame, optionally truncated
+        to trade_date <= day (same rows, same order, as the old per-day
+        boolean-mask slice)."""
+        rng = self._sym_ranges.get(str(sym))
+        if rng is None:
+            return None
+        start, stop = rng
+        if day is None:
+            return self.stock_df.iloc[start:stop]
+        end = bisect.bisect_right(self.sym_dates[str(sym)], str(day))
+        return self.stock_df.iloc[start:start + end]
+
+    def day_row_index(self, sym, day):
+        """Row position of day D in the symbol's history (last duplicate
+        wins, matching iloc[-1] on a frame truncated at D), or -1 if the
+        symbol has no bar on or before D."""
+        dates = self.sym_dates.get(str(sym))
+        if not dates:
+            return -1
+        return bisect.bisect_right(dates, str(day)) - 1
+
+    def bar_map_for_day(self, day):
+        """{symbol: {'open':..., 'low':..., 'close':...}} for one session
+        day. The simulator only reads open/low/close from a bar."""
+        if self._date_positions is None:
+            return {}
+        positions = self._date_positions.get(str(day))
+        if positions is None:
+            return {}
+        day_bars = self.stock_df.iloc[positions]
+        out = {}
+        for r in day_bars.itertuples(index=False):
+            out[str(r.symbol)] = {'open': r.open, 'low': r.low, 'close': r.close}
+        return out
+
+    def lagged_adv(self, sym, day):
+        """Lagged median traded value (paise) exactly as lagged_adv_paise:
+        sessions strictly before day, special sessions excluded, last
+        adv_lookback_sessions non-None turnovers; None if fewer."""
+        key = (str(sym), str(day))
+        if key in self.adv_cache:
+            return self.adv_cache[key]
+        lookback = int(CAPITAL_POLICY['adv_lookback_sessions'])
+        dates = self.sym_dates.get(str(sym))
+        if not dates:
+            self.adv_cache[key] = None
+            return None
+        end = bisect.bisect_left(dates, str(day))  # sessions strictly before day
+        start, _stop = self._sym_ranges[str(sym)]
+        vals = []
+        # Walk backwards from the last session before day, collecting the
+        # last `lookback` non-None turnovers (most recent first, like the
+        # original's reverse-chronological iterrows).
+        for i in range(start + end - 1, start - 1, -1):
+            if len(vals) >= lookback:
+                break
+            if dates[i - start] in ADV_EXCLUDED_SESSIONS:
+                continue
+            tv = self._turnovers[i]
+            if tv >= 0:
+                vals.append(int(tv))
+        if len(vals) < lookback:
+            self.adv_cache[key] = None
+            return None
+        vals.sort()
+        mid = lookback // 2
+        out = vals[mid] if lookback % 2 else (vals[mid - 1] + vals[mid]) / 2
+        self.adv_cache[key] = out
+        return out
+
+    def pit_series(self, db, sym, day):
+        """PIT Bhavcopy SERIES for (symbol, day), cached: the archive and
+        bands tables are never written during a run, so the value is
+        identical for every sim in the run."""
+        key = (id(db), str(sym), str(day))
+        if key in self.series_cache:
+            return self.series_cache[key]
+        val = pit.get_pit_series(db, sym, day, as_of_date=day)
+        self.series_cache[key] = val
+        return val
+
+    def prefilter_universe(self, db, namespace, day):
+        """PIT prefilter universe for (namespace, day), cached -- but only
+        NON-empty results, so the archive-on-the-fly path (empty universe
+        -> archive -> re-query) still works. Only what the simulator
+        reads is cached: the eligible symbols and whether the universe is
+        non-empty. The full per-symbol entries each carry a parsed
+        metrics_json dict (~2.4 MB/day); retaining all 61 days' worth
+        cost ~147 MB (tracemalloc) and the simulator never reads them."""
+        key = (id(db), str(namespace), str(day))
+        if key in self.universe_cache:
+            return self.universe_cache[key]
+        u = pit.get_pit_prefilter_universe(db, namespace, day, as_of_date=day, require_eq_series=True)
+        slim = {'eligible_symbols': list(u.get('eligible_symbols') or []),
+                'by_symbol': {s: True for s in (u.get('by_symbol') or {})}}
+        if slim['eligible_symbols'] or slim['by_symbol']:
+            self.universe_cache[key] = slim
+        return slim
+
+    def has_applicable_scaled_action(self, sym, max_day):
+        """Whether a scaled corporate action for this symbol becomes
+        applicable at or before max_day. If it does, the adjusted history
+        differs across the run's days, so the symbol keeps the per-day
+        signal path; otherwise one full-history adjustment is exact for
+        every day (applicability is monotone in as_of)."""
+        for act in self.scaled_actions_by_sym.get(str(sym), ()):
+            if _scaled_action_applicable(act, sym, max_day):
+                return True
+        return False
+
+    def signal_arrays(self, s, validated_params, signal_evaluator, sym, max_day):
+        """(entry, exit, qty, dates) for a symbol, computed ONCE over its
+        full history. entry/exit/qty are object arrays (NaN preserved, so
+        bool() on a row matches bool(last_row.get(...)) exactly); a missing
+        column gives None. dates is the symbol's date list, in the same
+        row order. Returns None when the symbol must keep the per-day
+        path (scaled corporate action inside the run) or has no bars."""
+        if signal_evaluator is not None:
+            key = ('eval', id(signal_evaluator), str(sym))
+        else:
+            key = ('base', int(s), tuple(sorted(validated_params.items())), str(sym))
+        if key in self.signal_cache:
+            return self.signal_cache[key]
+        hist = self.hist_view(sym)
+        if hist is None or hist.empty:
+            self.signal_cache[key] = None
+            return None
+        if self.has_applicable_scaled_action(sym, max_day):
+            # Adjusted history differs across the run's days: per-day path.
+            self.signal_cache[key] = None
+            return None
+        adj = back_adjust_ohlc_pit(hist, self.corp_actions, as_of_date=max_day)
+        if signal_evaluator is not None:
+            ind = signal_evaluator(s, adj)
+        else:
+            ind = evaluate_parameterized_strategy(s, adj, validated_params)
+        entry = ind['entry_condition'].to_numpy(dtype=object) if 'entry_condition' in ind.columns else None
+        exit_ = ind['exit_condition'].to_numpy(dtype=object) if 'exit_condition' in ind.columns else None
+        qty = ind['qty'].to_numpy(dtype=object) if 'qty' in ind.columns else None
+        result = (entry, exit_, qty, self.sym_dates[str(sym)])
+        self.signal_cache[key] = result
+        return result
+
+
 def simulate_track_window(
     db,
     namespace,
@@ -909,6 +1232,8 @@ def simulate_track_window(
     corp_actions=None,
     bands_by_date_symbol=None,
     stress_slippage=False,
+    signal_evaluator=None,
+    sim_context=None,
 ):
     """Run point-in-time warm-start + evaluation window simulation for a single track with all microstructure locks.
 
@@ -919,16 +1244,50 @@ def simulate_track_window(
     - Upper-circuit buy block, lower-circuit carry-forward exit with 1%/day haircut, gap-aware Strategy 07 stops
     - EQ-only new entries, 1.5x exit slippage on BE/BZ
     - Starting equity E_0 at eval_dates[0] valued net of exit haircut
+
+    signal_evaluator (B3, optional): a callable (strategy, df) -> df with
+    entry_condition / exit_condition columns, used INSTEAD of
+    evaluate_parameterized_strategy. It lets shadow challengers (ids 101+,
+    which are not in BASELINE_PARAMS) reuse this simulator with the same
+    frozen sizing and costs. When it is given, baseline parameter validation
+    and warm-start-day validation are skipped (the registry owns the
+    candidate's params and warm-start); everything else — fills, locks,
+    charges, slippage — is identical, so strategies 1-7 are unaffected.
+
+    sim_context (optional): a _SimContext built from the same stock_df /
+    index_df / corp_actions, shared across the sims of one process run so
+    the frame scans, ADV, PIT lookups and indicator frames are computed
+    once instead of once per sim. When omitted a fresh context is built
+    for this call (same results, slower). A context built for different
+    frames or corp actions raises ValueError.
     """
     s = int(strategy)
-    validated_params = validate_parameter_only_mutation(s, params)
+    if signal_evaluator is None:
+        validated_params = validate_parameter_only_mutation(s, params)
+    else:
+        # Candidate challenger: params are the registry params, not baseline
+        # mutations; the evaluator owns the signals.
+        validated_params = dict(params or {})
     ws_dates = [str(d) for d in warm_start_dates]
     ev_dates = [str(d) for d in eval_dates]
-    validate_warm_start_days(s, len(ws_dates))
+    if signal_evaluator is None:
+        validate_warm_start_days(s, len(ws_dates))
     all_dates = ws_dates + ev_dates
     ws_end = ws_dates[-1]
     corp_actions = corp_actions or []
     bands_by_date_symbol = bands_by_date_symbol or {}
+    if sim_context is None:
+        sim_context = _SimContext(stock_df, index_df, corp_actions)
+    else:
+        if sim_context._orig_stock_df is not stock_df or sim_context._orig_index_df is not index_df:
+            raise ValueError('sim_context_frame_mismatch')
+        if list(corp_actions) != list(sim_context.corp_actions):
+            raise ValueError('sim_context_corp_actions_mismatch')
+        # The context may hold a sorted copy of the frame (see
+        # _SimContext._build_frames); use it as the canonical frame for
+        # the archive-on-the-fly path below.
+        stock_df = sim_context.stock_df
+        index_df = sim_context.index_df
 
     cash_paise = SLEEVE_CAPITAL_PAISE
     positions = {}  # symbol -> {qty, entry_price, entry_date, high_water, pending_exit, locked_days}
@@ -937,16 +1296,14 @@ def simulate_track_window(
     daily_records = []
     starting_equity_summary = None
 
-    symbols = sorted(stock_df['symbol'].astype(str).unique().tolist()) if not stock_df.empty else []
-    hist_by_symbol = {sym: stock_df[stock_df['symbol'].astype(str) == sym] for sym in symbols}
+    symbols = sim_context.symbols
     skips = []
     adv_floor_paise = int(CAPITAL_POLICY['adv_floor_inr']) * 100
     participation = Fraction(str(CAPITAL_POLICY['participation_rate']))
 
     for idx_d, day in enumerate(all_dates):
         in_eval = day > ws_end
-        day_bars = stock_df[stock_df['trade_date'].astype(str) == day]
-        bar_map = {str(r['symbol']): r for _, r in day_bars.iterrows()}
+        bar_map = sim_context.bar_map_for_day(day)
 
         # 1. Apply point-in-time corporate action scaling on held positions on ex_date == day
         for act in corp_actions:
@@ -991,7 +1348,7 @@ def simulate_track_window(
                 continue
             band = bands_by_date_symbol.get((day, sym), {})
             circuit = str(band.get('circuit') or 'UNKNOWN').upper()
-            pit_ser = str(pit.get_pit_series(db, sym, day, as_of_date=day) or band.get('series') or 'UNKNOWN').upper()
+            pit_ser = str(sim_context.pit_series(db, sym, day) or band.get('series') or 'UNKNOWN').upper()
             pos = positions[sym]
             if circuit in ('LOWER', 'BOTH'):
                 pos['pending_exit'] = True
@@ -999,11 +1356,17 @@ def simulate_track_window(
                 continue
             raw_fill = float(sig.get('fill_override') or bar['open'])
             ref_paise = cap.price_paise(raw_fill)
-            adv = lagged_adv_paise(hist_by_symbol.get(sym), day)
+            adv = sim_context.lagged_adv(sym, day)
             fill_paise = ref_paise
-            if adv:
+            exit_slippage_rule = 'tiered_adv_slippage'
+            if adv and adv >= adv_floor_paise:
                 stressed = bool(stress_slippage or CAPITAL_POLICY.get('slippage_stress') is True or pit_ser in ('BE', 'BZ'))
                 fill_paise = slippage_fill_paise(ref_paise, pos['qty'] * ref_paise, adv, 'SELL', stress=stressed)['price_paise']
+            else:
+                # B1 (option (a)): ADV unknown or below the floor -> base-only fallback
+                # (base bps from capital_policy.json, no participation term, no stress).
+                fill_paise = base_only_slippage_paise(ref_paise, 'SELL')['price_paise']
+                exit_slippage_rule = 'base_only_fallback'
             gross_proceeds = pos['qty'] * fill_paise
             sell_fees = fill_charges_paise(gross_proceeds, 'SELL', overnight_dp=True)['total']
             net_proceeds = gross_proceeds - sell_fees
@@ -1018,7 +1381,8 @@ def simulate_track_window(
                 'exit_price': fill_paise / 100.0,
                 'reference_exit_price': raw_fill,
                 'side': pos.get('side'),
-                'exit_slippage_applied': bool(adv),
+                'exit_slippage_applied': True,
+                'exit_slippage_rule': exit_slippage_rule,
                 'net_pnl_paise': net_proceeds - entry_cost,
                 'reason': sig.get('reason', 'daily_exit'),
             })
@@ -1035,7 +1399,7 @@ def simulate_track_window(
                 continue
             band = bands_by_date_symbol.get((day, sym), {})
             circuit = str(band.get('circuit') or 'UNKNOWN').upper()
-            pit_ser = str(pit.get_pit_series(db, sym, day, as_of_date=day) or band.get('series') or 'UNKNOWN').upper()
+            pit_ser = str(sim_context.pit_series(db, sym, day) or band.get('series') or 'UNKNOWN').upper()
             if circuit in ('UPPER', 'BOTH'):
                 skips.append({'day': day, 'symbol': sym, 'cause': 'UPPER_CIRCUIT_BUY_BLOCK'})
                 continue
@@ -1045,10 +1409,22 @@ def simulate_track_window(
                 continue
             open_px = float(bar['open'])
             qty = cap.integer_shares(open_px, TARGET_NOTIONAL_INR)
+            # C109 only: use the candidate's ATR-based qty, capped at the
+            # frozen Rs 50,000 per-trade maximum at the fill price (the
+            # signal-day value cap used the entry close; a gap-up open
+            # must not breach the maximum). Every other strategy keeps
+            # the frozen fixed sizing above.
+            if s == 109 and sig.get('qty') is not None:
+                try:
+                    sig_qty = int(sig['qty'])
+                except (TypeError, ValueError):
+                    sig_qty = 0
+                if sig_qty >= 1:
+                    qty = min(sig_qty, qty)
             if qty < 1:
                 skips.append({'day': day, 'symbol': sym, 'cause': CAPITAL_POLICY['zero_share_cause']})
                 continue
-            adv = lagged_adv_paise(hist_by_symbol.get(sym), day)
+            adv = sim_context.lagged_adv(sym, day)
             if adv is None or adv < adv_floor_paise:
                 skips.append({'day': day, 'symbol': sym, 'cause': CAPITAL_POLICY['adv_filter_cause']})
                 continue
@@ -1086,14 +1462,14 @@ def simulate_track_window(
         locked_map = {}
         adv_map = {}
         for sym, pos in positions.items():
-            adv_map[sym] = lagged_adv_paise(hist_by_symbol.get(sym), day) or pos.get('adv_paise')
+            adv_map[sym] = sim_context.lagged_adv(sym, day) or pos.get('adv_paise')
             bar = bar_map.get(sym)
             if bar is not None:
                 cl = float(bar['close'])
                 pos['mark_price'] = cl
                 pos['high_water'] = max(pos['high_water'], cl)
             marks[sym] = pos['mark_price']
-            series_map[sym] = pit.get_pit_series(db, sym, day, as_of_date=day) or pos.get('series') or 'UNKNOWN'
+            series_map[sym] = sim_context.pit_series(db, sym, day) or pos.get('series') or 'UNKNOWN'
             locked_map[sym] = pos.get('locked_days', 0)
 
         # One liquidation-net basis (C-02/E5) for E_0 and for every end-of-day equity.
@@ -1129,27 +1505,58 @@ def simulate_track_window(
 
         # 3. Generate close-of-day t signals for next session open t+1 using strictly PIT data <= day
         pending_signals = []
-        pit_u = pit.get_pit_prefilter_universe(db, namespace, day, as_of_date=day, require_eq_series=True)
+        pit_u = sim_context.prefilter_universe(db, namespace, day)
         eligible_set = set(pit_u['eligible_symbols'])
         if not eligible_set and not pit_u['by_symbol']:
             # Archive PIT prefilter on the fly if not yet cached for this date
             pit.archive_daily_prefilter(db, namespace, day, stock_df, index_df, symbols=symbols, as_of_date=day)
-            pit_u = pit.get_pit_prefilter_universe(db, namespace, day, as_of_date=day, require_eq_series=True)
+            pit_u = sim_context.prefilter_universe(db, namespace, day)
             eligible_set = set(pit_u['eligible_symbols'])
 
         for sym in symbols:
             if sym not in eligible_set and sym not in positions:
                 continue
-            sym_hist = stock_df[(stock_df['symbol'] == sym) & (stock_df['trade_date'].astype(str) <= day)]
-            if sym_hist.empty or str(sym_hist.iloc[-1]['trade_date']) != day:
+            pos_idx = sim_context.day_row_index(sym, day)
+            if pos_idx < 0 or str(sim_context.sym_dates[sym][pos_idx]) != day:
                 continue
-            adj_hist = back_adjust_ohlc_pit(sym_hist, corp_actions, as_of_date=day)
-            ind_df = evaluate_parameterized_strategy(s, adj_hist, validated_params)
-            last_row = ind_df.iloc[-1]
-            if sym in positions and bool(last_row.get('exit_condition', False)):
+            sig_arrays = sim_context.signal_arrays(s, validated_params, signal_evaluator, sym, all_dates[-1])
+            if sig_arrays is not None:
+                entry_arr, exit_arr, qty_arr, _dates = sig_arrays
+                entry = bool(entry_arr[pos_idx]) if entry_arr is not None else False
+                exit_ = bool(exit_arr[pos_idx]) if exit_arr is not None else False
+                qty_val = qty_arr[pos_idx] if qty_arr is not None else 0
+            else:
+                # Symbol with a scaled corporate action inside the run:
+                # keep the per-day computation (exact, as before).
+                sym_hist = sim_context.hist_view(sym, day)
+                if sym_hist is None or sym_hist.empty:
+                    continue
+                adj_hist = back_adjust_ohlc_pit(sym_hist, corp_actions, as_of_date=day)
+                if signal_evaluator is not None:
+                    ind_df = signal_evaluator(s, adj_hist)
+                else:
+                    ind_df = evaluate_parameterized_strategy(s, adj_hist, validated_params)
+                last_row = ind_df.iloc[-1]
+                entry = bool(last_row.get('entry_condition', False))
+                exit_ = bool(last_row.get('exit_condition', False))
+                qty_val = last_row.get('qty', 0)
+            if sym in positions and exit_:
                 pending_signals.append({'symbol': sym, 'side': 'SELL', 'signal_date': day, 'reason': 'daily_exit'})
-            elif sym not in positions and sym in eligible_set and bool(last_row.get('entry_condition', False)):
-                pending_signals.append({'symbol': sym, 'side': 'BUY', 'signal_date': day, 'reason': 'daily_entry'})
+            elif sym not in positions and sym in eligible_set and entry:
+                sig = {'symbol': sym, 'side': 'BUY', 'signal_date': day, 'reason': 'daily_entry'}
+                # C109 only: ATR-based sizing. The candidate's signals frame
+                # carries a 'qty' column (shares for this entry bar, 0 = no
+                # entry). No other strategy or candidate produces that
+                # column, so this branch is inert for strategies 1-7 and
+                # candidates 101-108, which keep the frozen fixed sizing.
+                if s == 109:
+                    try:
+                        q = int(qty_val)
+                    except (TypeError, ValueError):
+                        q = 0
+                    if q >= 1:
+                        sig['qty'] = q
+                pending_signals.append(sig)
 
     return {
         'strategy': s,

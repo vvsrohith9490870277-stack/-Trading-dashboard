@@ -404,10 +404,19 @@ class Supervisor:
     def _job_runner(self, job):
         """The runner run_job uses for a job: engine.py <command> as a
         child with the memory guard (run_job_streaming). Shared by the
-        scheduler and the one-shot run (Task 2)."""
+        scheduler and the one-shot run (Task 2). A job may carry its own
+        per-job limits in the schedule (timeout_s / rss_cap_mb); they
+        apply to that job only -- jobs without them keep the defaults
+        (timeout 1800 s, cap from RENDER_JOB_RSS_CAP_MB, default 350 MB).
+        The adaptive_eod job sets both (measured 244 s, daily tree peak
+        ~401 MB; cap 407 MB = 512 MB container less the ~105 MB
+        supervisor, so the container cannot OOM from this job)."""
         def runner(name):
             cmd = [sys.executable, 'engine.py', job['command']]
-            return run_job_streaming(cmd, self._child_env(), timeout=1800)
+            timeout = job.get('timeout_s') or 1800
+            rss_cap = job.get('rss_cap_mb')
+            return run_job_streaming(cmd, self._child_env(),
+                                     timeout=timeout, rss_cap_mb=rss_cap)
         return runner
 
     def _run_job_sync(self, job, now=None):

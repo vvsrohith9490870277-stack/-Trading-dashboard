@@ -12,5 +12,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY package.json package-lock.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 COPY automation/paper-trading/ ./automation/paper-trading/
+# Adaptive EOD (live/adaptive_runner.py + candidate shadow): the daily
+# adaptive run is a Render schedule job, so its code must be in the image.
+# live/ is copied whole (runner, shadow, config, tests); the service only
+# executes it via the engine.py adaptive-eod command.
+COPY live/ ./live/
 WORKDIR /app/automation/paper-trading
 CMD ["python", "render_app.py"]

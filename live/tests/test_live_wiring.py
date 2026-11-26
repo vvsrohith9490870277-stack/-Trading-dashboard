@@ -463,6 +463,128 @@ class EodReportDirPassthrough(unittest.TestCase):
                             'no file under /workspace/reports/adaptive may be newer than the test start')
 
 
+class ShadowStepInEod(unittest.TestCase):
+    """The eod phase runs the registry-candidate shadow step (with the Turso
+    mirror) only after a SIMULATED daily step; a shadow failure is recorded
+    but never flips the eod status."""
+
+    def _run_eod(self, daily_report, shadow=None):
+        import adaptive_runner as ar
+        import types
+        from unittest import mock
+        day = '2026-11-11'
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(list(argv))
+            if 'adaptive_daily.py' in argv[1]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(daily_report) + '\n', stderr='')
+            if 'candidate_shadow.py' in argv[1]:
+                if shadow is None:
+                    raise AssertionError('shadow step must not run')
+                return subprocess.CompletedProcess(argv, shadow.get('returncode', 0),
+                                                  stdout=shadow.get('stdout', ''),
+                                                  stderr=shadow.get('stderr', ''))
+            raise AssertionError('unexpected subprocess: %r' % (argv,))
+
+        class FakeRO:
+            def query(self, sql, args=()):
+                if 'paper_eod' in sql:
+                    return [{'report_json': json.dumps({'ledger_reconciled': True})}]
+                return []
+            def many(self, qs):
+                return [[{'n': 0}] for _ in qs]
+
+        with tempfile.TemporaryDirectory() as t:
+            reports = Path(t) / 'reports'
+            state = Path(t) / 'state'
+            old_state, old_env = ar.STATE, os.environ.get('ADAPTIVE_REPORT_DIR')
+            os.environ['ADAPTIVE_REPORT_DIR'] = str(reports)
+            ar.STATE = state
+            stub = types.ModuleType('market_snapshot')
+            stub.refresh = lambda ro: {'stubbed': True}
+            old_ms = sys.modules.get('market_snapshot')
+            sys.modules['market_snapshot'] = stub
+            old_runnable = ar.ag.assert_runnable
+            ar.ag.assert_runnable = lambda **kw: True
+            old_counts = ar.protected_counts
+            ar.protected_counts = lambda ro: {}
+            old_ns = ar.get_track_a_namespace
+            ar.get_track_a_namespace = lambda: 'paper_v1'
+            try:
+                with mock.patch('subprocess.run', side_effect=fake_run):
+                    out = ar.eod(day, no_wait=True, ro=FakeRO())
+            finally:
+                ar.STATE = old_state
+                ar.ag.assert_runnable = old_runnable
+                ar.protected_counts = old_counts
+                ar.get_track_a_namespace = old_ns
+                if old_ms is None:
+                    sys.modules.pop('market_snapshot', None)
+                else:
+                    sys.modules['market_snapshot'] = old_ms
+                if old_env is None:
+                    os.environ.pop('ADAPTIVE_REPORT_DIR', None)
+                else:
+                    os.environ['ADAPTIVE_REPORT_DIR'] = old_env
+        return out, calls
+
+    def test_shadow_runs_after_simulated_daily(self):
+        shadow_summary = {'session_day': '2026-11-11', 'namespace': 'adaptive_v1', 'mode': 'shadow',
+                          'turso_mirrored': True, 'results': {'102': {'status': 'SHADOW_SIMULATED'}}}
+        out, calls = self._run_eod({'session_day': '2026-11-11', 'simulation_status': 'SIMULATED'},
+                                   shadow={'stdout': json.dumps(shadow_summary) + '\n'})
+        self.assertEqual(out['status'], 'OK')
+        self.assertEqual(len(calls), 2)
+        shadow_argv = calls[1]
+        self.assertIn('candidate_shadow.py', shadow_argv[1])
+        self.assertIn('--turso', shadow_argv)
+        self.assertIn('--market-sqlite', shadow_argv)
+        self.assertIn('--session', shadow_argv)
+        self.assertEqual(shadow_argv[shadow_argv.index('--session') + 1], '2026-11-11')
+        self.assertTrue(shadow_argv[shadow_argv.index('--db') + 1].endswith('adaptive.sqlite'))
+        self.assertEqual(out['shadow']['status'], 'OK')
+        self.assertTrue(out['shadow']['turso_mirrored'])
+        self.assertEqual(out['shadow']['strategies'], {'102': 'SHADOW_SIMULATED'})
+
+    def test_shadow_skipped_when_daily_blocked(self):
+        out, calls = self._run_eod({'session_day': '2026-11-11', 'simulation_status': 'BLOCKED_STALE_INPUT'},
+                                   shadow=None)
+        self.assertEqual(out['status'], 'OK')
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(out['shadow']['status'], 'SKIPPED')
+        self.assertEqual(out['shadow']['reason'], 'daily_not_simulated')
+
+    def test_shadow_failure_does_not_flip_eod_status(self):
+        out, calls = self._run_eod({'session_day': '2026-11-11', 'simulation_status': 'SIMULATED'},
+                                   shadow={'returncode': 1, 'stdout': '', 'stderr': 'boom\nline2\n'})
+        self.assertEqual(out['status'], 'OK')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(out['shadow']['status'], 'FAILED')
+        self.assertEqual(out['shadow']['exit_code'], 1)
+        self.assertIn('boom', ' '.join(out['shadow']['stderr_tail']))
+
+    def test_shadow_child_env_has_no_credentials(self):
+        import adaptive_runner as ar
+        old = {k: os.environ.get(k) for k in ('TURSO_AUTH_TOKEN', 'FYERS_ACCESS_TOKEN', 'PAPER_ENV_FILE')}
+        os.environ['TURSO_AUTH_TOKEN'] = 'x'
+        os.environ['FYERS_ACCESS_TOKEN'] = 'y'
+        os.environ['PAPER_ENV_FILE'] = '/tmp/env-file'
+        try:
+            env = ar.shadow_child_env()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertEqual(ag.credential_like_keys(env), [])
+        self.assertEqual(env['TZ'], 'Asia/Kolkata')
+        # Only a file PATH crosses into the child (db.mjs reads the secrets
+        # from that file itself); no credential value does.
+        self.assertEqual(env.get('PAPER_ENV_FILE'), '/tmp/env-file')
+
+
 class BackfillRetryPassthrough(unittest.TestCase):
     """R9: run_adaptive.sh backfill can pass --retry-missing through the runner."""
     def test_parser_accepts_retry_missing(self):

@@ -18,7 +18,8 @@ DEFAULT_CATCH_UP_MINUTES = 30
 def load_schedule(path=SCHEDULE_PATH, mode='live'):
     """Load the schedule. Only enabled jobs are returned. In trial mode the
     jobs under modes.trial replace the live jobs (same day shape, trial
-    namespace). The adaptive job is not scheduled on Render at all."""
+    namespace). The adaptive job (adaptive_eod, 17:00) runs in live mode
+    only; it is disabled in trial mode."""
     data = json.loads(Path(path).read_text())
     jobs = data.get('jobs', [])
     if mode == 'trial':
