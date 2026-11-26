@@ -118,6 +118,37 @@ class CandidateShadowTests(unittest.TestCase):
             self.assertTrue(r['simulated'])
             self.assertGreater(r['eval_days'], 0)
 
+    def test_sim_context_signal_precompute_matches_per_day_evaluator(self):
+        # The optimiser's per-symbol signal precompute must agree with the
+        # old per-day evaluator call for every (candidate, symbol, day):
+        # each candidate's signals are causal, so the row for day D in the
+        # full-history frame equals the last row of a frame truncated at D.
+        # 102 is a single-symbol walk; 105 is a cross-sectional rank (its
+        # evaluator already precomputes on the full panel).
+        import adaptive_candidates as ac
+        import adaptive_engine as ae
+        for s in (102, 105):
+            evaluator = cs.make_evaluator(s, self.df)
+            ctx = ae._SimContext(self.df, self.idx)
+            params = dict(ac.CANDIDATE_STRATEGIES[s]['params'])
+            max_day = self.days[-1]
+            for sym in sorted(self.df['symbol'].astype(str).unique()):
+                arrays = ctx.signal_arrays(s, params, evaluator, sym, max_day)
+                self.assertIsNotNone(arrays, f'no precompute for {s} {sym}')
+                entry_arr, exit_arr, _qty_arr, _dates = arrays
+                for day in self.days[::20]:
+                    sym_hist = self.df[(self.df['symbol'] == sym)
+                                       & (self.df['trade_date'].astype(str) <= day)]
+                    if sym_hist.empty or str(sym_hist.iloc[-1]['trade_date']) != day:
+                        continue
+                    adj = ae.back_adjust_ohlc_pit(sym_hist, [], as_of_date=day)
+                    last = evaluator(s, adj).iloc[-1]
+                    pos = ctx.day_row_index(sym, day)
+                    self.assertEqual(bool(entry_arr[pos]), bool(last.get('entry_condition', False)),
+                                     f'entry mismatch s={s} {sym} {day}')
+                    self.assertEqual(bool(exit_arr[pos]), bool(last.get('exit_condition', False)),
+                                     f'exit mismatch s={s} {sym} {day}')
+
     def test_c109_sim_uses_atr_qty_not_fixed_qty(self):
         # End-to-end proof the simulator honours C109's ATR sizing: a
         # volatile single-symbol market (range +/-10 around a ~100 close,
@@ -262,6 +293,37 @@ class UniverseSectorMapTests(unittest.TestCase):
         adj = ac._sector_adjusted_frame(closes, smap)
         self.assertAlmostEqual(adj.loc['2025-01-01', star], 0.5195, places=3)
 
+
+    def test_universe_panels_cached_and_identical(self):
+        # Panel cache: the pivot + rank frames for 101/105/106 are built
+        # once per universe frame (not once per symbol) and the cached
+        # values equal a fresh direct computation.
+        import adaptive_candidates as ac
+        import numpy as np
+        uni, smap, star = _real_sector_universe()
+        frame = cs.with_sector_column(uni, smap)
+        c1 = ac._universe_closes(frame)
+        c2 = ac._universe_closes(frame)
+        self.assertIs(c1, c2)
+        fresh = frame.copy().pivot(index='trade_date', columns='symbol', values='close').sort_index()
+        self.assertTrue(c1.equals(fresh))
+        r1 = ac._derived_rs_rank(frame)
+        self.assertIs(r1, ac._derived_rs_rank(frame))
+        ret252 = fresh / fresh.shift(252) - 1.0
+        self.assertTrue(r1.equals(ret252.rank(axis=1, ascending=True, pct=True, method='min') * 100.0))
+        rank1, n1 = ac._rank_frame(c1)
+        rank2, n2 = ac._rank_frame(c1)
+        self.assertIs(rank1, rank2)
+        self.assertIs(n1, n2)
+        adj1 = ac._sector_adjusted_frame(c1, smap)
+        self.assertIs(adj1, ac._sector_adjusted_frame(c1, smap))
+        # Candidate signals are identical on repeat calls with the same universe.
+        sdf = frame[frame['symbol'] == star].reset_index(drop=True)
+        for s in (101, 105, 106):
+            a = ac.candidate_signals(s, sdf, universe=frame, sector_map=smap)
+            b = ac.candidate_signals(s, sdf, universe=frame, sector_map=smap)
+            self.assertTrue(a['entry_condition'].equals(b['entry_condition']), s)
+            self.assertTrue(a['exit_condition'].equals(b['exit_condition']), s)
 
     def test_run_shadow_passes_sector_map_to_c106(self):
         # End-to-end: the live shadow flow passes the sector map through

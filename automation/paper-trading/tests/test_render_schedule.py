@@ -46,6 +46,22 @@ class ScheduleTests(unittest.TestCase):
         self.assertNotIn('adaptive', names)
         self.assertIn('adaptive_eod', names)
 
+    def test_adaptive_eod_per_job_limits_only(self):
+        # Per-job limits (optimised sim, measured 244 s full job, daily
+        # tree peak ~401 MB): adaptive_eod carries timeout_s=1200 and
+        # rss_cap_mb=407 (= 512 MB container less the ~105 MB
+        # supervisor). No other live job carries per-job limits -- they
+        # keep the defaults (timeout 1800 s, cap from
+        # RENDER_JOB_RSS_CAP_MB, default 350 MB).
+        sched = rsch.load_schedule()
+        by_name = {j['name']: j for j in sched['jobs']}
+        self.assertEqual(by_name['adaptive_eod']['timeout_s'], 1200)
+        self.assertEqual(by_name['adaptive_eod']['rss_cap_mb'], 407)
+        for name, job in by_name.items():
+            if name != 'adaptive_eod':
+                self.assertNotIn('timeout_s', job, name)
+                self.assertNotIn('rss_cap_mb', job, name)
+
     def test_times_are_ist(self):
         # 08:15 IST is 02:45 UTC. The same instant given in UTC must agree.
         # At 08:15 both preflight (08:15) and record_outages (08:00 slot,

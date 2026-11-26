@@ -87,6 +87,48 @@ import numpy as np
 import pandas as pd
 
 # ---------------------------------------------------------------------------
+# Universe-panel cache (optimisation; the values are identical, computed once)
+# ---------------------------------------------------------------------------
+# Candidates 101/105/106 need whole-universe panels: the pivoted close
+# frame and its rank frames. The naive path recomputes a pivot + rank over
+# the full ~400k-row frame once per symbol (~900x per candidate) -- most of
+# the shadow sim's 33 minutes. The panels depend only on the universe frame
+# (and, for C106, the sector map), so they are computed once per distinct
+# universe and reused. Single-entry cache, keyed by frame identity plus a
+# cheap fingerprint (length, first/last date, close sum), holding a strong
+# reference to the frame, so an in-place mutation or an id reuse can never
+# serve a stale panel. _MISSING marks a panel not computed yet (distinct
+# from a computed None, e.g. a too-short frame).
+_MISSING = object()
+_PANEL_CACHE = {}
+
+
+def _universe_fingerprint(universe):
+    try:
+        return (len(universe),
+                str(universe['trade_date'].iloc[0]),
+                str(universe['trade_date'].iloc[-1]),
+                float(universe['close'].sum()))
+    except Exception:
+        return (len(universe),)
+
+
+def _panel_entry(universe):
+    """Cache entry for one universe frame (creates it on first sight)."""
+    ent = _PANEL_CACHE.get('entry')
+    fp = _universe_fingerprint(universe)
+    if ent is not None and ent['universe'] is universe and ent['fingerprint'] == fp:
+        return ent
+    ent = {'universe': universe, 'fingerprint': fp,
+           'closes': _MISSING, 'rs_rank': _MISSING,
+           'rank105': _MISSING, 'n105': _MISSING,
+           'sector_map': _MISSING, 'sector_map_obj': None,
+           'sector_adj': _MISSING, 'sector_adj_closes': None, 'sector_adj_map': None,
+           'sector_adj_rank': _MISSING, 'sector_adj_rank_adj': None}
+    _PANEL_CACHE['entry'] = ent
+    return ent
+
+# ---------------------------------------------------------------------------
 # Indicator helpers (mirror the frozen constructions, never edit them)
 # ---------------------------------------------------------------------------
 
@@ -192,11 +234,15 @@ def _derived_rs_rank(universe):
     at a date uses only closes up to that date."""
     if universe is None:
         return None
-    closes = _universe_closes(universe)
-    if closes is None or len(closes) < 253:
-        return None
-    ret252 = closes / closes.shift(252) - 1.0
-    return ret252.rank(axis=1, ascending=True, pct=True, method='min') * 100.0
+    ent = _panel_entry(universe)
+    if ent['rs_rank'] is _MISSING:
+        closes = _universe_closes(universe)
+        if closes is None or len(closes) < 253:
+            ent['rs_rank'] = None
+        else:
+            ret252 = closes / closes.shift(252) - 1.0
+            ent['rs_rank'] = ret252.rank(axis=1, ascending=True, pct=True, method='min') * 100.0
+    return ent['rs_rank']
 
 
 # ---------------------------------------------------------------------------
@@ -341,21 +387,32 @@ def _c104_exits(df):
 
 def _universe_closes(universe):
     """Pivot a multi-symbol bars frame (symbol/trade_date/close) to
-    close[trade_date, symbol]. The frame must be sorted by trade_date."""
+    close[trade_date, symbol]. The frame must be sorted by trade_date.
+    Cached per universe frame (see the panel cache above): the pivot is
+    the same for every symbol, so it is built once, not once per symbol."""
     if universe is None:
         return None
-    u = universe.copy()
-    return u.pivot(index='trade_date', columns='symbol', values='close').sort_index()
+    ent = _panel_entry(universe)
+    if ent['closes'] is _MISSING:
+        u = universe.copy()
+        ent['closes'] = u.pivot(index='trade_date', columns='symbol', values='close').sort_index()
+    return ent['closes']
 
 
 def _rank_frame(closes):
     """12-1 return rank per day: return over sessions -252..-21 (skip the
-    most recent 21 sessions). Returns (rank, n) frames; rank 1 = best."""
+    most recent 21 sessions). Returns (rank, n) frames; rank 1 = best.
+    Cached per closes frame (see the panel cache above)."""
     if closes is None or len(closes) < 253:
         return None, None
+    ent = _PANEL_CACHE.get('entry')
+    if ent is not None and ent['closes'] is closes and ent['rank105'] is not _MISSING:
+        return ent['rank105'], ent['n105']
     ret = closes.shift(21) / closes.shift(252) - 1.0
     rank = ret.rank(axis=1, ascending=False, method='min')
     n = ret.notna().sum(axis=1)
+    if ent is not None and ent['closes'] is closes:
+        ent['rank105'], ent['n105'] = rank, n
     return rank, n
 
 
@@ -429,7 +486,7 @@ def _c105_exits(df, universe=None, entry_dates=None):
 # C106 — Sector-adjusted 12-1 momentum, top 30 (Ceta Research, India)
 # ---------------------------------------------------------------------------
 
-def _sector_map_from_universe(universe, sector_map=None):
+def _sector_map_from_universe_uncached(universe, sector_map=None):
     """Symbol -> sector map for C106. An explicit sector_map wins; else a
     'sector' (or 'industry') column on the universe frame is used (first
     value per symbol); else None (C106 then enters nothing)."""
@@ -453,7 +510,22 @@ def _sector_map_from_universe(universe, sector_map=None):
     return out or None
 
 
-def _sector_adjusted_frame(closes, sector_map):
+def _sector_map_from_universe(universe, sector_map=None):
+    """Symbol -> sector map for C106 (same contract as the uncached
+    version). The derived map (from the universe frame's sector column,
+    a full-frame groupby) is cached per universe frame; an explicit
+    sector_map is a cheap normalisation and is computed fresh."""
+    if sector_map:
+        return {str(k): str(v) for k, v in dict(sector_map).items()}
+    if universe is None:
+        return None
+    ent = _panel_entry(universe)
+    if ent['sector_map'] is _MISSING:
+        ent['sector_map'] = _sector_map_from_universe_uncached(universe, None)
+    return ent['sector_map']
+
+
+def _sector_adjusted_frame_uncached(closes, sector_map):
     """12-1 return minus the stock's sector average 12-1 return, per day.
     Same 12-1 window as C105 (sessions -252..-21). A sector's average is
     the mean over its members with a computable return that day; a stock
@@ -472,6 +544,42 @@ def _sector_adjusted_frame(closes, sector_map):
         for sym in syms:
             adj[sym] = ret[sym] - mean
     return adj
+
+
+def _sector_adjusted_frame(closes, sector_map):
+    """Sector-adjusted 12-1 return frame (same contract as the uncached
+    version). Cached per (closes frame, sector map) -- the frame is the
+    same for every symbol, so it is built once, not once per symbol."""
+    if closes is None or len(closes) < 253 or not sector_map:
+        return None
+    ent = _PANEL_CACHE.get('entry')
+    if (ent is not None and ent['sector_adj'] is not _MISSING
+            and ent['sector_adj_closes'] is closes and ent['sector_adj_map'] is sector_map):
+        return ent['sector_adj']
+    adj = _sector_adjusted_frame_uncached(closes, sector_map)
+    if ent is not None and ent['closes'] is closes:
+        ent['sector_adj'] = adj
+        ent['sector_adj_closes'] = closes
+        ent['sector_adj_map'] = sector_map
+    return adj
+
+
+def _sector_adj_rank(closes, sector_map):
+    """Rank of the sector-adjusted frame (rank 1 = best), cached per
+    (closes frame, sector map). _c106_walk ranks the same frame once per
+    symbol; this builds it once."""
+    adj = _sector_adjusted_frame(closes, sector_map)
+    if adj is None:
+        return None
+    ent = _PANEL_CACHE.get('entry')
+    if (ent is not None and ent['sector_adj_rank'] is not _MISSING
+            and ent['sector_adj_rank_adj'] is adj):
+        return ent['sector_adj_rank']
+    rank = adj.rank(axis=1, ascending=False, method='min')
+    if ent is not None and ent['sector_adj'] is adj:
+        ent['sector_adj_rank'] = rank
+        ent['sector_adj_rank_adj'] = adj
+    return rank
 
 
 def _c106_walk(df, universe=None, sector_map=None):
@@ -499,7 +607,7 @@ def _c106_walk(df, universe=None, sector_map=None):
     adj = _sector_adjusted_frame(closes, smap)
     if adj is None or sym not in adj.columns:
         return entry, exit_cond
-    rank = adj.rank(axis=1, ascending=False, method='min')
+    rank = _sector_adj_rank(closes, smap)
     r = rank[sym].reindex(dates)
     top = (r <= 30)
     holding = False

@@ -110,6 +110,88 @@ class CircuitIngest(unittest.TestCase):
         self.assertEqual(no_prev[('2026-11-06', 'LOCKUP-EQ')]['circuit'], 'UNKNOWN')
         self.assertEqual(no_prev[('2026-11-06', 'LOCKUP-EQ')]['reason'], 'no_previous_close')
 
+    def test_archive_only_key_and_shared_unknown_instances(self):
+        # Archive-only key (official file, no bar): same band logic with no
+        # OHLC -- static band + a previous close from an earlier bar gives
+        # a KNOWN NONE band (infer_circuit with no range hits NONE).
+        db = MemDB()
+        cb.init(db)
+        cb.ingest_file(db, FIXTURE, recorded_at='2026-11-06T19:00:00+05:30')
+        stock = _stock()
+        # Drop every 11-06 bar for LOCKUP-EQ: its archive row stays, its bar goes.
+        stock = stock[~((stock['trade_date'] == '2026-11-06') & (stock['symbol'] == 'LOCKUP-EQ'))]
+        bands = cb.build_bands_by_date_symbol(db, stock, ['2026-11-05', '2026-11-06'], as_of='2026-11-06')
+        only = bands[('2026-11-06', 'LOCKUP-EQ')]
+        self.assertTrue(only['known'])
+        self.assertEqual(only['circuit'], 'NONE')
+        self.assertEqual(only['upper'], 105.0)
+        # Unknown bands share one frozen instance per (series, reason):
+        # the full map holds one entry per bar, so sharing is what keeps
+        # the map small. A mutation must fail loudly, not corrupt the map.
+        a = bands[('2026-11-06', 'NOFILE-EQ')]
+        b = bands[('2026-11-05', 'NOFILE-EQ')]
+        self.assertIs(a, b)
+        self.assertEqual(a['circuit'], 'UNKNOWN')
+        self.assertEqual(a['reason'], 'no_official_sec_list')
+        with self.assertRaises(TypeError):
+            a['circuit'] = 'UPPER'
+
+    def test_build_bands_matches_reference_on_random_frame(self):
+        # Streaming build must agree with the straightforward per-key
+        # reference logic on a random frame (covers prev-close tracking,
+        # archive-only keys and the as_of filter).
+        import random
+        rng = random.Random(7)
+        db = MemDB()
+        cb.init(db)
+        cb.ingest_file(db, FIXTURE, recorded_at='2026-11-06T19:00:00+05:30')
+        syms = ['LOCKUP-EQ', 'LOCKDN-EQ', 'FREE-EQ', 'FNO-EQ', 'BAJAJ-AUTO-EQ', 'HFCL-BE', 'NOFILE-EQ', 'EXTRA-EQ']
+        rows = []
+        for sym in syms:
+            px = 100.0
+            for d in ('2026-11-04', '2026-11-05', '2026-11-06'):
+                px = round(px * (1 + rng.uniform(-0.03, 0.03)), 2)
+                rows.append(dict(symbol=sym, trade_date=d, open=px, high=round(px * 1.01, 2),
+                                 low=round(px * 0.99, 2), close=px, volume=1000))
+        stock = pd.DataFrame(rows)
+        got = cb.build_bands_by_date_symbol(db, stock, ['2026-11-05', '2026-11-06'], as_of='2026-11-06')
+        # Reference: previous close per (date, symbol) from the frame, then
+        # the same per-key rules as the old implementation.
+        prev = {}
+        for sym, g in stock.groupby('symbol'):
+            last = None
+            for _, r in g.sort_values('trade_date').iterrows():
+                if last is not None:
+                    prev[(str(r['trade_date']), sym)] = last
+                last = float(r['close'])
+        archive = {}
+        for d in ('2026-11-05', '2026-11-06'):
+            for row in cb.get_bands_for_session(db, d, as_of_date='2026-11-06'):
+                archive[(d, row['symbol'])] = row
+        bars = {(str(r['trade_date']), str(r['symbol'])): r for _, r in stock.iterrows()}
+        for key in set(bars) | set(archive):
+            d, sym = key
+            if d > '2026-11-06':
+                continue
+            row = archive.get(key)
+            bar = bars.get(key)
+            if bar is None:
+                bar = {}
+            if row is None:
+                want = cb.unknown_band(reason='no_official_sec_list')
+            elif not row.get('static_band') or row.get('band_pct') in (None, ''):
+                want = cb.unknown_band(series=row.get('series'), reason='no_static_band')
+            else:
+                inf = cb.infer_circuit(row['band_pct'], prev.get(key),
+                                       high=bar.get('high'), low=bar.get('low'), close=bar.get('close'))
+                if inf is None:
+                    want = cb.unknown_band(series=row.get('series'), reason='no_previous_close')
+                else:
+                    want = {'series': row.get('series'), 'circuit': inf['circuit'], 'known': True,
+                            'reason': 'official_sec_list', 'upper': inf['upper'], 'lower': inf['lower'],
+                            'band_pct': inf['band_pct'], 'source': row.get('source')}
+            self.assertEqual(dict(got[key]), want, key)
+
     def test_simulator_lock_never_invents_unknown(self):
         self.assertTrue(cb.simulator_lock('UPPER')['block_buy'])
         self.assertFalse(cb.simulator_lock('UPPER')['lock_sell'])

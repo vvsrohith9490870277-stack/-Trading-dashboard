@@ -42,6 +42,7 @@ for p in (str(HERE), str(LIB)):
 
 import adaptive_candidates as ac
 import adaptive_engine as ae
+import market_frame as mf  # chunked bars loader (no read_sql fetchall arenas)
 
 # Sector source for C106 (Grok's decision, 2026-11-22): the Industry column
 # of automation/paper-trading/universe.csv, which covers all 692 stocks.
@@ -124,20 +125,21 @@ def make_evaluator(strategy, stock_df, sector_map=None):
     'industry' column on the panel); without one it enters nothing."""
     s = int(strategy)
     if s in (101, 105, 106):
-        # Precompute 101/105/106 signals once on the full panel (each rank at a
-        # date uses only closes up to that date, so this is PIT-safe).
-        # Corp-action back-adjustment is not applied to the rank panel; the
-        # simulator's adj_hist is used only for the fill prices.
-        precomputed = {}
-        for sym, sdf in stock_df.groupby('symbol'):
-            precomputed[str(sym)] = ac.candidate_signals(s, sdf.reset_index(drop=True), universe=stock_df,
-                                                          sector_map=sector_map)
-
+        # Lazily compute 101/105/106 signals per symbol on first use
+        # (each rank at a date uses only closes up to that date, so this
+        # is PIT-safe -- _rank_frame shifts 21/252 sessions back and the
+        # walks are stateful over the symbol's own bars in order, so the
+        # row for day D is the same whether the frame is the full history
+        # or truncated at D). The old code precomputed all 905 symbols up
+        # front (~65 MB and minutes per candidate); only the eligible
+        # symbols are ever read, so on-demand is identical and far
+        # cheaper. The panel cache in adaptive_candidates makes the
+        # per-symbol rank cheap. Corp-action back-adjustment is not
+        # applied to the rank panel; the simulator's adj_hist is used
+        # only for the fill prices.
         def evaluator(_s, adj_hist):
-            sym = str(adj_hist['symbol'].iloc[0])
-            frame = precomputed[sym]
-            day = str(adj_hist['trade_date'].iloc[-1])
-            return frame[frame['trade_date'].astype(str) <= day]
+            return ac.candidate_signals(s, adj_hist, universe=stock_df,
+                                        sector_map=sector_map)
     else:
         def evaluator(_s, adj_hist):
             return ac.candidate_signals(s, adj_hist)
@@ -174,6 +176,12 @@ def run_shadow(db, namespace, stock_df, index_df, warm_start_dates, eval_dates,
         init(turso_db)
     strategies = sorted(strategies) if strategies else sorted(ac.CANDIDATE_STRATEGIES)
     out = {}
+    # One shared _SimContext for all 9 shadow sims in this run: the frame
+    # scans, lagged ADV, PIT lookups and candidate signals are computed
+    # once instead of once per sim (identical results; see
+    # test_sim_context and the candidate precompute test in
+    # test_candidate_shadow).
+    sim_ctx = ae._SimContext(stock_df, index_df)
     for s in strategies:
         c = ac.CANDIDATE_STRATEGIES[int(s)]
         ws = int(c['warm_start_days'])
@@ -181,7 +189,7 @@ def run_shadow(db, namespace, stock_df, index_df, warm_start_dates, eval_dates,
         ev_dates = [str(d) for d in eval_dates]
         evaluator = make_evaluator(s, stock_df, sector_map=sector_map)
         res = ae.simulate_track_window(db, namespace, s, dict(c['params']), stock_df, index_df,
-                                       ws_dates, ev_dates, signal_evaluator=evaluator)
+                                       ws_dates, ev_dates, signal_evaluator=evaluator, sim_context=sim_ctx)
         stamp = _utc_now()
         day = session_day or (ev_dates[-1] if ev_dates else ws_dates[-1])
         daily_stmts = [(
@@ -213,10 +221,9 @@ def load_market_sqlite(path, session_day):
     import pandas as pd
     c = sqlite3.connect(str(path))
     try:
-        stock_df = pd.read_sql(
-            'SELECT symbol,trade_date,open,high,low,close,volume FROM daily_ohlcv '
-            'WHERE trade_date<=? ORDER BY symbol,trade_date',
-            c, params=(str(session_day)[:10],))
+        # Chunked loader, not pd.read_sql: read_sql's fetchall transient
+        # retains ~140 MB of allocator arenas on a 403k-row snapshot.
+        stock_df = mf.load_stock_frame(c, session_day)
     finally:
         c.close()
     idx = stock_df[stock_df['symbol'] == 'NIFTY500']

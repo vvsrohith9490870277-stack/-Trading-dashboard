@@ -1185,10 +1185,14 @@ def adaptive_eod_cli(session_day=None):
     """
     day = session_day or now().date().isoformat()
     runner = ROOT.parent / 'live' / 'adaptive_runner.py'
+    # Inner timeout 1140 s: 60 s under the schedule's timeout_s (1200 s)
+    # for adaptive_eod, so a hung runner fails gracefully here (status
+    # FAILED / adaptive_eod_timeout) instead of being killed by the
+    # supervisor's outer timeout. Measured full job is ~244 s.
     try:
         p = subprocess.run([sys.executable, str(runner), 'eod',
                             '--session', day],
-                           capture_output=True, text=True, timeout=1700)
+                           capture_output=True, text=True, timeout=1140)
     except subprocess.TimeoutExpired:
         return ({'phase': 'eod', 'session_day': day, 'status': 'FAILED',
                  'error': 'adaptive_eod_timeout'}, 1)

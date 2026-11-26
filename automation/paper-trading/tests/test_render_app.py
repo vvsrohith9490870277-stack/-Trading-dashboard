@@ -985,6 +985,41 @@ class JobGuardTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_job_runner_applies_per_job_limits(self):
+        # _job_runner passes a job's own timeout_s / rss_cap_mb through
+        # to run_job_streaming (adaptive_eod only); a job without them
+        # keeps the defaults (timeout 1800, rss_cap_mb None so the
+        # global RENDER_JOB_RSS_CAP_MB applies inside run_job_streaming).
+        import render_app as ra
+        sup = ra.Supervisor.__new__(ra.Supervisor)
+        sup.mode = 'live'
+        sup.owner_id = 'test'
+        seen = {}
+
+        def fake_streaming(cmd, env, timeout=1800, rss_cap_mb=None):
+            seen['cmd'] = cmd
+            seen['timeout'] = timeout
+            seen['rss_cap_mb'] = rss_cap_mb
+            return {'exit_code': 0, 'stdout_tail': '', 'stderr_tail': ''}
+
+        orig = ra.run_job_streaming
+        ra.run_job_streaming = fake_streaming
+        try:
+            sup._job_runner({'name': 'adaptive_eod',
+                             'command': 'adaptive-eod',
+                             'timeout_s': 1200,
+                             'rss_cap_mb': 407})('adaptive_eod')
+            self.assertEqual(seen['cmd'][-1], 'adaptive-eod')
+            self.assertEqual(seen['timeout'], 1200)
+            self.assertEqual(seen['rss_cap_mb'], 407)
+            sup._job_runner({'name': 'scan',
+                             'command': 'scan'})('scan')
+            self.assertEqual(seen['cmd'][-1], 'scan')
+            self.assertEqual(seen['timeout'], 1800)
+            self.assertIsNone(seen['rss_cap_mb'])
+        finally:
+            ra.run_job_streaming = orig
+
     def _today_ist(self):
         # Today's date in IST: the session day the seeded breaker
         # runs must carry. _refresh_breakers reads today's IST date,

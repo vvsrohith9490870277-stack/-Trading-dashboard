@@ -245,7 +245,13 @@ def get_bands_for_session(db, trade_date, as_of_date=None):
 
 
 def _prev_closes(stock_df, sessions):
-    """Map (trade_date, symbol) -> previous session close from stock_df (PIT: only earlier dates)."""
+    """Map (trade_date, symbol) -> previous session close from stock_df (PIT: only earlier dates).
+
+    Kept for API stability; build_bands_by_date_symbol now streams the
+    previous close inline (one pass, no 400k-entry map) and no longer
+    calls this. Implemented the same way (per-symbol date order, a close
+    counts only from a strictly earlier date) so the two agree.
+    """
     if stock_df is None or getattr(stock_df, 'empty', True):
         return {}
     by_sym = {}
@@ -269,64 +275,120 @@ def _prev_closes(stock_df, sessions):
     return prev
 
 
+# Shared immutable instances for the identical unknown bands. The full
+# (date, symbol) map holds one entry per bar (~400k on the real snapshot)
+# and almost all of them are the same unknown band; sharing one frozen
+# instance per (series, reason) instead of one fresh dict per bar saves
+# ~150 MB. MappingProxyType makes an accidental mutation fail loudly
+# instead of silently corrupting every entry that shares the instance.
+_UNKNOWN_BAND_CACHE = {}
+
+
+def _shared_unknown_band(series=None, reason='unknown'):
+    key = (series, reason)
+    got = _UNKNOWN_BAND_CACHE.get(key)
+    if got is None:
+        from types import MappingProxyType
+        got = MappingProxyType(unknown_band(series=series, reason=reason))
+        _UNKNOWN_BAND_CACHE[key] = got
+    return got
+
+
+def _band_from_archive(key, prev_close, ohlc, row):
+    """Band dict for one (date, symbol) key from its archive row (or None)
+    and the day's OHLC (a (high, low, close) triple, or Nones when the key
+    has no bar). Identical outcomes to the previous per-key block: no
+    archive row -> UNKNOWN/no_official_sec_list; non-static band ->
+    UNKNOWN/no_static_band; static band without a previous close ->
+    UNKNOWN/no_previous_close; otherwise the inferred circuit."""
+    if row is None:
+        return _shared_unknown_band(series=None, reason='no_official_sec_list')
+    series = row.get('series')
+    if not row.get('static_band') or row.get('band_pct') in (None, ''):
+        return _shared_unknown_band(series=series, reason='no_static_band')
+    high, low, close = ohlc if ohlc is not None else (None, None, None)
+    inferred = infer_circuit(
+        row['band_pct'], prev_close, high=high, low=low, close=close,
+    )
+    if inferred is None:
+        return _shared_unknown_band(series=series, reason='no_previous_close')
+    return {
+        'series': series,
+        'circuit': inferred['circuit'],
+        'known': True,
+        'reason': 'official_sec_list',
+        'upper': inferred['upper'],
+        'lower': inferred['lower'],
+        'band_pct': inferred['band_pct'],
+        'source': row.get('source'),
+    }
+
+
 def build_bands_by_date_symbol(db, stock_df, sessions, as_of):
     """Point-in-time circuit map for the simulator: {(date, symbol): band_dict}.
 
     - Official sec_list for session D is used only when D <= as_of and that file was ingested.
     - Static band + previous close + day's OHLC -> UPPER / LOWER / BOTH / NONE via infer_circuit.
     - Missing file, missing prev close, or non-static (dynamic) band -> UNKNOWN (no lock invented).
+
+    Memory: the map still covers every bar (the simulator and the tests
+    index it directly), but it is built in ONE streaming pass over the
+    bars (frame is ORDER BY symbol, trade_date, so each symbol's previous
+    close is tracked as we go -- no 400k-entry prev-close map and no
+    to_dict('records') transient) and the identical unknown bands share
+    one frozen instance each instead of one fresh dict per bar.
     """
     sessions = [str(d) for d in sessions if (as_of is None or str(d) <= as_of)]
-    prev = _prev_closes(stock_df, sessions)
-    bars = {}
-    if stock_df is not None and not getattr(stock_df, 'empty', True):
-        for rec in stock_df.to_dict('records'):
-            d = str(rec['trade_date'])
-            if as_of is not None and d > as_of:
-                continue
-            bars[(d, str(rec['symbol']))] = rec
-
     archive = {}
     for d in sessions:
         for row in get_bands_for_session(db, d, as_of_date=as_of):
             archive[(d, row['symbol'])] = row
-
     out = {}
-    # Cover every bar in the window, plus any archive-only names (no bar => still record UNKNOWN/known band).
-    keys = set(bars) | set(archive)
-    for key in keys:
-        d, sym = key
+    if stock_df is None or getattr(stock_df, 'empty', True):
+        for key, row in archive.items():
+            out[key] = _band_from_archive(key, None, None, row)
+        return out
+    frame = stock_df[['trade_date', 'symbol', 'high', 'low', 'close']]
+    last = {}   # symbol -> (last_date_str, last_close_float), previous bar seen
+    hist = {}   # symbol -> [(date_str, close_float)] -- only for symbols with
+                # an archive key, to resolve archive-only keys afterwards
+    archive_syms = {sym for (_, sym) in archive}
+    seen_archive = set()
+    for rec in frame.itertuples(index=False):
+        d = str(rec.trade_date)
+        sym = str(rec.symbol)
         if as_of is not None and d > as_of:
             continue
-        if sessions and d not in sessions and (d, sym) not in bars:
-            continue
+        prev_close = None
+        l = last.get(sym)
+        if l is not None and l[0] < d:
+            prev_close = l[1]
+        try:
+            cl = float(rec.close)
+        except (TypeError, ValueError):
+            cl = None
+        if cl is not None:
+            last[sym] = (d, cl)
+            if sym in archive_syms:
+                hist.setdefault(sym, []).append((d, cl))
+        key = (d, sym)
         row = archive.get(key)
-        bar = bars.get(key) or {}
-        if row is None:
-            out[key] = unknown_band(reason='no_official_sec_list')
+        if row is not None:
+            seen_archive.add(key)
+        out[key] = _band_from_archive(key, prev_close, (rec.high, rec.low, rec.close), row)
+    # Archive keys with no bar: same band logic with no OHLC; prev close is
+    # the symbol's latest close strictly before the key's date.
+    for key, row in archive.items():
+        if key in seen_archive:
             continue
-        series = row.get('series')
-        if not row.get('static_band') or row.get('band_pct') in (None, ''):
-            out[key] = unknown_band(series=series, reason='no_static_band')
-            continue
-        prev_close = prev.get(key)
-        inferred = infer_circuit(
-            row['band_pct'], prev_close,
-            high=bar.get('high'), low=bar.get('low'), close=bar.get('close'),
-        )
-        if inferred is None:
-            out[key] = unknown_band(series=series, reason='no_previous_close')
-            continue
-        out[key] = {
-            'series': series,
-            'circuit': inferred['circuit'],
-            'known': True,
-            'reason': 'official_sec_list',
-            'upper': inferred['upper'],
-            'lower': inferred['lower'],
-            'band_pct': inferred['band_pct'],
-            'source': row.get('source'),
-        }
+        d, sym = key
+        prev_close = None
+        for hd, hc in hist.get(sym, []):
+            if hd < d:
+                prev_close = hc
+            else:
+                break
+        out[key] = _band_from_archive(key, prev_close, None, row)
     return out
 
 
