@@ -142,8 +142,14 @@ def run_job(store, namespace, job, session_day, owner_id, runner):
     status 'error' and the exception is re-raised. When the runner
     reports the child was killed (e.g. the memory guard's
     killed_reason), the attempt is recorded 'failed' with the reason.
-    The runner's returned dict is never modified; the stored
-    result_json merges in this attempt's start (the breaker count).
+    When the runner reports a BLOCKED simulation (a result dict with
+    simulation_status BLOCKED_*, from the adaptive EOD: the day's
+    snapshot was stale, so nothing was simulated), the attempt is
+    recorded 'blocked' — not 'ok' — so /health.schedule shows it and
+    the day is not counted as done (a blocked day is re-run by a
+    later catch-up). The runner's returned dict is never modified;
+    the stored result_json merges in this attempt's start (the
+    breaker count).
     """
     attempt = _next_attempt(store, namespace, job, session_day)
     claimed = int(time.time())
@@ -196,11 +202,15 @@ def run_job(store, namespace, job, session_day, owner_id, runner):
              json.dumps({**result, 'starts': starts}),
              namespace, job, session_day))
         return result
+    sim = result.get('simulation_status') if isinstance(result, dict) \
+        else None
+    status = ('blocked' if isinstance(sim, str)
+              and sim.startswith('BLOCKED') else 'ok')
     store.execute(
         'UPDATE paper_job_runs SET status=?, finished_at=?, exit_code=?,'
         ' result_json=?'
         ' WHERE namespace=? AND job=? AND session_day=?',
-        ('ok', _now_iso(), 0,
+        (status, _now_iso(), 0,
          json.dumps({**result, 'starts': starts})
          if isinstance(result, dict) else
          json.dumps({'result': result, 'starts': starts}),

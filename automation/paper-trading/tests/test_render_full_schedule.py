@@ -350,6 +350,42 @@ class SchedulerTests(_SupervisorMixin, unittest.TestCase):
         self.assertEqual((row[0]['status'], row[0]['error_code']),
                          ('skipped', 'lease_held_by_other'))
 
+    def test_blocked_simulation_records_blocked_in_both_tables(self):
+        # Grok review of PR #25: a BLOCKED adaptive simulation reports
+        # 'blocked', not 'ok'. End to end through the real _job_runner:
+        # the engine child prints a BLOCKED report, and the supervisor
+        # records 'blocked' (with the reason) in both job tables, so
+        # /health.schedule shows it and the day is not counted as done.
+        sup = self._sup(self.store)
+        report = json.dumps({'phase': 'eod', 'session_day': '2026-11-20',
+                             'status': 'OK',
+                             'simulation_status': 'BLOCKED_STALE_INPUT'})
+        orig = ra.run_job_streaming
+        ra.run_job_streaming = lambda cmd, env, timeout=1800, \
+            rss_cap_mb=None: {'exit_code': 0,
+                              'stdout_tail': report + '\n',
+                              'stderr_tail': '', 'peak_rss_mb': 10}
+        try:
+            sup._job_runner = lambda job: ra.Supervisor._job_runner(sup,
+                                                                     job)
+            sup._run_job_sync({'name': 'adaptive_eod',
+                               'command': 'adaptive-eod', 'time': '17:45'},
+                              now=_at(FRI, 17, 50))
+        finally:
+            ra.run_job_streaming = orig
+        paper = self.store.execute(
+            "SELECT status FROM paper_job_runs WHERE namespace='paper_v2'"
+            " AND job='adaptive_eod' AND session_day='2026-11-20'")
+        self.assertEqual([r['status'] for r in paper], ['blocked'])
+        row = self.store.execute(
+            'SELECT status, error_code FROM render_job_runs'
+            ' WHERE namespace=? AND job=? AND trade_date=?',
+            ('paper_v2', 'adaptive_eod', '2026-11-20'))
+        self.assertEqual([(r['status'], r['error_code']) for r in row],
+                         [('blocked', 'BLOCKED_STALE_INPUT')])
+        self.assertFalse(rfs.job_completed_today(
+            self.store, 'paper_v2', 'adaptive_eod', '2026-11-20'))
+
     def test_job_exception_recorded_and_scheduler_alive(self):
         sup = self._sup(self.store)
         self.fail_jobs = {'scan'}
@@ -517,6 +553,28 @@ class ScheduleHealthTests(unittest.TestCase):
         eod = sched['jobs']['eod']
         self.assertEqual(eod['last_status'], 'error')
         self.assertEqual(eod['last_error_code'], 'RuntimeError')
+
+    def test_schedule_field_shows_blocked_simulation(self):
+        # Grok review of PR #25: a BLOCKED adaptive simulation reports
+        # 'blocked', not 'ok', in /health.schedule, with the reason.
+        # The paper_job_runs row (the run_job record) is the fallback
+        # source; the render_job_runs row is preferred when present.
+        rj.run_job(self.store, 'paper_v2', 'adaptive_eod', '2026-11-20',
+                   owner_id='render:h:1:1',
+                   runner=lambda n: {'exit_code': 0,
+                                     'simulation_status':
+                                         'BLOCKED_STALE_INPUT'})
+        sched = self._schedule_field(_at(FRI, 18, 0))
+        job = sched['jobs']['adaptive_eod']
+        self.assertEqual(job['last_status'], 'blocked')
+        self.assertEqual(job['last_error_code'], 'BLOCKED_STALE_INPUT')
+        rfs.record_job_finish(self.store, 'paper_v2', 'adaptive_eod',
+                              '2026-11-20', 'blocked',
+                              'BLOCKED_STALE_INPUT')
+        sched = self._schedule_field(_at(FRI, 18, 0))
+        job = sched['jobs']['adaptive_eod']
+        self.assertEqual(job['last_status'], 'blocked')
+        self.assertEqual(job['last_error_code'], 'BLOCKED_STALE_INPUT')
 
     def test_build_snapshot_carries_schedule(self):
         snap = rh.build_snapshot(
