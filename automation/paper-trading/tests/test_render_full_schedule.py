@@ -295,6 +295,39 @@ class SchedulerTests(_SupervisorMixin, unittest.TestCase):
         self.assertEqual(len(row), 1)
         self.assertEqual(row[0]['status'], 'ok')
 
+    def test_restart_at_1746_runs_sync_before_adaptive(self):
+        # Grok review of PR #25: adaptive_eod (17:45) depends on
+        # sync_history (17:30) being ok today. Restart at 17:46, both
+        # due: the sync runs first, and adaptive only on the next tick
+        # once the sync has finished ok. The day's scan and EOD are
+        # seeded done so the startup catch-up does not grab the tick.
+        sup = self._sup(self.store)
+        for name in ('scan', 'eod'):
+            rj.run_job(self.store, 'paper_v2', name, '2026-11-20',
+                       owner_id='render:h:1:1',
+                       runner=lambda n: {'exit_code': 0})
+        sup._manage_jobs(now=_at(FRI, 17, 46))
+        self._join(sup)
+        self.assertEqual(self.calls, ['sync_history'])
+        sup._manage_jobs(now=_at(FRI, 17, 46))
+        self._join(sup)
+        self.assertEqual(self.calls, ['sync_history', 'adaptive_eod'])
+
+    def test_adaptive_eod_waits_when_sync_never_finished_ok(self):
+        # Same restart, but the sync's 30-minute window has passed
+        # (18:05) without an ok run: adaptive is due, but it must not
+        # run on stale data — the next due job (revalue) runs instead.
+        # Reverting the dependency filter fails this test (adaptive
+        # would be first in the due list and would run).
+        sup = self._sup(self.store)
+        for name in ('scan', 'eod'):
+            rj.run_job(self.store, 'paper_v2', name, '2026-11-20',
+                       owner_id='render:h:1:1',
+                       runner=lambda n: {'exit_code': 0})
+        sup._manage_jobs(now=_at(FRI, 18, 5))
+        self._join(sup)
+        self.assertEqual(self.calls, ['revalue'])
+
     def test_no_job_runs_twice_same_day(self):
         sup = self._sup(self.store)
         sup._manage_jobs(now=_at(FRI, 8, 50))

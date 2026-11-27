@@ -556,6 +556,23 @@ class Supervisor:
         # A job whose breaker is open is not started again today.
         self._refresh_breakers()
         due = [j for j in due if j['name'] not in self.breakers]
+        # Adaptive EOD depends on today's history sync (Grok review of
+        # PR #25): the adaptive job needs sync_history's data, so it
+        # must not run before sync_history has finished ok today. The
+        # sync is listed before adaptive in render_schedule.json, so
+        # when both are due the sync runs first; this filter covers the
+        # case where the sync's window has passed without an ok run
+        # (then adaptive waits for tomorrow instead of running on
+        # stale data). A store read failure leaves the dependency
+        # unsatisfied: the job is skipped this tick, never run blind.
+        if any(j['name'] == 'adaptive_eod' for j in due):
+            try:
+                completed_today = rfs.completed_jobs_today(
+                    self.store, self.namespace, now.date().isoformat())
+            except Exception:
+                completed_today = set()
+            if 'sync_history' not in completed_today:
+                due = [j for j in due if j['name'] != 'adaptive_eod']
         if not due:
             return
         job = due[0]
