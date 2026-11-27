@@ -415,8 +415,26 @@ class Supervisor:
             cmd = [sys.executable, 'engine.py', job['command']]
             timeout = job.get('timeout_s') or 1800
             rss_cap = job.get('rss_cap_mb')
-            return run_job_streaming(cmd, self._child_env(),
-                                     timeout=timeout, rss_cap_mb=rss_cap)
+            res = run_job_streaming(cmd, self._child_env(),
+                                    timeout=timeout, rss_cap_mb=rss_cap)
+            # A BLOCKED adaptive simulation rides in the child's JSON
+            # report (its stdout is one JSON line; the last non-empty
+            # line is parsed, as probe_result_from_child does). Surface
+            # its status so run_job records 'blocked' instead of 'ok'
+            # (Grok review of PR #25). Any other job's output, and any
+            # unparseable tail, is untouched.
+            try:
+                lines = [ln for ln in str(res.get('stdout_tail') or '')
+                         .splitlines() if ln.strip()]
+                parsed = json.loads(lines[-1]) if lines else None
+            except Exception:
+                parsed = None
+            if isinstance(parsed, dict):
+                sim = parsed.get('simulation_status')
+                if isinstance(sim, str) and sim.startswith('BLOCKED'):
+                    res = dict(res)
+                    res['simulation_status'] = sim
+            return res
         return runner
 
     def _run_job_sync(self, job, now=None):
@@ -436,9 +454,17 @@ class Supervisor:
         if not started:
             return
         try:
-            rj.run_job(self.store, self.namespace, job['name'], day,
-                       self.owner_id, self._job_runner(job))
+            result = rj.run_job(self.store, self.namespace, job['name'],
+                                day, self.owner_id, self._job_runner(job))
             status, error = 'ok', None
+            if isinstance(result, dict):
+                # A BLOCKED adaptive simulation is not a success: the
+                # day was not simulated, so record 'blocked' (with the
+                # reason) in render_job_runs too, matching the
+                # paper_job_runs row run_job just wrote.
+                sim = result.get('simulation_status')
+                if isinstance(sim, str) and sim.startswith('BLOCKED'):
+                    status, error = 'blocked', sim
         except Exception as ex:
             # Recorded in paper_job_runs; the next tick retries
             # in-window. A job exception never kills the scheduler
@@ -556,6 +582,23 @@ class Supervisor:
         # A job whose breaker is open is not started again today.
         self._refresh_breakers()
         due = [j for j in due if j['name'] not in self.breakers]
+        # Adaptive EOD depends on today's history sync (Grok review of
+        # PR #25): the adaptive job needs sync_history's data, so it
+        # must not run before sync_history has finished ok today. The
+        # sync is listed before adaptive in render_schedule.json, so
+        # when both are due the sync runs first; this filter covers the
+        # case where the sync's window has passed without an ok run
+        # (then adaptive waits for tomorrow instead of running on
+        # stale data). A store read failure leaves the dependency
+        # unsatisfied: the job is skipped this tick, never run blind.
+        if any(j['name'] == 'adaptive_eod' for j in due):
+            try:
+                completed_today = rfs.completed_jobs_today(
+                    self.store, self.namespace, now.date().isoformat())
+            except Exception:
+                completed_today = set()
+            if 'sync_history' not in completed_today:
+                due = [j for j in due if j['name'] != 'adaptive_eod']
         if not due:
             return
         job = due[0]

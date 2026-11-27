@@ -182,8 +182,8 @@ def record_job_start(store, namespace, job, trade_date, started_at=None):
 
 def record_job_finish(store, namespace, job, trade_date, status,
                       error_code=None, finished_at=None):
-    """Mark a job finished (status 'ok' or 'error'). Upserts so a
-    finish without a recorded start still leaves a row."""
+    """Mark a job finished (status 'ok', 'error' or 'blocked').
+    Upserts so a finish without a recorded start still leaves a row."""
     finished_at = finished_at or _now_iso()
     store.execute(
         'INSERT INTO render_job_runs(namespace, job, trade_date, status,'
@@ -306,6 +306,11 @@ def _last_job_status(store, namespace, job, trade_date):
         try:
             res = json.loads(r.get('result_json') or '{}')
             err = res.get('error') or res.get('killed_reason')
+            # A blocked run carries no error: its reason is the
+            # simulation_status (e.g. BLOCKED_STALE_INPUT), shown as
+            # the error code so /health.schedule names the cause.
+            if r.get('status') == 'blocked':
+                err = res.get('simulation_status') or err
         except Exception:
             err = None
         if err is None and r.get('exit_code') not in (None, 0):

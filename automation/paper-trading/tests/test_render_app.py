@@ -1020,6 +1020,70 @@ class JobGuardTests(unittest.TestCase):
         finally:
             ra.run_job_streaming = orig
 
+    def test_job_runner_surfaces_blocked_simulation(self):
+        # The real _job_runner parses the engine child's JSON report:
+        # a BLOCKED simulation_status rides along in the runner result
+        # so run_job can record 'blocked'; any other report (or an
+        # unparseable tail) leaves the result untouched.
+        import render_app as ra
+        sup = ra.Supervisor.__new__(ra.Supervisor)
+        sup.mode = 'live'
+        sup.owner_id = 'test'
+        tail = {}
+
+        def fake_streaming(cmd, env, timeout=1800, rss_cap_mb=None):
+            return {'exit_code': 0, 'stdout_tail': tail.get('tail', ''),
+                    'stderr_tail': ''}
+
+        orig = ra.run_job_streaming
+        ra.run_job_streaming = fake_streaming
+        try:
+            tail['tail'] = json.dumps(
+                {'phase': 'eod', 'status': 'OK',
+                 'simulation_status': 'BLOCKED_STALE_INPUT'}) + '\n'
+            out = sup._job_runner({'name': 'adaptive_eod',
+                                   'command': 'adaptive-eod'})('adaptive_eod')
+            self.assertEqual(out.get('simulation_status'),
+                             'BLOCKED_STALE_INPUT')
+            tail['tail'] = json.dumps(
+                {'phase': 'eod', 'status': 'OK',
+                 'simulation_status': 'SIMULATED'})
+            out = sup._job_runner({'name': 'adaptive_eod',
+                                   'command': 'adaptive-eod'})('adaptive_eod')
+            self.assertNotIn('simulation_status', out)
+            tail['tail'] = 'not json at all'
+            out = sup._job_runner({'name': 'scan',
+                                   'command': 'scan'})('scan')
+            self.assertNotIn('simulation_status', out)
+        finally:
+            ra.run_job_streaming = orig
+
+    def test_run_job_records_blocked_for_blocked_simulation(self):
+        # run_job maps a BLOCKED simulation_status to status 'blocked'
+        # (not 'ok'): the day is not counted as done, and last_run
+        # does not suppress a later retry.
+        import render_full_schedule as rfs
+        import render_jobs as rj
+        store = self._store()
+        try:
+            rj.run_job(store, 'paper_v2', 'adaptive_eod',
+                       self._today_ist(), owner_id='render:h:1:1',
+                       runner=lambda name: {
+                           'exit_code': 0,
+                           'simulation_status':
+                               'BLOCKED_PIT_SERIES_ARCHIVE_P1'})
+            rows = store.execute(
+                "SELECT status, result_json FROM paper_job_runs"
+                " WHERE namespace='paper_v2' AND job='adaptive_eod'")
+            self.assertEqual(rows[0]['status'], 'blocked')
+            self.assertIn('BLOCKED_PIT_SERIES_ARCHIVE_P1',
+                          rows[0]['result_json'])
+            self.assertFalse(rfs.job_completed_today(
+                store, 'paper_v2', 'adaptive_eod', self._today_ist()))
+            self.assertEqual(rj.last_run_times(store, 'paper_v2'), {})
+        finally:
+            store.close()
+
     def _today_ist(self):
         # Today's date in IST: the session day the seeded breaker
         # runs must carry. _refresh_breakers reads today's IST date,
