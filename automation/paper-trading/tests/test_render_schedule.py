@@ -101,12 +101,14 @@ class ScheduleTests(unittest.TestCase):
 
     def test_adaptive_eod_due_at_1745(self):
         sched = rsch.load_schedule()
-        # 17:45 slot: adaptive_eod, sync_history (17:30, inside its
-        # 30 min catch-up window) and the 17:30 record_outages slot;
-        # support (16:45) is past its window by then.
+        # 17:45 slot: sync_history (17:30, inside its 30 min catch-up
+        # window) is listed before adaptive_eod, so when both are due
+        # after a restart the sync runs first (Grok review of PR #25:
+        # adaptive needs the sync's data). The 17:30 record_outages
+        # slot is due too; support (16:45) is past its window by then.
         now = datetime(2026, 11, 20, 17, 45, tzinfo=IST)
         self.assertEqual([j['name'] for j in rsch.due_jobs(sched, now)],
-                         ['adaptive_eod', 'sync_history', 'record_outages'])
+                         ['sync_history', 'adaptive_eod', 'record_outages'])
         # 18:05: still inside the 30 min catch-up window (sync_history
         # is past its window by then); revalue (18:00) is due.
         now = datetime(2026, 11, 20, 18, 5, tzinfo=IST)
@@ -118,6 +120,26 @@ class ScheduleTests(unittest.TestCase):
         names = [j['name'] for j in rsch.due_jobs(sched, now)]
         self.assertNotIn('adaptive_eod', names)
         self.assertIn('record_outages', names)
+
+    def test_sync_history_listed_before_adaptive_eod(self):
+        # Grok review of PR #25: adaptive_eod (17:45) needs the history
+        # sync's data, so sync_history (17:30) is listed first in the
+        # schedule (live and trial lists alike) — when both are due,
+        # the supervisor takes the first due job, so the sync runs
+        # before the adaptive job. Reverting the order fails this test.
+        import json
+        raw = json.loads((Path(__file__).resolve().parent.parent
+                          / 'render_schedule.json').read_text())
+        for jobs in (raw['jobs'], raw['modes']['trial']['jobs']):
+            names = [j['name'] for j in jobs]
+            self.assertLess(names.index('sync_history'),
+                            names.index('adaptive_eod'))
+        for mode in ('live', 'trial'):
+            names = [j['name'] for j in
+                     rsch.load_schedule(mode=mode)['jobs']]
+            if 'sync_history' in names and 'adaptive_eod' in names:
+                self.assertLess(names.index('sync_history'),
+                                names.index('adaptive_eod'))
 
     def test_adaptive_eod_not_due_after_run(self):
         # Idempotency: a job that already ran for its slot is never due
