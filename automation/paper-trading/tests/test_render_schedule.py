@@ -141,6 +141,18 @@ class ScheduleTests(unittest.TestCase):
                 self.assertLess(names.index('sync_history'),
                                 names.index('adaptive_eod'))
 
+    def test_trial_note_names_adaptive_eod_time(self):
+        # Grok review of PR #25: the trial note said the adaptive job
+        # runs at (17:00) — stale since PR #25 moved it to 17:45. The
+        # note must name the live job's real time.
+        import json
+        raw = json.loads((Path(__file__).resolve().parent.parent
+                          / 'render_schedule.json').read_text())
+        live = {j['name']: j for j in raw['jobs']}
+        note = raw['modes']['trial']['note']
+        self.assertIn('(%s)' % live['adaptive_eod']['time'], note)
+        self.assertNotIn('(17:00)', note)
+
     def test_adaptive_eod_not_due_after_run(self):
         # Idempotency: a job that already ran for its slot is never due
         # again that day (same run-once rule as every other job).
