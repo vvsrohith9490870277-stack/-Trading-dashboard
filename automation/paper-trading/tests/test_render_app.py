@@ -10,6 +10,7 @@ import time
 import unittest
 import urllib.request
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -932,8 +933,10 @@ class JobGuardTests(unittest.TestCase):
     """Task 2 (render-deploy-03): per-job memory guard + crash-loop
     breaker. The guard kills the job's process group over the cap and
     records failed/memory_cap; the breaker counts starts from
-    paper_job_runs, stops scheduling for the rest of the IST day, and
-    /health stays 200 with state degraded."""
+    paper_job_runs, stops scheduling while it is open (a rolling
+    30-minute window — I23 on Render corrected the docstring, which
+    used to say "rest of the IST day"), and /health stays 200 with
+    state degraded."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -953,6 +956,44 @@ class JobGuardTests(unittest.TestCase):
         return [sys.executable, '-c',
                 'import time; b = bytearray(%d * 1024 * 1024);'
                 ' time.sleep(30)' % mb]
+
+    def test_breaker_docstring_describes_rolling_window(self):
+        # I23 on Render: the docstring must say rolling window, not
+        # "rest of the IST day" — a day-long lockout would undo the
+        # retry-until-EOD fix.
+        import render_jobs as rj
+        self.assertNotIn('rest of the IST day', rj.__doc__)
+        self.assertIn('rolling window', rj.__doc__)
+
+    def test_breaker_closes_when_window_passes(self):
+        # I23 on Render: three starts in the window open the breaker;
+        # once the oldest start ages out of the rolling 30-minute
+        # window, it closes again (the job may be scheduled).
+        import render_jobs as rj
+        import time
+        store = self._store()
+        try:
+            day = self._today_ist()
+            now_unix = int(time.time())
+            starts = [now_unix - 29 * 60, now_unix - 14 * 60, now_unix]
+            store.execute(
+                'INSERT INTO paper_job_runs(namespace, job, session_day,'
+                ' attempt, status, owner_id, claimed_unix,'
+                ' lease_until_unix, started_at, result_json)'
+                ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                ('paper_v2', 'scan', day, len(starts), 'error',
+                 'render:h:1:1', starts[-1], starts[-1] + 90,
+                 datetime.fromtimestamp(
+                     starts[-1], tz=timezone.utc).strftime(
+                         '%Y-%m-%dT%H:%M:%S'),
+                 json.dumps({'starts': starts})))
+            self.assertTrue(rj.breaker_open(
+                store, 'paper_v2', 'scan', day, now_unix=now_unix))
+            self.assertFalse(rj.breaker_open(
+                store, 'paper_v2', 'scan', day,
+                now_unix=now_unix + 2 * 60))
+        finally:
+            store.close()
 
     def test_job_rss_cap_kills_child(self):
         import render_app as ra

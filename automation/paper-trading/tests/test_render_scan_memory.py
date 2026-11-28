@@ -469,6 +469,53 @@ class RerunIdempotent(unittest.TestCase):
         self.assertEqual(audit_seq, want['audit_events_stm_order'],
                          'audit event order differs')
 
+    def test_scan_rerun_after_signals_written_idempotent(self):
+        # I23 on Render: abort on the FIRST batch that writes a
+        # signal (the crash lands mid-scan, after signals exist),
+        # re-run, and the day still has exactly one
+        # paper_scan_batches row and the same signal ids — no
+        # duplicate batch, no duplicate signals. The re-run report
+        # is NOT asserted: signals_queued is legitimately lower on
+        # the re-run (already-queued signals are skipped via the
+        # pending set), a pre-existing reporting quirk out of scope.
+        old_ns, old_now = e.NS, e.now
+        e.NS, e.now = NS, lambda: T
+        path = HERE / ('test_rendermem_rerun2_%s.sqlite' % uuid.uuid4().hex)
+        try:
+            build_golden_db(path)
+            db = e.DB(str(path))
+            try:
+                orig = db.batch
+
+                def aborting(stm):
+                    if any('INTO paper_signals' in sql for sql, _ in stm):
+                        raise RuntimeError(
+                            'simulated_kill_after_signals')
+                    return orig(stm)
+
+                db.batch = aborting
+                with self.assertRaises(RuntimeError):
+                    e.scan(db, DummyApi())
+                db.batch = orig
+                _report, tables, audit_seq, _multi = run_scan_golden(db)
+            finally:
+                db.close_helper()
+        finally:
+            e.NS, e.now = old_ns, old_now
+            path.unlink(missing_ok=True)
+            for suffix in ('-wal', '-shm', '-journal'):
+                Path(str(path) + suffix).unlink(missing_ok=True)
+        want = json.loads(GOLDEN.read_text())
+        batches = tables['paper_scan_batches']
+        self.assertEqual(len(batches), 1,
+                         're-run wrote a second scan batch row')
+        self.assertEqual(tables['paper_signals'],
+                         want['tables']['paper_signals'],
+                         'signals differ after re-run (duplicates?)')
+        self.assertEqual(tables, want['tables'], 'tables differ')
+        self.assertEqual(audit_seq, want['audit_events_stm_order'],
+                         'audit event order differs')
+
 
 class SingleNode(unittest.TestCase):
     """At most one node helper runs at a time during the scan, and the

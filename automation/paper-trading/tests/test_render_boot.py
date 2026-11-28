@@ -478,6 +478,41 @@ class EmitProbeAuditTests(unittest.TestCase):
         finally:
             store.close()
 
+    def test_emit_scan_abandoned_writes_error_event_once(self):
+        # I23 on Render: the abandoned scan retry is an ERROR audit
+        # event (ready for the I22 email alert), recorded at most
+        # once per day.
+        store = self._store_with_events()
+        try:
+            self.assertTrue(rb.emit_scan_abandoned_audit(
+                store, TRIAL_NS, 800, 856))
+            self.assertFalse(rb.emit_scan_abandoned_audit(
+                store, TRIAL_NS, 700, 856))
+            rows = store.execute(
+                'SELECT event_type, severity, data_json FROM paper_events'
+                ' WHERE namespace=?', (TRIAL_NS,))
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]['event_type'], 'scan_abandoned')
+            self.assertEqual(rows[0]['severity'], 'ERROR')
+            data = json.loads(rows[0]['data_json'])
+            self.assertEqual(
+                data['reason'], 'fyers_budget_below_scan_retry_reserve')
+            self.assertEqual(data['remaining_budget_requests'], 800)
+            self.assertEqual(data['scan_retry_reserve_requests'], 856)
+        finally:
+            store.close()
+
+    def test_emit_scan_abandoned_fails_closed_without_table(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        store = rs.SqliteStore(Path(tmp.name) / 'noevents.sqlite')
+        rs.migrate(store)
+        try:
+            self.assertFalse(rb.emit_scan_abandoned_audit(
+                store, TRIAL_NS, 800, 856))
+        finally:
+            store.close()
+
 
 if __name__ == '__main__':
     unittest.main()

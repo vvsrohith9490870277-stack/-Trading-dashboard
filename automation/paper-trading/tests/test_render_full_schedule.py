@@ -20,6 +20,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(HERE))
 
+import audit as al
 import render_app as ra
 import render_full_schedule as rfs
 import render_health as rh
@@ -158,10 +159,62 @@ class CatchUpTests(unittest.TestCase):
             self.sched, _at(FRI, 10, 0), set(), self.cfg)
         self.assertEqual([j['name'] for j in due], ['scan'])
 
-    def test_scan_not_caught_up_after_1500(self):
+    def test_scan_caught_up_at_1510(self):
+        # I23 on Render: the missed scan still retries at 15:10 —
+        # the old 15:00 cutoff quietly gave up mid-afternoon.
         due = rfs.catch_up_due_jobs(
-            self.sched, _at(FRI, 15, 30), set(), self.cfg)
+            self.sched, _at(FRI, 15, 10), set(), self.cfg)
+        self.assertEqual([j['name'] for j in due], ['scan'])
+
+    def test_scan_not_caught_up_at_1625(self):
+        # I23 on Render: after the EOD deadline (16:20) the scan is
+        # not caught up — only the EOD is (it is after 16:10).
+        due = rfs.catch_up_due_jobs(
+            self.sched, _at(FRI, 16, 25), set(), self.cfg)
+        self.assertEqual([j['name'] for j in due], ['eod'])
+
+    def test_scan_not_caught_up_on_holiday_at_1510(self):
+        # A holiday is a holiday even at 15:10, inside the retry
+        # window: no catch-up scan.
+        due = rfs.catch_up_due_jobs(
+            self.sched, _at(HOL, 15, 10), set(), self.cfg)
         self.assertEqual(due, [])
+
+    def test_scan_catch_up_deadline_uses_config_eod_due(self):
+        # The deadline is config sessiond_eod_due, not a hard-coded
+        # time: a 15:00 EOD in the config stops the retry at 15:10,
+        # and a missing value falls back to 16:20.
+        cfg = _config()
+        cfg['sessiond_eod_due'] = '15:00'
+        due = rfs.catch_up_due_jobs(
+            self.sched, _at(FRI, 15, 10), set(), cfg)
+        self.assertEqual(due, [])
+        cfg = _config()
+        del cfg['sessiond_eod_due']
+        due = rfs.catch_up_due_jobs(
+            self.sched, _at(FRI, 15, 10), set(), cfg)
+        self.assertEqual([j['name'] for j in due], ['scan'])
+
+    def test_scan_catch_up_spacing_blocks_retry_within_15_minutes(self):
+        # I23 on Render: a scan attempt 10 minutes ago is too soon
+        # — retries are spaced at least 15 minutes apart.
+        due = rfs.catch_up_due_jobs(
+            self.sched, _at(FRI, 10, 10), set(), self.cfg,
+            last_attempt={'scan': _at(FRI, 10, 0)})
+        self.assertEqual(due, [])
+
+    def test_scan_catch_up_spacing_allows_retry_at_15_minutes(self):
+        # Exactly 15 minutes after the last attempt, the retry is due.
+        due = rfs.catch_up_due_jobs(
+            self.sched, _at(FRI, 10, 15), set(), self.cfg,
+            last_attempt={'scan': _at(FRI, 10, 0)})
+        self.assertEqual([j['name'] for j in due], ['scan'])
+
+    def test_scan_catch_up_spacing_allows_retry_after_15_minutes(self):
+        due = rfs.catch_up_due_jobs(
+            self.sched, _at(FRI, 10, 16), set(), self.cfg,
+            last_attempt={'scan': _at(FRI, 10, 0)})
+        self.assertEqual([j['name'] for j in due], ['scan'])
 
     def test_scan_not_caught_up_before_slot(self):
         due = rfs.catch_up_due_jobs(
@@ -174,9 +227,11 @@ class CatchUpTests(unittest.TestCase):
         self.assertEqual([j['name'] for j in due], ['eod'])
 
     def test_eod_not_caught_up_before_1610(self):
+        # I23 on Render: at 16:00 the EOD is not caught up yet — but
+        # the scan IS (its retry deadline is now 16:20, not 15:00).
         due = rfs.catch_up_due_jobs(
             self.sched, _at(FRI, 16, 0), set(), self.cfg)
-        self.assertEqual(due, [])
+        self.assertEqual([j['name'] for j in due], ['scan'])
 
     def test_no_catch_up_when_completed(self):
         due = rfs.catch_up_due_jobs(
@@ -294,6 +349,167 @@ class SchedulerTests(_SupervisorMixin, unittest.TestCase):
             ('paper_v2', 'scan', '2026-11-20'))
         self.assertEqual(len(row), 1)
         self.assertEqual(row[0]['status'], 'ok')
+
+    def _seed_scan_attempts(self, starts, status='error'):
+        """Seed one paper_job_runs row for scan/2026-11-20 whose
+        result_json 'starts' are the given aware datetimes (a failed
+        attempt the supervisor can retry)."""
+        unix = [int(s.timestamp()) for s in starts]
+        self.store.execute(
+            'INSERT INTO paper_job_runs(namespace, job, session_day,'
+            ' attempt, status, owner_id, claimed_unix,'
+            ' lease_until_unix, started_at, result_json)'
+            ' VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('paper_v2', 'scan', '2026-11-20', len(unix), status,
+             'render:h:1:1', unix[-1], unix[-1] + 90,
+             datetime.fromtimestamp(unix[-1], tz=timezone.utc).strftime(
+                 '%Y-%m-%dT%H:%M:%S'),
+             json.dumps({'starts': unix})))
+
+    def _events_table(self):
+        self.store.execute_many([(s, ()) for s in al.SCHEMA.split(';')
+                                 if s.strip()])
+
+    def _set_budget_used(self, sup, used):
+        cache = rh.new_health_cache()
+        fields = dict(cache['fields'])
+        fields['fyers_budget_day_used'] = used
+        cache['fields'] = fields
+        cache['ok'] = True
+        sup._health_cache = cache
+
+    def test_restart_catch_up_scan_skipped_when_lease_held_by_other(self):
+        # I23 on Render: a restart at 10:00 with the lease held by
+        # the other runner does not run the catch-up scan — the lease
+        # guard covers the catch-up path too.
+        sup = self._sup(self.store, lease_held=False)
+        sup._manage_jobs(now=_at(FRI, 10, 0))
+        self._join(sup)
+        self.assertEqual(self.calls, [])
+        row = self.store.execute(
+            'SELECT status, error_code FROM render_job_runs'
+            ' WHERE namespace=? AND job=? AND trade_date=?',
+            ('paper_v2', 'scan', '2026-11-20'))[0]
+        self.assertEqual((row['status'], row['error_code']),
+                         ('skipped', 'lease_held_by_other'))
+
+    def test_spacing_holds_when_breaker_reopens(self):
+        # I23 on Render: three scan starts at 09:00/09:15/09:30 open
+        # the breaker; at 09:31 it has reopened (the oldest start
+        # aged out of the rolling 30-minute window) — but the next
+        # attempt must still wait out the 15-minute spacing, so there
+        # is never a burst of 3 attempts back to back. At 09:45 the
+        # retry is due again.
+        self._seed_scan_attempts([_at(FRI, 9, 0), _at(FRI, 9, 15),
+                                  _at(FRI, 9, 30)])
+        day = '2026-11-20'
+        self.assertTrue(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', day,
+            now_unix=int(_at(FRI, 9, 30).timestamp())))
+        self.assertFalse(rj.breaker_open(
+            self.store, 'paper_v2', 'scan', day,
+            now_unix=int(_at(FRI, 9, 31).timestamp())))
+        cfg = _config()
+        sched = rsch.load_schedule(mode='live')
+        self.assertEqual(
+            rfs.catch_up_due_jobs(
+                sched, _at(FRI, 9, 31), set(), cfg,
+                last_attempt={'scan': _at(FRI, 9, 30)}), [])
+        due = rfs.catch_up_due_jobs(
+            sched, _at(FRI, 9, 45), set(), cfg,
+            last_attempt={'scan': _at(FRI, 9, 30)})
+        self.assertEqual([j['name'] for j in due], ['scan'])
+
+    def test_supervisor_spaces_scan_retries(self):
+        # I23 on Render: a scan attempt 1 minute ago holds the
+        # retry this tick; 16 minutes after the attempt it runs.
+        sup = self._sup(self.store)
+        self._seed_scan_attempts([_at(FRI, 10, 0)])
+        sup._manage_jobs(now=_at(FRI, 10, 1))
+        self._join(sup)
+        self.assertNotIn('scan', self.calls)
+        sup._manage_jobs(now=_at(FRI, 10, 16))
+        self._join(sup)
+        self.assertIn('scan', self.calls)
+        self.assertEqual(self.calls.count('scan'), 1)
+
+    def test_scan_retry_budget_values(self):
+        # I23 on Render: the reserve is 856 (config), the remaining
+        # budget is the day limit less the used count, and trial mode
+        # uses the trial day cap and counter.
+        sup = self._sup(self.store)
+        self.assertEqual(sup._scan_retry_budget(), (None, 856))
+        self._set_budget_used(sup, 3200)
+        self.assertEqual(sup._scan_retry_budget(), (800, 856))
+        sup.mode = 'trial'
+        cache = rh.new_health_cache()
+        fields = dict(cache['fields'])
+        fields['trial_budget_day_used'] = 200
+        cache['fields'] = fields
+        sup._health_cache = cache
+        self.assertEqual(sup._scan_retry_budget(), (800, 856))
+
+    def test_scan_retry_abandoned_when_budget_below_reserve(self):
+        # I23 on Render: a failed 08:50 scan attempt, 800 calls left
+        # (< reserve 856) at 10:00 — the retry is abandoned, an
+        # ERROR scan_abandoned audit event is recorded once, and a
+        # second tick does not emit a second event.
+        self._events_table()
+        sup = self._sup(self.store)
+        self._seed_scan_attempts([_at(FRI, 8, 50)])
+        self._set_budget_used(sup, 3200)
+        sup._manage_jobs(now=_at(FRI, 10, 0))
+        self._join(sup)
+        self.assertNotIn('scan', self.calls)
+        rows = self.store.execute(
+            'SELECT event_type, severity, data_json FROM paper_events'
+            " WHERE namespace='paper_v2'")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['event_type'], 'scan_abandoned')
+        self.assertEqual(rows[0]['severity'], 'ERROR')
+        data = json.loads(rows[0]['data_json'])
+        self.assertEqual(
+            data['reason'], 'fyers_budget_below_scan_retry_reserve')
+        self.assertEqual(data['remaining_budget_requests'], 800)
+        self.assertEqual(data['scan_retry_reserve_requests'], 856)
+        sup._manage_jobs(now=_at(FRI, 10, 0))
+        self._join(sup)
+        self.assertNotIn('scan', self.calls)
+        rows = self.store.execute(
+            "SELECT 1 AS x FROM paper_events WHERE namespace='paper_v2'")
+        self.assertEqual(len(rows), 1)
+
+    def test_scan_retry_runs_when_budget_above_reserve(self):
+        self._events_table()
+        sup = self._sup(self.store)
+        self._seed_scan_attempts([_at(FRI, 8, 50)])
+        self._set_budget_used(sup, 3000)  # 1000 left >= reserve 856
+        sup._manage_jobs(now=_at(FRI, 10, 0))
+        self._join(sup)
+        self.assertIn('scan', self.calls)
+        rows = self.store.execute(
+            "SELECT 1 AS x FROM paper_events WHERE namespace='paper_v2'")
+        self.assertEqual(len(rows), 0)
+
+    def test_first_scan_of_day_not_gated_by_budget(self):
+        # The first scan of the day is never gated: it makes no
+        # Fyers calls itself, so even 100 calls left is enough.
+        self._events_table()
+        sup = self._sup(self.store)
+        self._set_budget_used(sup, 3900)
+        sup._manage_jobs(now=_at(FRI, 8, 45))
+        self._join(sup)
+        self.assertIn('scan', self.calls)
+
+    def test_scan_retry_runs_when_budget_unknown(self):
+        # Unknown budget fails open: the retry runs rather than
+        # being abandoned on missing health data.
+        self._events_table()
+        sup = self._sup(self.store)
+        self._seed_scan_attempts([_at(FRI, 8, 50)])
+        sup._manage_jobs(now=_at(FRI, 10, 0))
+        self._join(sup)
+        self.assertIn('scan', self.calls)
 
     def test_restart_at_1746_runs_sync_before_adaptive(self):
         # Grok review of PR #25: adaptive_eod (17:45) depends on
