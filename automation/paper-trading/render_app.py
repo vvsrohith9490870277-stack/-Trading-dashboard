@@ -42,6 +42,18 @@ WORKER_STOP_TIMEOUT_SECONDS = 20
 # and refreshes the /health store fields at most once per tick. Was 5 s.
 SUPERVISOR_TICK_SECONDS = 60
 
+# Default scan-retry Fyers reserve (I23 on Render), used only when
+# config market_data.scan_retry_reserve_requests is missing: 856 =
+# (EOD 0 + sync_history 713) x 1.2, rounded up. Measured 2026-11-27
+# from the code: one Render scan uses 0 Fyers calls (engine.py scan
+# reads stored bars only), one EOD uses 0 (the official close is an
+# NSE bhavcopy download, not a Fyers call), one sync_history uses up
+# to 713 (692 universe symbols + 1 benchmark + 20 history-repair
+# budget). The reserve keeps EOD and sync_history runnable; the scan
+# retry itself costs no Fyers calls, so the reserve is a policy
+# guard for the evening jobs, not a cap the scan could breach.
+SCAN_RETRY_RESERVE_REQUESTS_DEFAULT = 856
+
 
 def repo_config_namespace():
     """The namespace from config.json (next to engine.py; never edited)."""
@@ -546,6 +558,41 @@ class Supervisor:
             pass
         return self.breakers
 
+    def _scan_retry_budget(self):
+        """(remaining, reserve) for the scan-retry Fyers guard
+        (I23 on Render).
+
+        remaining is the Fyers day budget left (the per-day limit
+        less the used count from the health cache), or None when the
+        usage is unknown. reserve is the config reserve kept for EOD
+        and sync_history. Live mode uses the shared day budget;
+        trial mode uses the trial day cap and the trial counter.
+        Unknown usage fails open: the scan itself makes no Fyers
+        calls, so it cannot breach the budget — the reserve is a
+        policy guard for the evening jobs, not a cap the scan needs.
+        """
+        md = self.config.get('market_data') or {}
+        reserve = md.get('scan_retry_reserve_requests',
+                         SCAN_RETRY_RESERVE_REQUESTS_DEFAULT)
+        try:
+            reserve = int(reserve)
+        except (TypeError, ValueError):
+            reserve = SCAN_RETRY_RESERVE_REQUESTS_DEFAULT
+        cache = getattr(self, '_health_cache', None) or {}
+        fields = cache.get('fields') or {}
+        if self.mode == 'trial':
+            used = fields.get('trial_budget_day_used')
+            limit = rt.trial_caps()['day']
+        else:
+            used = fields.get('fyers_budget_day_used')
+            limit = md.get('budget_requests_per_day', 4000)
+        if used is None:
+            return None, reserve
+        try:
+            return max(0, int(limit) - int(used)), reserve
+        except (TypeError, ValueError):
+            return None, reserve
+
     def _manage_jobs(self, now=None):
         if self._job_thread is not None and self._job_thread.is_alive():
             return
@@ -555,8 +602,21 @@ class Supervisor:
             last = rj.last_run_times(self.store, self.namespace)
         except Exception:
             return
+        # Last scan attempt (I23 on Render): retries are spaced at
+        # least 15 minutes apart, and a retry is abandoned when the
+        # Fyers day budget is below the reserve for EOD/sync_history.
+        # Best-effort: an unreadable store leaves the last attempt
+        # unknown, and the scan runs (it makes no Fyers calls itself,
+        # so it cannot breach the budget).
+        last_scan_start = None
+        try:
+            last_scan_start = rj.last_job_start(
+                self.store, self.namespace, 'scan',
+                now.date().isoformat())
+        except Exception:
+            last_scan_start = None
         # Startup catch-up first (full schedule, brief 23 Nov 2026):
-        # a missed scan (before 15:00) or a missed EOD (after 16:10)
+        # a missed scan (before EOD, 16:20) or a missed EOD (after 16:10)
         # after a restart is a trading job and outranks housekeeping.
         # The normal 30-minute window is too short for a restart
         # mid-morning, so catch-up covers it, each exactly once per
@@ -569,7 +629,9 @@ class Supervisor:
             completed = rfs.completed_jobs_today(
                 self.store, self.namespace, now.date().isoformat())
             due = rfs.catch_up_due_jobs(
-                sched, now, completed, self.config)
+                sched, now, completed, self.config,
+                last_attempt={'scan': last_scan_start}
+                if last_scan_start is not None else None)
         except Exception:
             pass
         if not due:
@@ -582,6 +644,39 @@ class Supervisor:
         # A job whose breaker is open is not started again today.
         self._refresh_breakers()
         due = [j for j in due if j['name'] not in self.breakers]
+        # Scan spacing (I23 on Render): a scan retry never starts
+        # within 15 minutes of the previous scan attempt, whichever
+        # path offered it — so a crash loop can never burst, even
+        # when the breaker reopens.
+        if any(j['name'] == 'scan' for j in due):
+            if last_scan_start is not None and \
+                    now - last_scan_start < timedelta(minutes=15):
+                due = [j for j in due if j['name'] != 'scan']
+        # Scan-retry Fyers reserve (I23 on Render): a retry (a scan
+        # attempt already happened today) does not start when the
+        # remaining day budget is below the reserve kept for EOD and
+        # sync_history. The first scan of the day is never gated: it
+        # makes no Fyers calls itself. The abandon is recorded once
+        # per day as an ERROR audit event (ready for the I22 email
+        # alert) and as a skip row.
+        if any(j['name'] == 'scan' for j in due) and \
+                last_scan_start is not None:
+            remaining, reserve = self._scan_retry_budget()
+            if remaining is not None and remaining < reserve:
+                import render_boot as rb
+                try:
+                    rb.emit_scan_abandoned_audit(
+                        self.store, self.namespace, remaining, reserve)
+                except Exception:
+                    pass
+                try:
+                    rfs.record_job_skipped(
+                        self.store, self.namespace, 'scan',
+                        now.date().isoformat(),
+                        'scan_abandoned_fyers_reserve')
+                except Exception:
+                    pass
+                due = [j for j in due if j['name'] != 'scan']
         # Adaptive EOD depends on today's history sync (Grok review of
         # PR #25): the adaptive job needs sync_history's data, so it
         # must not run before sync_history has finished ok today. The

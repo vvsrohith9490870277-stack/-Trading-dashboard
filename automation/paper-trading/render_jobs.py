@@ -10,9 +10,14 @@ are kept in the row's result_json 'starts' list (one row per
 (namespace, job, session_day), so no new table). A job that starts
 RENDER_JOB_MAX_STARTS (default 3) times inside RENDER_JOB_WINDOW_MIN
 (default 30) minutes has its breaker open: the supervisor stops
-scheduling it for the rest of the IST day. The count comes from the
-store, so it survives a supervisor restart. `clear_breaker` drops the
-stored starts after the cause is fixed.
+scheduling it while the breaker is open — until the oldest start
+ages out of the rolling window, when it may be scheduled again
+(I23 on Render: the docstring used to say "for the rest of the IST
+day", but the code is a rolling 30-minute window, and a breaker
+that locked out the rest of the day would undo the retry-until-EOD
+fix). The count comes from the store, so it survives a supervisor
+restart. `clear_breaker` drops the stored starts after the cause is
+fixed.
 """
 import json
 import os
@@ -68,6 +73,36 @@ def job_starts(store, namespace, job, session_day, window_min=None,
     if not row:
         return []
     return _starts_in_window(row.get('result_json'), window_min, now_unix)
+
+
+def last_job_start(store, namespace, job, session_day):
+    """Aware IST datetime of this job's most recent attempt start
+    today, or None when it never started.
+
+    From the result_json 'starts' list (every run_job attempt records
+    its start there, so the latest attempt survives a supervisor
+    restart). The supervisor uses it to space scan retries at least
+    15 minutes apart (I23 on Render). Never raises: a missing row or
+    an unparseable list means None, not a made-up time."""
+    try:
+        row = _job_row(store, namespace, job, session_day)
+        if not row:
+            return None
+        try:
+            data = json.loads(row.get('result_json') or '{}')
+        except Exception:
+            return None
+        starts = [s for s in (data.get('starts') or [])
+                  if isinstance(s, (int, float))]
+        if not starts:
+            return None
+        from datetime import timezone
+        from zoneinfo import ZoneInfo
+        return datetime.fromtimestamp(
+            max(starts), tz=timezone.utc).astimezone(
+                ZoneInfo('Asia/Kolkata'))
+    except Exception:
+        return None
 
 
 def breaker_open(store, namespace, job, session_day, max_starts=None,

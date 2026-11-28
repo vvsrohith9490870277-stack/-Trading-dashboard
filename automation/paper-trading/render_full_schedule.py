@@ -16,8 +16,10 @@ existing job runner (render_jobs.run_job, paper_job_runs).
   re-run after a restart.
 - Catch-up after a restart: the normal 30-minute window is too short
   for a restart mid-morning, so on top of due_jobs the scheduler also
-  runs a missed scan (if it is before 15:00) and a missed EOD (if it
-  is after 16:10), each exactly once per trade_date. Other jobs are
+  runs a missed scan (if it is before EOD, 16:20) and a missed EOD (if it
+  is after 16:10), each exactly once per trade_date. A scan retry runs
+  at most once per 15 minutes (I23 on Render), so a crash loop can
+  never fire a burst of attempts back to back. Other jobs are
   not caught up; they run at their next slot.
 - Single writer: jobs only run when this supervisor holds the Turso
   lease (the tick gates on it); a job that would run without the
@@ -41,11 +43,19 @@ from zoneinfo import ZoneInfo
 IST = ZoneInfo('Asia/Kolkata')
 
 # Catch-up deadlines (IST) for the jobs the scheduler catches up after
-# a restart. scan: run if missed and now is before 15:00. eod: run if
-# missed and now is at/after 16:10 (no upper bound today — EOD is the
-# day's close-out and must run whenever the service comes back).
-CATCH_UP_SCAN_BEFORE = dtime(15, 0)
+# a restart. scan: run if missed and now is before EOD (config
+# sessiond_eod_due, "16:20" — I23 on Render; it used to stop at 15:00,
+# so a missed scan quietly gave up mid-afternoon). eod: run if missed
+# and now is at/after 16:10 (no upper bound today — EOD is the day's
+# close-out and must run whenever the service comes back).
+DEFAULT_CATCH_UP_SCAN_BEFORE = dtime(16, 20)
 CATCH_UP_EOD_AFTER = dtime(16, 10)
+
+# Minimum gap between two scan attempts (I23 on Render): retries are
+# spaced like sessiond's 900 s interval, so a crash loop can never
+# fire a burst of attempts back to back — even when the breaker
+# reopens, the next attempt still waits out the gap.
+SCAN_RETRY_MIN_SPACING = timedelta(minutes=15)
 
 # Jobs the scheduler catches up after a restart. Every other job runs
 # at its next slot only.
@@ -251,13 +261,29 @@ def completed_jobs_today(store, namespace, trade_date):
 
 # -- catch-up --------------------------------------------------------------
 
-def catch_up_due_jobs(schedule, now, completed, config):
+def _catch_up_scan_before(config):
+    """The scan catch-up deadline as an IST time: config
+    sessiond_eod_due ("16:20"), else 16:20. A missing or unparsable
+    value fails closed to the EOD deadline, never to the old 15:00."""
+    raw = (config or {}).get('sessiond_eod_due')
+    try:
+        h, m = str(raw).split(':')
+        return dtime(int(h), int(m))
+    except (ValueError, AttributeError, TypeError):
+        return DEFAULT_CATCH_UP_SCAN_BEFORE
+
+
+def catch_up_due_jobs(schedule, now, completed, config, last_attempt=None):
     """Jobs needing a startup catch-up run at `now`.
 
     `completed` is the set of job names already finished today.
     Only scan and eod are caught up, and only on trading days:
-    scan when its 08:45 slot has passed and it is before 15:00;
+    scan when its 08:45 slot has passed and it is before the EOD
+    deadline (config sessiond_eod_due, 16:20);
     eod when its 16:10 slot has passed and it is at/after 16:10.
+    `last_attempt` maps job names to the aware datetime of their
+    last attempt start: a scan catch-up is due only when the last
+    attempt was at least 15 minutes ago, so retries never burst.
     Returns the jobs in schedule order. A job inside the normal
     30-minute due window is also returned here (the caller dedups),
     so a restart at 09:00 and a restart at 10:00 both run the scan.
@@ -265,6 +291,8 @@ def catch_up_due_jobs(schedule, now, completed, config):
     now = now.astimezone(IST)
     if not is_trading_day_config(now.date(), config):
         return []
+    deadline = _catch_up_scan_before(config)
+    last_attempt = last_attempt or {}
     due = []
     for job in schedule.get('jobs', []):
         name = job.get('name')
@@ -273,7 +301,15 @@ def catch_up_due_jobs(schedule, now, completed, config):
         slot = _slot_today(job, now.date())
         if slot is None or slot > now:
             continue
-        if name == 'scan' and now.time() < CATCH_UP_SCAN_BEFORE:
+        if name == 'scan':
+            if now.time() >= deadline:
+                continue
+            last = last_attempt.get('scan')
+            if last is not None:
+                if last.tzinfo is None:
+                    last = last.replace(tzinfo=timezone.utc)
+                if now - last.astimezone(IST) < SCAN_RETRY_MIN_SPACING:
+                    continue
             due.append(job)
         elif name == 'eod' and now.time() >= CATCH_UP_EOD_AFTER:
             due.append(job)

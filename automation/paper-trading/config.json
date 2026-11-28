@@ -106,6 +106,8 @@
     "budget_requests_per_minute": 40,
     "budget_requests_per_day": 4000,
     "budget_reserve_for_session_monitor": 1500,
+    "scan_retry_reserve_requests": 856,
+    "scan_retry_reserve_requests_note": "I23 on Render, measured 2026-11-27 from the code (no guessing): one Render scan uses 0 Fyers calls (engine.py scan reads stored bars only), one EOD uses 0 (the official close is an NSE bhavcopy download, not a Fyers call), one sync_history uses up to 713 (692 universe symbols + 1 benchmark + 20 history-repair budget). Reserve = (0 + 713) x 1.2 = 855.6, rounded up to 856. A scan retry does not start when the remaining day budget is below this, so EOD and sync_history can still run.",
     "budget_state_path": "fyers_request_budget.json",
     "quotes_max_symbols_per_request": 50,
     "quotes_freshness": "exchange_ltt_or_session_observation",

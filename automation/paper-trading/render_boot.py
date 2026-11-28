@@ -241,3 +241,44 @@ def emit_probe_audit(store, namespace, result):
         return True
     except Exception:
         return False
+
+
+def emit_scan_abandoned_audit(store, namespace, remaining, reserve):
+    """Write the 'scan_abandoned' audit event for a scan retry the
+    supervisor refused to start because the remaining Fyers day
+    budget is below the reserve kept for EOD and sync_history
+    (I23 on Render).
+
+    Severity ERROR, so the I22 email alert (ERROR audit events)
+    picks it up. Returns True when the row was written. Returns
+    False when an event for this namespace and day is already
+    recorded — at most one abandon event per day, so a low budget
+    does not spam one event per tick — or when the row could not be
+    written (e.g. the paper_events table is missing on a fresh
+    store). Never raises. Only allowlisted fields are written
+    (audit.clean drops the rest).
+    """
+    import audit as al
+    try:
+        day = datetime.now(IST).date().isoformat()
+        try:
+            rows = store.execute(
+                'SELECT 1 AS x FROM paper_events WHERE namespace=?'
+                ' AND event_type=? AND session_day=? LIMIT 1',
+                (namespace, 'scan_abandoned', day))
+            if rows:
+                return False
+        except Exception:
+            pass
+        ctx = _AuditCtx(namespace)
+        row = al.event(
+            ctx, 'scan_abandoned',
+            outcome='abandoned', severity='ERROR',
+            reason='fyers_budget_below_scan_retry_reserve',
+            remaining_budget_requests=remaining,
+            scan_retry_reserve_requests=reserve)
+        sql, params = al.statements([row])[0]
+        store.execute(sql, params)
+        return True
+    except Exception:
+        return False
